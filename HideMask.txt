@@ -1,0 +1,14 @@
+; here we will place all the windows that we want to hide
+AsPowerBar
+ZPTNativeTransferWnd
+ZPToolBarParentWnd
+Środowisko wprowadzania systemu Windows
+NOWEMenu czatu
+NOWE Apps For You
+AxisArmFrm
+C:\Windows\System32\ApplicationFrameHost.exe
+C:\Windows\ImmersiveControlPanel\SystemSettings.exe
+C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\TextInputHost.exe
+Menedżer zadań
+Lupa
+ShadowForm
