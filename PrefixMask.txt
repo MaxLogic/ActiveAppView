@@ -1,0 +1,18 @@
+;here we can define how we wish to prefix some visible apps
+;the format is simple
+;a comma separated param list 
+;available params:
+;prefix - how the app display caption should be prefixed
+;caption - the mask to compare the app caption with
+;filename - the mask the filename of the app will be compared to
+prefix=npp,caption=*notepad++
+prefix=Thunderbird,caption=*thunderbird
+prefix=Firefox,caption=*firefox
+prefix=WinSCP,caption=*WinSCP
+prefix=Toad,filename=*\Toad.exe
+prefix=D11,filename=*\Embarcadero\Studio\22.0\bin\bds.exe
+prefix=D12,filename=*\Embarcadero\Studio\23.0\bin\bds.exe
+prefix=XE8,filename=C:\Program Files (x86)\Embarcadero\Studio\16.0\bin\bds.exe
+prefix=Obsidian,filename=C:\Users\pawel\AppData\Local\Programs\obsidian\Obsidian.exe
+prefix=QBitTorrent,filename=*\qbittorrent.exe
+prefix=7z,filename=*\7zFM.exe
