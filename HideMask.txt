@@ -8,7 +8,12 @@ NOWE Apps For You
 AxisArmFrm
 C:\Windows\System32\ApplicationFrameHost.exe
 C:\Windows\ImmersiveControlPanel\SystemSettings.exe
-C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\TextInputHost.exe
+C:\Windows\SystemApps\MicrosoftWindows.Client.*\TextInputHost.exe
 Menedżer zadań
 Lupa
 ShadowForm
+C:\Program Files\ShurePlus MOTIV\ShurePlus MOTIV.exe
+C:\ProgramData\Logishrd\LogiOptions\Software\Current\LogiOverlay.exe
+Host środowiska powłoki systemu Windows
+C:\Windows\SystemApps\*\ShellExperienceHost.exe
+IpPbxContactCard

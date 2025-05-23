@@ -5,6 +5,8 @@
 ;prefix - how the app display caption should be prefixed
 ;caption - the mask to compare the app caption with
 ;filename - the mask the filename of the app will be compared to
+
+prefix=MaxLogicTeams,caption=Microsoft Teams*
 prefix=npp,caption=*notepad++
 prefix=Thunderbird,caption=*thunderbird
 prefix=Firefox,caption=*firefox
@@ -16,3 +18,5 @@ prefix=XE8,filename=C:\Program Files (x86)\Embarcadero\Studio\16.0\bin\bds.exe
 prefix=Obsidian,filename=C:\Users\pawel\AppData\Local\Programs\obsidian\Obsidian.exe
 prefix=QBitTorrent,filename=*\qbittorrent.exe
 prefix=7z,filename=*\7zFM.exe
+prefix=mpc,filename=*\mpc-hc64.exe
+
