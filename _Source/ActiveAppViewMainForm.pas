@@ -4,60 +4,67 @@ interface
 
 uses
   ActiveAppViewCore,
-  Winapi.Windows, Winapi.Messages, System.SysUtils, System.Variants, System.Classes, Vcl.Graphics,
-  Vcl.Controls, Vcl.Forms, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.StdCtrls, generics.Collections,
-  Vcl.Buttons;
+  Winapi.Windows, Winapi.Messages, System.SysUtils, System.Variants, System.Classes, vcl.Graphics,
+  vcl.Controls, vcl.Forms, vcl.Dialogs, vcl.ExtCtrls, vcl.StdCtrls, generics.collections,
+  vcl.Buttons;
 
 type
   TAppsViewMainFrm = class(TForm)
     lbApps: TListBox;
-    pnlAppDetails: TPanel;
-    pnlAppDetailInfo: TPanel;
-    imgAppScreenshot: TImage;
-    edAppFileName: TEdit;
-    lapAppCaption: TStaticText;
-    edAppCaption: TEdit;
-    labAppFileName: TStaticText;
     pnlApps: TPanel;
     labAppTitle: TStaticText;
     Splitter1: TSplitter;
     pnlExplorer: TPanel;
     labExplorerTitle: TStaticText;
     lbExplorer: TListBox;
-    labTemplateActiv: TStaticText;
-    labTemplateInActiv: TStaticText;
     pnlAppFocusLeft: TPanel;
     pnlExplorerFocusLeft: TPanel;
     pnlAppsFocusRight: TPanel;
     pnlExplorerFocusRight: TPanel;
-    btnRestartNvda: TBitBtn;
-    btnRestartExplorer: TBitBtn;
-    btnKillDelphi: TBitBtn;
+    pnlAppDetails: TPanel;
+    imgAppScreenshot: TImage;
+    pnlAppDetailInfo: TPanel;
+    edAppFileName: TEdit;
+    lapAppCaption: TStaticText;
+    edAppCaption: TEdit;
+    labAppFileName: TStaticText;
+    labTemplateActiv: TStaticText;
+    labTemplateInActiv: TStaticText;
+    Splitter2: TSplitter;
+    pnlScripts: TPanel;
+    labScriptsTitle: TStaticText;
+    lbScripts: TListBox;
+    pnlScriptsFocusLeft: TPanel;
+    pnlScriptsFocusRight: TPanel;
+    Splitter3: TSplitter;
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure FormActivate(Sender: TObject);
     procedure lbAppsDblClick(Sender: TObject);
     procedure lbAppsKeyUp(Sender: TObject; var Key: Word;
       Shift: TShiftState);
+    procedure lbScriptsDblClick(Sender: TObject);
     procedure lbAppsClick(Sender: TObject);
     procedure FormKeyUp(Sender: TObject; var Key: Word;
       Shift: TShiftState);
     procedure FormShow(Sender: TObject);
-    procedure btnRestartNvdaClick(Sender: TObject);
-    procedure btnKillDelphiClick(Sender: TObject);
-    procedure btnRestartExplorerClick(Sender: TObject);
+    procedure lbScriptsKeyUp(Sender: TObject; var Key: Word;
+      Shift: TShiftState);
   private
 
     fApps: TAppList;
+    fOrgAppOnActivate: TNotifyEvent;
+    procedure AppOnActivate(Sender: TObject);
     procedure UpdateGui;
+    procedure UpdateScriptsList;
 
     procedure BringToFrontFocusedApp(lb: TListBox);
     procedure UpdateAppDetail;
     procedure LoadPrefixRules(l: TObjectList<TStringList>);
     procedure CheckPrefixRule(var s: string; app: TAppInfo; l: TObjectList<TStringList>);
-    function ExcludeByMask(app: TAppInfo; l: TStringList): Boolean;
-    Procedure RestoreItemIndex(lb: TListBox; wnd: hwnd; oldItemIndex: Integer);
-    Function GetWnd(lb: TListBox): hwnd;
+    function ExcludeByMask(app: TAppInfo; l: TStringList): boolean;
+    procedure RestoreItemIndex(lb: TListBox; wnd: hwnd; oldItemIndex: integer; const aOldItemCaption: string);
+    function GetWnd(lb: TListBox): hwnd;
     procedure ActiveControlChanged(Sender: TObject);
   public
 
@@ -69,71 +76,75 @@ var
 implementation
 
 uses
-  autoFree, bsUtils, MaxLogic.AutoStart, srDesktop, strUtils, MaxLogic.strUtils, ioUtils,
-  MaxLogic.ioUtils;
+  AutoFree, bsUtils, maxLogic.AutoStart, srDesktop, StrUtils, maxLogic.StrUtils, IOUtils,
+  maxLogic.IOUtils;
 
 {$R *.dfm}
-
 
 procedure TAppsViewMainFrm.ActiveControlChanged(Sender: TObject);
 var
   lActive: TWinControl;
-  lPrefix: String;
+  lPrefix: string;
 
-  procedure UpdatePrefix(st: TStaticText; aEnabled: Boolean);
+  procedure UpdatePrefix(st: TStaticText; aEnabled: boolean);
   begin
     if aEnabled then
     begin
-      if not startsText(lPrefix, st.Caption) then
-        st.Caption := lPrefix + st.Caption;
-    end else begin
-      if startsText(lPrefix, st.Caption) then
-        st.Caption := trim(copy(st.Caption, length(lPrefix) + 1, length(st.Caption)));
+      if not startsText(lPrefix, st.caption) then
+        st.caption := lPrefix + st.caption;
+    end
+    else
+    begin
+      if startsText(lPrefix, st.caption) then
+        st.caption := Trim(copy(st.caption, length(lPrefix) + 1, length(st.caption)));
     end;
   end;
 
+var
+  lTitles: TArray<TStaticText>;
+  lPanels: TArray<TPanel>;
+  lIndex: integer;
 begin
   lActive := self.ActiveControl;
 
-  lPrefix := copy(labTemplateActiv.Caption, 1, 2);
+  lPrefix := copy(labTemplateActiv.caption, 1, 2);
   UpdatePrefix(labAppTitle, lActive = lbApps);
   UpdatePrefix(labExplorerTitle, lActive = lbApps);
 
+  lTitles := [labAppTitle, labExplorerTitle, labScriptsTitle];
+  lPanels := [pnlAppFocusLeft, pnlExplorerFocusLeft, pnlScriptsFocusLeft];
   if lActive = lbApps then
+    lIndex := 0
+  else if lActive = lbExplorer then
+    lIndex := 1
+  else if lActive = lbScripts then
+    lIndex := 2
+  else
+    lIndex := -1;
+
+  if lindex <> -1 then
   begin
-    labAppTitle.Font.assign(labTemplateActiv.Font);
-    pnlAppFocusLeft.Color := clBlack;
-  end else begin
-    labAppTitle.Font.assign(labTemplateInActiv.Font);
-    pnlAppFocusLeft.Color := self.Color;
+    lTitles[lIndex].Font.Assign(labTemplateActiv.Font);
+    lPanels[lIndex].Color := clBlack;
   end;
 
-  if lActive = lbExplorer then
-  begin
-    labExplorerTitle.Font.assign(labTemplateActiv.Font);
-    pnlExplorerFocusLeft.Color := clBlack;
-  end else begin
-    labExplorerTitle.Font.assign(labTemplateInActiv.Font);
-    pnlExplorerFocusLeft.Color := self.Color;
-  end;
+  for var X := 0 to 2 do
+    if X <> lIndex then
+    begin
+      lTitles[X].Font.Assign(labTemplateInActiv.Font);
+      lPanels[X].Color := self.Color;
+    end;
 
   pnlAppsFocusRight.Color := pnlAppFocusLeft.Color;
   pnlExplorerFocusRight.Color := pnlExplorerFocusLeft.Color;
+  pnlScriptsFocusRight.Color := pnlScriptsFocusLeft.Color;
 end;
 
-procedure TAppsViewMainFrm.btnKillDelphiClick(Sender: TObject);
+procedure TAppsViewMainFrm.AppOnActivate(Sender: TObject);
 begin
-  exec(getInstallDir + 'dkill - kill bds.exe.cmd');
-end;
-
-procedure TAppsViewMainFrm.btnRestartExplorerClick(Sender: TObject);
-begin
-  exec(getInstallDir + 'RestartExplorer.cmd');
-end;
-
-procedure TAppsViewMainFrm.btnRestartNvdaClick(Sender: TObject);
-begin
-  exec(getInstallDir + 'restartNvda.cmd');
+  UpdateGui;
+  if assigned(fOrgAppOnActivate) then
+    fOrgAppOnActivate(Sender);
 end;
 
 procedure TAppsViewMainFrm.BringToFrontFocusedApp;
@@ -148,54 +159,50 @@ begin
   wnd := GetWnd(lb);
 
   if fApps.TryGetApp(wnd, app) then
-    app.Show;
+    app.SHOW;
 end;
 
 procedure TAppsViewMainFrm.CheckPrefixRule(var s: string; app: TAppInfo;
   l: TObjectList<TStringList>);
 var
   ls: TStringList;
-  v1, v2: string;
+  V1, V2: string;
 begin
   for ls in l do
   begin
-    v1 := ls.Values['caption'];
-    v2 := ls.Values['filename'];
-    if ((v1 <> '') and MaxLogic.strUtils.StringMatches(app.Caption, v1, false))
-      or ((v2 <> '') and MaxLogic.strUtils.StringMatches(app.FileName, v2, false)) then
+    V1 := ls.Values['caption'];
+    V2 := ls.Values['filename'];
+    if ((V1 <> '') and maxLogic.StrUtils.StringMatches(app.caption, V1, False))
+      or ((V2 <> '') and maxLogic.StrUtils.StringMatches(app.FileName, V2, False)) then
     begin
       s := ls.Values['prefix'] + ' - ' + s;
-      Exit;
+      exit;
     end;
   end;
 end;
 
 function TAppsViewMainFrm.ExcludeByMask(app: TAppInfo;
-  l: TStringList): Boolean;
+  l: TStringList): boolean;
 var
-  x: Integer;
+  X: integer;
   m: string;
 begin
-  Result := false;
+  Result := False;
   // first only the caption
-  for x := 0 to l.Count - 1 do
+  for X := 0 to l.Count - 1 do
   begin
-    m := l[x];
-    if m <> '' then
-      if m[1] <> ';' then
-        if MaxLogic.strUtils.StringMatches(app.Caption, m, false) then
-          Exit(true);
+    m := l[X];
+    if maxLogic.StrUtils.StringMatches(app.caption, m, False) then
+      exit(True);
   end;
 
-  // if the caption is ok, the go by the file name
-  // but note, taht retriving the file name takes a bit longer, so if we are lucky, we already excluded the item
-  for x := 0 to l.Count - 1 do
+  // if the caption is ok, then go by the file name
+  // but note, that retriving the file name takes a bit longer, so if we are lucky, we already excluded the item
+  for X := 0 to l.Count - 1 do
   begin
-    m := l[x];
-    if m <> '' then
-      if m[1] <> ';' then
-        if MaxLogic.strUtils.StringMatches(app.FileName, m, false) then
-          Exit(true);
+    m := l[X];
+    if maxLogic.StrUtils.StringMatches(app.FileName, m, False) then
+      exit(True);
   end;
 end;
 
@@ -209,13 +216,16 @@ begin
   fApps := TAppList.Create;
   AddToAutoStart;
   Screen.OnActiveControlChange := ActiveControlChanged;
-  labAppTitle.height := labTemplateActiv.height;
-  labExplorerTitle.height := labTemplateActiv.height;
+  labAppTitle.Height := labTemplateActiv.Height;
+  labExplorerTitle.Height := labTemplateActiv.Height;
   ActiveControlChanged(nil);
+  fOrgAppOnActivate := application.OnActivate;
+  application.OnActivate := AppOnActivate;
 end;
 
 procedure TAppsViewMainFrm.FormDestroy(Sender: TObject);
 begin
+  application.OnActivate := fOrgAppOnActivate;
   fApps.Free;
   Screen.OnActiveControlChange := nil;
 end;
@@ -224,11 +234,13 @@ procedure TAppsViewMainFrm.FormKeyUp(Sender: TObject; var Key: Word;
   Shift: TShiftState);
 begin
   if Key = VK_F5 then
-    UpdateGui;
-  if Key = vk_F1 then
+    UpdateGui
+  else if Key = vk_F1 then
     lbApps.SetFocus
   else if Key = vk_F2 then
     lbExplorer.SetFocus
+  else if Key = vk_F3 then
+    lbScripts.SetFocus
 end;
 
 procedure TAppsViewMainFrm.FormShow(Sender: TObject);
@@ -264,42 +276,82 @@ begin
     UpdateAppDetail;
 end;
 
+procedure TAppsViewMainFrm.lbScriptsDblClick(Sender: TObject);
+var
+  i: Integer;
+  fn: String;
+begin
+  i:= lbScripts.ItemIndex;
+  if i = -1 then
+    exit;
+  fn := getInstallDir + 'Scripts\'+ lbScripts.Items[i];
+  if TFile.Exists(fn) then
+    TThread.CreateAnonymousThread(
+      procedure begin
+        exec(fn);
+      end).Start;
+
+end;
+
+procedure TAppsViewMainFrm.lbScriptsKeyUp(Sender: TObject; var Key: Word;
+  Shift: TShiftState);
+begin
+  if Key = VK_RETURN then
+    lbScriptsDblClick(sender);
+end;
+
 procedure TAppsViewMainFrm.LoadPrefixRules(l: TObjectList<TStringList>);
 var
   l1, l2: TStringList;
-  x: Integer;
+  X: integer;
 begin
   gc(l1, TStringList.Create);
 
   l1.LoadFromFile(getInstallDir + 'PrefixMask.txt');
-  for x := 0 to l1.Count - 1 do
+  for X := 0 to l1.Count - 1 do
   begin
-    if l1[x] <> '' then
-      if l1[x][1] <> ';' then
+    if l1[X] <> '' then
+      if l1[X][1] <> ';' then
       begin
         l2 := TStringList.Create;
-        l2.commaText := l1[x];
-        l.add(l2);
+        l2.CaseSensitive := False;
+        l2.StrictDelimiter:= True;
+        l2.Commatext := l1[X];
+        l.Add(l2);
       end;
   end;
 end;
 
 procedure TAppsViewMainFrm.RestoreItemIndex(lb: TListBox; wnd: hwnd;
-  oldItemIndex: Integer);
+  oldItemIndex: integer; const aOldItemCaption: string);
 var
-  x: Integer;
+  i, X: integer;
+  l: TStringList;
 begin
   if lb.Items.Count = 0 then
   begin
     lb.ItemIndex := -1;
-    Exit;
+    exit;
   end;
-  for x := 0 to lb.Items.Count - 1 do
-    if wnd = hwnd(lb.Items.Objects[x]) then
+  for X := 0 to lb.Items.Count - 1 do
+    if wnd = hwnd(lb.Items.Objects[X]) then
     begin
-      lb.ItemIndex := x;
-      Exit;
+      lb.ItemIndex := X;
+      exit;
     end;
+
+  if (aOldItemCaption <> '') and lb.Sorted then
+  begin
+    gc(l, TStringList.Create);
+    l.Assign(lb.Items);
+    l.Sorted := True;
+    l.find(aOldItemCaption, i);
+    if i <> -1 then
+    begin
+      lb.ItemIndex := i;
+      exit;
+    end;
+  end;
 
   if oldItemIndex >= lb.Items.Count then
     lb.ItemIndex := lb.Items.Count - 1
@@ -313,12 +365,12 @@ var
   app: TAppInfo;
 begin
   if not fApps.TryGetApp(GetWnd(lbApps), app) then
-    pnlAppDetails.Visible := false
+    pnlAppDetails.Visible := False
   else
   begin
-    pnlAppDetails.Visible := true;
+    pnlAppDetails.Visible := True;
     imgAppScreenshot.Picture.Graphic := app.Icon;
-    edAppCaption.Text := app.Caption;
+    edAppCaption.Text := app.caption;
     edAppFileName.Text := app.FileName;
   end;
 
@@ -326,62 +378,106 @@ end;
 
 procedure TAppsViewMainFrm.UpdateGui;
 var
-  oldItemIndex, x: Integer;
+  lOldItemIndex: integer;
   app: TAppInfo;
-  ExcludeList: TStringList;
-  PrefixRules: TObjectList<TStringList>;
-  s: string;
-  Explorers: TList<TAppInfo>;
+  lExcludeList: TStringList;
+  lPrefixRules: TObjectList<TStringList>;
+  s, lFocusedCaption: string;
+  lExplorers: TList<TAppInfo>;
   wnd: hwnd;
 begin
-  gc(ExcludeList, TStringList.Create);
-  gc(PrefixRules, TObjectList<TStringList>.Create);
-  gc(Explorers, TList<TAppInfo>.Create);
-  LoadPrefixRules(PrefixRules);
+  gc(lExcludeList, TStringList.Create);
+  gc(lPrefixRules, TObjectList<TStringList>.Create);
+  gc(lExplorers, TList<TAppInfo>.Create);
+  LoadPrefixRules(lPrefixRules);
+  lExcludeList.LoadFromFile(getInstallDir + 'hideMask.txt');
 
-  oldItemIndex := lbApps.ItemIndex;
+  // preprocess and remove irrelevant items
+  for var X := lExcludeList.Count - 1 downto 0 do
+    if (lExcludeList[X].Trim = '') or startsText(';', lExcludeList[X].Trim) then
+      lExcludeList.delete(X);
+
+  lOldItemIndex := lbApps.ItemIndex;
+  if lOldItemIndex <> -1 then
+    lFocusedCaption := lbApps.Items[lOldItemIndex];
   wnd := GetWnd(lbApps);
-  lbApps.Items.beginUpdate;
+  lbApps.Items.BeginUpdate;
   try
-    fApps.update;
-    ExcludeList.LoadFromFile(getInstallDir + 'hideMask.txt');
+    fApps.Update;
     lbApps.Items.Clear;
-    for x := 0 to fApps.Count - 1 do
+    for var X := 0 to fApps.Count - 1 do
     begin
-      app := fApps[x];
+      app := fApps[X];
 
       if (app.wnd = application.Handle)
         or (app.wnd = self.Handle) then
         Continue;
 
-      if app.Caption <> '' then
-        if (not ExcludeByMask(app, ExcludeList)) then
+      if app.caption <> '' then
+        if (not ExcludeByMask(app, lExcludeList)) then
           if SameText('explorer.exe', ExtractFileName(app.FileName)) then
-            Explorers.add(app)
+            lExplorers.Add(app)
           else
           begin
-            s := trim(app.DisplayCaption);
-            CheckPrefixRule(s, app, PrefixRules);
+            s := Trim(app.DisplayCaption);
+            CheckPrefixRule(s, app, lPrefixRules);
             lbApps.Items.addObject(s, TObject(app.wnd));
           end;
     end;
   finally
-    lbApps.Items.endupdate;
+    lbApps.Items.EndUpdate;
   end;
-  RestoreItemIndex(lbApps, wnd, oldItemIndex);
+  RestoreItemIndex(lbApps, wnd, lOldItemIndex, lFocusedCaption);
   UpdateAppDetail;
 
   wnd := GetWnd(lbExplorer);
-  oldItemIndex := lbExplorer.ItemIndex;
-  lbExplorer.Items.beginUpdate;
+  lOldItemIndex := lbExplorer.ItemIndex;
+  lFocusedCaption := '';
+  if lOldItemIndex <> -1 then
+    lFocusedCaption := lbExplorer.Items[lOldItemIndex];
+  lbExplorer.Items.BeginUpdate;
   try
     lbExplorer.Items.Clear;
-    for app in Explorers do
-      lbExplorer.Items.addObject(app.Caption, TObject(app.wnd));
+    for app in lExplorers do
+      lbExplorer.Items.addObject(app.caption, TObject(app.wnd));
   finally
-    lbExplorer.Items.endupdate;
+    lbExplorer.Items.EndUpdate;
   end;
-  RestoreItemIndex(lbExplorer, wnd, oldItemIndex);
+  RestoreItemIndex(lbExplorer, wnd, lOldItemIndex, lFocusedCaption);
+
+  UpdateScriptsList;
+end;
+
+procedure TAppsViewMainFrm.UpdateScriptsList;
+var
+  lExt: string;
+  s, lPrevFocused: string;
+  i: integer;
+begin
+  if lbScripts.ItemIndex <> -1 then
+    lPrevFocused := lbScripts.Items[lbScripts.ItemIndex];
+  lbScripts.Items.BeginUpdate;
+  try
+    lbScripts.ItemIndex := -1;
+    lbScripts.Items.Clear;
+    for var fn in TDirectory.GetFiles(getInstallDir + 'Scripts', '*.*') do
+    begin
+      lExt := ExtractFileExt(fn);
+      if System.StrUtils.MatchText(lExt, ['.cmd', '.bat', '.ps1', '.exe', '.py']) then
+      begin
+        s := ExtractFileName(fn);
+        i := lbScripts.Items.Add(s);
+        if lbScripts.ItemIndex = -1 then
+          if SameText(lPrevFocused, s) then
+            lbScripts.ItemIndex := i;
+
+      end;
+    end;
+  finally
+    lbScripts.Items.EndUpdate;
+  end;
+
 end;
 
 end.
+
