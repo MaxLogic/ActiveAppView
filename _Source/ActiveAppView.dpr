@@ -10,7 +10,8 @@ uses
   ActiveAppViewMainForm in 'ActiveAppViewMainForm.pas' {AppsViewMainFrm},
   ActiveAppViewCore in 'ActiveAppViewCore.pas',
   srDeskTop in '..\..\myPas\srDeskTop.pas',
-  MaxLogic.StrUtils in '..\..\myPas\MaxLogic.StrUtils.pas';
+  MaxLogic.StrUtils in '..\..\myPas\MaxLogic.StrUtils.pas',
+  ActiveAppView.ChatMonitor in 'ActiveAppView.ChatMonitor.pas';
 
 {$R *.res}
 

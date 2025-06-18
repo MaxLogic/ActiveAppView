@@ -330,4 +330,9 @@ object AppsViewMainFrm: TAppsViewMainFrm
       TabOrder = 3
     end
   end
+  object tmrChatMonitor: TTimer
+    OnTimer = tmrChatMonitorTimer
+    Left = 704
+    Top = 432
+  end
 end
