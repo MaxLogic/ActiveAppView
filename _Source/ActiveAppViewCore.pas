@@ -90,8 +90,11 @@ function TAppInfo.GetFileName: string;
 begin
   if not fFileNameRetrived then
   begin
-    fFileNameRetrived := True;
-    fFileName := srDesktop.GetFileName(Wnd);
+    if srDesktop.isWndValid(Wnd) then
+    begin
+      fFileName := srDesktop.GetFileName(Wnd);
+      fFileNameRetrived := True;
+    end;
   end;
   Result := fFileName;
 end;

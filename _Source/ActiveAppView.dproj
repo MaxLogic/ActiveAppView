@@ -145,6 +145,7 @@
         <DCCReference Include="ActiveAppViewCore.pas"/>
         <DCCReference Include="..\..\myPas\srDeskTop.pas"/>
         <DCCReference Include="..\..\myPas\MaxLogic.StrUtils.pas"/>
+        <DCCReference Include="ActiveAppView.ChatMonitor.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
             <DependentOn>..\..\myPas\MaxLogicDefault.optset</DependentOn>
@@ -172,7 +173,12 @@
             </Delphi.Personality>
             <Deployment Version="5">
                 <DeployFile LocalName="..\ActiveAppView.exe" Configuration="Debug" Class="ProjectOutput"/>
-                <DeployFile LocalName="..\ActiveAppView.rsm" Configuration="Debug" Class="DebugSymbols"/>
+                <DeployFile LocalName="..\ActiveAppView.exe" Configuration="Debug" Class="ProjectOutput">
+                    <Platform Name="Win32">
+                        <RemoteName>ActiveAppView.exe</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
                 <DeployClass Name="AdditionalDebugSymbols">
                     <Platform Name="iOSSimulator">
                         <Operation>1</Operation>

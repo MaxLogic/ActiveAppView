@@ -3,7 +3,7 @@ unit ActiveAppViewMainForm;
 interface
 
 uses
-  ActiveAppViewCore,
+  ActiveAppViewCore, ActiveAppView.ChatMonitor, // Add this new unit,
   Winapi.Windows, Winapi.Messages, System.SysUtils, System.Variants, System.Classes, vcl.Graphics,
   vcl.Controls, vcl.Forms, vcl.Dialogs, vcl.ExtCtrls, vcl.StdCtrls, generics.collections,
   vcl.Buttons;
@@ -37,6 +37,7 @@ type
     pnlScriptsFocusLeft: TPanel;
     pnlScriptsFocusRight: TPanel;
     Splitter3: TSplitter;
+    tmrChatMonitor: TTimer;
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure FormActivate(Sender: TObject);
@@ -50,10 +51,12 @@ type
     procedure FormShow(Sender: TObject);
     procedure lbScriptsKeyUp(Sender: TObject; var Key: Word;
       Shift: TShiftState);
+    procedure tmrChatMonitorTimer(Sender: TObject);
   private
 
     fApps: TAppList;
     fOrgAppOnActivate: TNotifyEvent;
+    fChatMonitor: TChatMonitor;
     procedure AppOnActivate(Sender: TObject);
     procedure UpdateGui;
     procedure UpdateScriptsList;
@@ -77,6 +80,7 @@ implementation
 
 uses
   AutoFree, bsUtils, maxLogic.AutoStart, srDesktop, StrUtils, maxLogic.StrUtils, IOUtils,
+  System.IniFiles, Winapi.MMSystem,
   maxLogic.IOUtils;
 
 {$R *.dfm}
@@ -212,6 +216,8 @@ begin
 end;
 
 procedure TAppsViewMainFrm.FormCreate(Sender: TObject);
+var
+  lIniFile: TMemIniFile;
 begin
   fApps := TAppList.Create;
   AddToAutoStart;
@@ -221,11 +227,17 @@ begin
   ActiveControlChanged(nil);
   fOrgAppOnActivate := application.OnActivate;
   application.OnActivate := AppOnActivate;
+
+  gc(lIniFile, TMemIniFile.Create(GetInstallDir + 'settings.ini', TEncoding.Utf8, False));
+  fChatMonitor := TChatMonitor.Create(lIniFile);
+  tmrChatMonitor.Interval := lIniFile.ReadInteger('ChatMonitor', 'CheckIntervalSeconds', 5) * 1000;
+  tmrChatMonitor.Enabled:= lIniFile.ReadBool('ChatMonitor', 'Enabled', False);
 end;
 
 procedure TAppsViewMainFrm.FormDestroy(Sender: TObject);
 begin
   application.OnActivate := fOrgAppOnActivate;
+  FreeAndNil(fChatMonitor);
   fApps.Free;
   Screen.OnActiveControlChange := nil;
 end;
@@ -358,6 +370,12 @@ begin
   else if oldItemIndex < 0 then
     lb.ItemIndex := 0;
 
+end;
+
+procedure TAppsViewMainFrm.tmrChatMonitorTimer(Sender: TObject);
+begin
+  if Assigned(fChatMonitor) then
+    fChatMonitor.Process;
 end;
 
 procedure TAppsViewMainFrm.UpdateAppDetail;
