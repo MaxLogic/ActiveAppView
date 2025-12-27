@@ -13,12 +13,19 @@ type
     FAlife: boolean;
     fWnd: hWnd;
     fIcon: TIcon;
+    fCommandLine: String;
+    fCommandLineRetrieved: Boolean;
 
     fCaption: string;
     function GetIcon: TIcon;
     procedure SetAlife(const Value: boolean);
     function GetDisplayCaption: string;
     function GetFileName: string;
+    function GetCommandLine: String;
+    function GetCommandLineParams: String;
+    function GetPID: Cardinal;
+    function GetAppUserModelID: String;
+    function GetRelaunchCommand: String;
   public
     constructor Create(aWnd: hWnd);
     destructor Destroy; override;
@@ -31,6 +38,14 @@ type
     property caption: string read fCaption;
     property FileName: string read GetFileName;
     property DisplayCaption: string read GetDisplayCaption;
+    property CommandLine: String read GetCommandLine;
+    property CommandLineParams: String read GetCommandLineParams;
+    property PID: Cardinal read GetPID;
+
+    // Edge PWA specific
+    property AppUserModelID: String read GetAppUserModelID;
+    property RelaunchCommand: String read GetRelaunchCommand;
+
     property Icon: TIcon read GetIcon;
     property Alife: boolean read FAlife write SetAlife;
   end;
@@ -74,6 +89,41 @@ begin
   inherited;
 end;
 
+function TAppInfo.GetAppUserModelID: String;
+begin
+  Result:= RetrieveAppUserModelID(fWnd);
+end;
+
+function TAppInfo.GetCommandLine: String;
+var
+  lPid: Cardinal;
+begin
+  if not fCommandLineRetrieved then
+  begin
+    fCommandLineRetrieved:= True;
+    lPid:= RetrievePID(fWnd);
+    fCommandLine:= RetrieveCommandLine(lPid);
+  end;
+  Result:= fCommandLine;
+end;
+
+function TAppInfo.GetCommandLineParams: String;
+var
+  s: String;
+  i: Integer;
+begin
+  s:= Self.CommandLine.Trim;
+  if s = '' then
+    Exit('');
+
+  if startsStr('"', s) then
+    i:= posEx('"', s, 2)
+  else
+    i:= posEx(' ', s, 1);
+
+  Result:= Copy(s, i+1, Length(s)).Trim;
+end;
+
 function TAppInfo.GetDisplayCaption: string;
 begin
   if (fCaption <> '') and (fFileName <> '') then
@@ -107,6 +157,16 @@ begin
     srDesktop.CopyIconFromWindowHandle(fWnd, fIcon);
   end;
   Result := fIcon;
+end;
+
+function TAppInfo.GetPID: Cardinal;
+begin
+  Result:= RetrievePID(fWnd);
+end;
+
+function TAppInfo.GetRelaunchCommand: String;
+begin
+  Result:= RetrieveRelaunchCommand(fWnd);
 end;
 
 procedure TAppInfo.ScreenShoot(aBitMap: TBitmap);

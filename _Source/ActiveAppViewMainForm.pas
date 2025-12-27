@@ -28,8 +28,6 @@ type
     lapAppCaption: TStaticText;
     edAppCaption: TEdit;
     labAppFileName: TStaticText;
-    labTemplateActiv: TStaticText;
-    labTemplateInActiv: TStaticText;
     Splitter2: TSplitter;
     pnlScripts: TPanel;
     labScriptsTitle: TStaticText;
@@ -38,6 +36,17 @@ type
     pnlScriptsFocusRight: TPanel;
     Splitter3: TSplitter;
     tmrChatMonitor: TTimer;
+    Panel1: TPanel;
+    labTemplateActiv: TStaticText;
+    labTemplateInActiv: TStaticText;
+    edCommandLineParams: TEdit;
+    labCommandLineParams: TStaticText;
+    edPID: TEdit;
+    labPid: TStaticText;
+    edAppUserModelID: TEdit;
+    labAppUserModelID: TStaticText;
+    edRelaunchCommand: TEdit;
+    labRelaunchCommand: TStaticText;
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure FormActivate(Sender: TObject);
@@ -170,14 +179,20 @@ procedure TAppsViewMainFrm.CheckPrefixRule(var s: string; app: TAppInfo;
   l: TObjectList<TStringList>);
 var
   ls: TStringList;
-  V1, V2: string;
+  lCmdParams, lAppUserModelID, lCaption, lFileName: string;
 begin
   for ls in l do
   begin
-    V1 := ls.Values['caption'];
-    V2 := ls.Values['filename'];
-    if ((V1 <> '') and maxLogic.StrUtils.StringMatches(app.caption, V1, False))
-      or ((V2 <> '') and maxLogic.StrUtils.StringMatches(app.FileName, V2, False)) then
+    ls.CaseSensitive:= False;
+    lCaption := ls.Values['caption'];
+    lFileName := ls.Values['filename'];
+    lAppUserModelID:= ls.Values['AppUserModelID'];
+    lCmdParams:= ls.Values['CmdParams'];
+
+    if ((lCaption <> '') and maxLogic.StrUtils.StringMatches(app.caption, lCaption, False))
+      or ((lFileName <> '') and maxLogic.StrUtils.StringMatches(app.FileName, lFileName, False))
+      or ((lAppUserModelID <> '') and maxLogic.StrUtils.StringMatches(app.AppUserModelID, lAppUserModelID, False))
+      or ((lCmdParams<> '') and maxLogic.StrUtils.StringMatches(app.CommandLineParams, lCmdParams, False)) then
     begin
       s := ls.Values['prefix'] + ' - ' + s;
       exit;
@@ -319,7 +334,7 @@ var
 begin
   gc(l1, TStringList.Create);
 
-  l1.LoadFromFile(getInstallDir + 'PrefixMask.txt');
+  l1.LoadFromFile(getInstallDir + 'PrefixMask.txt', TEncoding.Utf8);
   for X := 0 to l1.Count - 1 do
   begin
     if l1[X] <> '' then
@@ -390,6 +405,10 @@ begin
     imgAppScreenshot.Picture.Graphic := app.Icon;
     edAppCaption.Text := app.caption;
     edAppFileName.Text := app.FileName;
+    edCommandLineParams.Text := app.CommandLineParams;
+    edPid.Text := app.PID.ToString;
+    edRelaunchCommand.Text:= app.RelaunchCommand;
+    edAppUserModelID.Text:= app.AppUserModelID;
   end;
 
 end;
