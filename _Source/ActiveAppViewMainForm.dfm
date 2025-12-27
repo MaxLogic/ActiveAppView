@@ -46,7 +46,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
     object Splitter2: TSplitter
       AlignWithMargins = True
       Left = 3
-      Top = 645
+      Top = 483
       Width = 500
       Height = 3
       Cursor = crVSplit
@@ -74,7 +74,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Left = 33
       Top = 43
       Width = 440
-      Height = 596
+      Height = 434
       Align = alClient
       ItemHeight = 21
       Sorted = True
@@ -88,7 +88,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Left = 3
       Top = 43
       Width = 24
-      Height = 596
+      Height = 434
       Align = alLeft
       Caption = 'Panel1'
       Color = clBlack
@@ -101,7 +101,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Left = 479
       Top = 43
       Width = 24
-      Height = 596
+      Height = 434
       Align = alRight
       Caption = 'Panel1'
       Color = clBlack
@@ -112,9 +112,9 @@ object AppsViewMainFrm: TAppsViewMainFrm
     object pnlAppDetails: TPanel
       AlignWithMargins = True
       Left = 3
-      Top = 654
+      Top = 492
       Width = 500
-      Height = 196
+      Height = 358
       Align = alBottom
       ShowCaption = False
       TabOrder = 4
@@ -123,7 +123,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
         Left = 4
         Top = 4
         Width = 179
-        Height = 188
+        Height = 350
         Align = alLeft
         AutoSize = True
         Proportional = True
@@ -132,7 +132,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
         Left = 186
         Top = 1
         Width = 313
-        Height = 194
+        Height = 356
         Align = alClient
         BevelOuter = bvNone
         ShowCaption = False
@@ -147,16 +147,16 @@ object AppsViewMainFrm: TAppsViewMainFrm
           Align = alTop
           TabOrder = 1
         end
-        object lapAppCaption: TStaticText
+        object labAppFileName: TStaticText
           AlignWithMargins = True
           Left = 3
-          Top = 3
+          Top = 63
           Width = 307
           Height = 25
           Margins.Bottom = 0
           Align = alTop
-          Caption = 'lapAppCaption'
-          TabOrder = 2
+          Caption = 'Filename'
+          TabOrder = 3
         end
         object edAppCaption: TEdit
           AlignWithMargins = True
@@ -168,45 +168,138 @@ object AppsViewMainFrm: TAppsViewMainFrm
           Align = alTop
           TabOrder = 0
         end
-        object labAppFileName: TStaticText
+        object lapAppCaption: TStaticText
           AlignWithMargins = True
           Left = 3
-          Top = 63
+          Top = 3
           Width = 307
           Height = 25
           Margins.Bottom = 0
           Align = alTop
-          Caption = 'labAppFileName'
-          TabOrder = 3
+          Caption = 'Application Title'
+          TabOrder = 2
         end
-        object labTemplateActiv: TStaticText
+        object edCommandLineParams: TEdit
+          AlignWithMargins = True
+          Left = 3
+          Top = 148
+          Width = 307
+          Height = 29
+          Margins.Top = 0
+          Align = alTop
+          TabOrder = 4
+        end
+        object labCommandLineParams: TStaticText
           AlignWithMargins = True
           Left = 3
           Top = 123
           Width = 307
-          Height = 44
+          Height = 25
+          Margins.Bottom = 0
           Align = alTop
-          Caption = #9654' template for Active title'
-          Font.Charset = DEFAULT_CHARSET
-          Font.Color = clWindowText
-          Font.Height = -29
-          Font.Name = 'Segoe UI'
-          Font.Style = [fsBold, fsUnderline]
-          ParentFont = False
-          TabOrder = 4
-          Visible = False
+          Caption = 'CommandLine params (not reliable for PWAs)'
+          TabOrder = 5
         end
-        object labTemplateInActiv: TStaticText
+        object edPID: TEdit
           AlignWithMargins = True
           Left = 3
-          Top = 173
+          Top = 208
+          Width = 307
+          Height = 29
+          Margins.Top = 0
+          Align = alTop
+          TabOrder = 6
+        end
+        object labPid: TStaticText
+          AlignWithMargins = True
+          Left = 3
+          Top = 183
           Width = 307
           Height = 25
+          Margins.Bottom = 0
           Align = alTop
-          Caption = 'template for inactive title'
-          TabOrder = 5
-          Visible = False
+          Caption = 'PID'
+          TabOrder = 7
         end
+        object edAppUserModelID: TEdit
+          AlignWithMargins = True
+          Left = 3
+          Top = 268
+          Width = 307
+          Height = 29
+          Margins.Top = 0
+          Align = alTop
+          TabOrder = 8
+        end
+        object labAppUserModelID: TStaticText
+          AlignWithMargins = True
+          Left = 3
+          Top = 243
+          Width = 307
+          Height = 25
+          Margins.Bottom = 0
+          Align = alTop
+          Caption = 'AppUserModelID'
+          TabOrder = 9
+        end
+        object edRelaunchCommand: TEdit
+          AlignWithMargins = True
+          Left = 3
+          Top = 328
+          Width = 307
+          Height = 29
+          Margins.Top = 0
+          Align = alTop
+          TabOrder = 10
+        end
+        object labRelaunchCommand: TStaticText
+          AlignWithMargins = True
+          Left = 3
+          Top = 303
+          Width = 307
+          Height = 25
+          Margins.Bottom = 0
+          Align = alTop
+          Caption = 'RelaunchCommand (Edge PWA)'
+          TabOrder = 11
+        end
+      end
+    end
+    object Panel1: TPanel
+      Left = 264
+      Top = 120
+      Width = 185
+      Height = 89
+      Caption = 'Panel1'
+      TabOrder = 5
+      Visible = False
+      object labTemplateActiv: TStaticText
+        AlignWithMargins = True
+        Left = 4
+        Top = 4
+        Width = 177
+        Height = 44
+        Align = alTop
+        Caption = #9654' template for Active title'
+        Font.Charset = DEFAULT_CHARSET
+        Font.Color = clWindowText
+        Font.Height = -29
+        Font.Name = 'Segoe UI'
+        Font.Style = [fsBold, fsUnderline]
+        ParentFont = False
+        TabOrder = 0
+        Visible = False
+      end
+      object labTemplateInActiv: TStaticText
+        AlignWithMargins = True
+        Left = 4
+        Top = 54
+        Width = 177
+        Height = 25
+        Align = alTop
+        Caption = 'template for inactive title'
+        TabOrder = 1
+        Visible = False
       end
     end
   end
