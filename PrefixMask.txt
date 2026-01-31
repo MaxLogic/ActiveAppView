@@ -20,7 +20,7 @@ prefix=Obsidian,filename=C:\Users\pawel\AppData\Local\Programs\obsidian\Obsidian
 prefix=QBitTorrent,filename=*\qbittorrent.exe
 prefix=7z,filename=*\7zFM.exe
 prefix=mpc,filename=*\mpc-hc64.exe
-prefix=MaxLogic Classic Teams,filename=C:\Program Files\WindowsApps\MSTeams_25306.804.4102.7193_x64__8wekyb3d8bbwe\ms-teams.exe
+prefix=MaxLogic Classic Teams,filename=*\ms-teams.exe
 prefix=Mirosław,AppUserModelID=messages.google.com-C289C013_2b6zn51gm2mke!App
 prefix=OEC,AppUserModelID=teams.microsoft.com-EC3AC78B_sgbv0bttxw9p2!App
 prefix=MaxLogic Teams,CmdParams=*EdgeTeams_MaxLogic*

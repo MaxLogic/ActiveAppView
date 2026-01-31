@@ -15,6 +15,12 @@ type
     fIcon: TIcon;
     fCommandLine: String;
     fCommandLineRetrieved: Boolean;
+    fCommandLineParams: String;
+    fCommandLineParamsRetrieved: Boolean;
+    fAppUserModelID: String;
+    fAppUserModelIDRetrieved: Boolean;
+    fRelaunchCommand: String;
+    fRelaunchCommandRetrieved: Boolean;
 
     fCaption: string;
     function GetIcon: TIcon;
@@ -91,7 +97,12 @@ end;
 
 function TAppInfo.GetAppUserModelID: String;
 begin
-  Result:= RetrieveAppUserModelID(fWnd);
+  if not fAppUserModelIDRetrieved then
+  begin
+    fAppUserModelIDRetrieved := True;
+    fAppUserModelID := RetrieveAppUserModelID(fWnd);
+  end;
+  Result := fAppUserModelID;
 end;
 
 function TAppInfo.GetCommandLine: String;
@@ -112,16 +123,24 @@ var
   s: String;
   i: Integer;
 begin
-  s:= Self.CommandLine.Trim;
-  if s = '' then
-    Exit('');
+  if not fCommandLineParamsRetrieved then
+  begin
+    fCommandLineParamsRetrieved := True;
+    s := Self.CommandLine.Trim;
+    if s = '' then
+      fCommandLineParams := ''
+    else
+    begin
+      if startsStr('"', s) then
+        i := posEx('"', s, 2)
+      else
+        i := posEx(' ', s, 1);
 
-  if startsStr('"', s) then
-    i:= posEx('"', s, 2)
-  else
-    i:= posEx(' ', s, 1);
+      fCommandLineParams := Copy(s, i + 1, Length(s)).Trim;
+    end;
+  end;
 
-  Result:= Copy(s, i+1, Length(s)).Trim;
+  Result := fCommandLineParams;
 end;
 
 function TAppInfo.GetDisplayCaption: string;
@@ -166,7 +185,12 @@ end;
 
 function TAppInfo.GetRelaunchCommand: String;
 begin
-  Result:= RetrieveRelaunchCommand(fWnd);
+  if not fRelaunchCommandRetrieved then
+  begin
+    fRelaunchCommandRetrieved := True;
+    fRelaunchCommand := RetrieveRelaunchCommand(fWnd);
+  end;
+  Result := fRelaunchCommand;
 end;
 
 procedure TAppInfo.ScreenShoot(aBitMap: TBitmap);
