@@ -24,3 +24,9 @@ __recovery
 /*.rsm
 /bugreport.txt
 .aider*
+*.log
+/zip-project.bat
+/project.zip
+/conventions.md
+/agents.md
+*.cmds

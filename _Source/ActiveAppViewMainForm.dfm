@@ -4,11 +4,11 @@ object AppsViewMainFrm: TAppsViewMainFrm
   ActiveControl = lbApps
   Caption = 'Apps View'
   ClientHeight = 853
-  ClientWidth = 1427
-  Color = clBtnFace
+  ClientWidth = 2500
+  Color = clWindow
   Font.Charset = DEFAULT_CHARSET
   Font.Color = clWindowText
-  Font.Height = -16
+  Font.Height = -13
   Font.Name = 'Segoe UI'
   Font.Style = []
   KeyPreview = True
@@ -33,6 +33,27 @@ object AppsViewMainFrm: TAppsViewMainFrm
     Height = 847
     Align = alRight
   end
+  object Splitter4: TSplitter
+    AlignWithMargins = True
+    Left = 1424
+    Top = 3
+    Height = 847
+    Align = alRight
+  end
+  object Splitter5: TSplitter
+    AlignWithMargins = True
+    Left = 1780
+    Top = 3
+    Height = 847
+    Align = alRight
+  end
+  object Splitter6: TSplitter
+    AlignWithMargins = True
+    Left = 2136
+    Top = 3
+    Height = 847
+    Align = alRight
+  end
   object pnlApps: TPanel
     Left = 0
     Top = 0
@@ -41,6 +62,8 @@ object AppsViewMainFrm: TAppsViewMainFrm
     Align = alClient
     BevelOuter = bvNone
     Caption = 'pnlApps'
+    Color = clWindow
+    ParentBackground = False
     ShowCaption = False
     TabOrder = 0
     object Splitter2: TSplitter
@@ -116,6 +139,9 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Width = 500
       Height = 358
       Align = alBottom
+      BevelOuter = bvNone
+      Color = clWindow
+      ParentBackground = False
       ShowCaption = False
       TabOrder = 4
       object imgAppScreenshot: TImage
@@ -135,6 +161,8 @@ object AppsViewMainFrm: TAppsViewMainFrm
         Height = 356
         Align = alClient
         BevelOuter = bvNone
+        Color = clWindow
+        ParentBackground = False
         ShowCaption = False
         TabOrder = 0
         object edAppFileName: TEdit
@@ -155,7 +183,9 @@ object AppsViewMainFrm: TAppsViewMainFrm
           Height = 25
           Margins.Bottom = 0
           Align = alTop
+          AutoSize = False
           Caption = 'Filename'
+          TabStop = False
           TabOrder = 3
         end
         object edAppCaption: TEdit
@@ -176,7 +206,9 @@ object AppsViewMainFrm: TAppsViewMainFrm
           Height = 25
           Margins.Bottom = 0
           Align = alTop
+          AutoSize = False
           Caption = 'Application Title'
+          TabStop = False
           TabOrder = 2
         end
         object edCommandLineParams: TEdit
@@ -197,7 +229,9 @@ object AppsViewMainFrm: TAppsViewMainFrm
           Height = 25
           Margins.Bottom = 0
           Align = alTop
+          AutoSize = False
           Caption = 'CommandLine params (not reliable for PWAs)'
+          TabStop = False
           TabOrder = 5
         end
         object edPID: TEdit
@@ -218,7 +252,9 @@ object AppsViewMainFrm: TAppsViewMainFrm
           Height = 25
           Margins.Bottom = 0
           Align = alTop
+          AutoSize = False
           Caption = 'PID'
+          TabStop = False
           TabOrder = 7
         end
         object edAppUserModelID: TEdit
@@ -239,7 +275,9 @@ object AppsViewMainFrm: TAppsViewMainFrm
           Height = 25
           Margins.Bottom = 0
           Align = alTop
+          AutoSize = False
           Caption = 'AppUserModelID'
+          TabStop = False
           TabOrder = 9
         end
         object edRelaunchCommand: TEdit
@@ -260,7 +298,9 @@ object AppsViewMainFrm: TAppsViewMainFrm
           Height = 25
           Margins.Bottom = 0
           Align = alTop
+          AutoSize = False
           Caption = 'RelaunchCommand (Edge PWA)'
+          TabStop = False
           TabOrder = 11
         end
       end
@@ -270,7 +310,11 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Top = 120
       Width = 185
       Height = 89
-      Caption = 'Panel1'
+      BevelOuter = bvNone
+      Caption = ''
+      Color = clWindow
+      ParentBackground = False
+      ShowCaption = False
       TabOrder = 5
       Visible = False
       object labTemplateActiv: TStaticText
@@ -283,9 +327,9 @@ object AppsViewMainFrm: TAppsViewMainFrm
         Caption = #9654' template for Active title'
         Font.Charset = DEFAULT_CHARSET
         Font.Color = clWindowText
-        Font.Height = -29
+        Font.Height = -15
         Font.Name = 'Segoe UI'
-        Font.Style = [fsBold, fsUnderline]
+        Font.Style = [fsBold]
         ParentFont = False
         TabOrder = 0
         Visible = False
@@ -298,6 +342,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
         Height = 25
         Align = alTop
         Caption = 'template for inactive title'
+        TabStop = False
         TabOrder = 1
         Visible = False
       end
@@ -311,6 +356,8 @@ object AppsViewMainFrm: TAppsViewMainFrm
     Align = alRight
     BevelOuter = bvNone
     Caption = 'pnlExplorer'
+    Color = clWindow
+    ParentBackground = False
     ShowCaption = False
     TabOrder = 1
     object labExplorerTitle: TStaticText
@@ -372,6 +419,8 @@ object AppsViewMainFrm: TAppsViewMainFrm
     Align = alRight
     BevelOuter = bvNone
     Caption = 'pnlScripts'
+    Color = clWindow
+    ParentBackground = False
     ShowCaption = False
     TabOrder = 2
     object labScriptsTitle: TStaticText
@@ -413,6 +462,189 @@ object AppsViewMainFrm: TAppsViewMainFrm
     object pnlScriptsFocusRight: TPanel
       AlignWithMargins = True
       Left = 376
+      Top = 43
+      Width = 24
+      Height = 807
+      Align = alRight
+      Color = clBlack
+      ParentBackground = False
+      ShowCaption = False
+      TabOrder = 3
+    end
+  end
+  object pnlConsole: TPanel
+    Left = 1433
+    Top = 0
+    Width = 350
+    Height = 853
+    Align = alRight
+    BevelOuter = bvNone
+    Caption = 'pnlConsole'
+    Color = clWindow
+    ParentBackground = False
+    ShowCaption = False
+    TabOrder = 3
+    object labConsoleTitle: TStaticText
+      AlignWithMargins = True
+      Left = 3
+      Top = 3
+      Width = 344
+      Height = 34
+      Align = alTop
+      AutoSize = False
+      Caption = 'Console instances (F4)'
+      TabOrder = 0
+    end
+    object lbConsole: TListBox
+      AlignWithMargins = True
+      Left = 33
+      Top = 43
+      Width = 284
+      Height = 807
+      Align = alClient
+      ItemHeight = 21
+      Sorted = True
+      TabOrder = 1
+      OnDblClick = lbAppsDblClick
+      OnKeyUp = lbAppsKeyUp
+    end
+    object pnlConsoleFocusLeft: TPanel
+      AlignWithMargins = True
+      Left = 3
+      Top = 43
+      Width = 24
+      Height = 807
+      Align = alLeft
+      Color = clBlack
+      ParentBackground = False
+      ShowCaption = False
+      TabOrder = 2
+    end
+    object pnlConsoleFocusRight: TPanel
+      AlignWithMargins = True
+      Left = 323
+      Top = 43
+      Width = 24
+      Height = 807
+      Align = alRight
+      Color = clBlack
+      ParentBackground = False
+      ShowCaption = False
+      TabOrder = 3
+    end
+  end
+  object pnlDesktop: TPanel
+    Left = 1789
+    Top = 0
+    Width = 350
+    Height = 853
+    Align = alRight
+    BevelOuter = bvNone
+    Caption = 'pnlDesktop'
+    Color = clWindow
+    ParentBackground = False
+    ShowCaption = False
+    TabOrder = 4
+    object labDesktopTitle: TStaticText
+      AlignWithMargins = True
+      Left = 3
+      Top = 3
+      Width = 344
+      Height = 34
+      Align = alTop
+      AutoSize = False
+      Caption = 'Desktop (F6)'
+      TabOrder = 0
+    end
+    object lbDesktop: TListBox
+      AlignWithMargins = True
+      Left = 33
+      Top = 43
+      Width = 284
+      Height = 807
+      Align = alClient
+      ItemHeight = 21
+      Sorted = True
+      TabOrder = 1
+      OnDblClick = lbDesktopDblClick
+      OnKeyUp = lbDesktopKeyUp
+    end
+    object pnlDesktopFocusLeft: TPanel
+      AlignWithMargins = True
+      Left = 3
+      Top = 43
+      Width = 24
+      Height = 807
+      Align = alLeft
+      Color = clBlack
+      ParentBackground = False
+      ShowCaption = False
+      TabOrder = 2
+    end
+    object pnlDesktopFocusRight: TPanel
+      AlignWithMargins = True
+      Left = 323
+      Top = 43
+      Width = 24
+      Height = 807
+      Align = alRight
+      Color = clBlack
+      ParentBackground = False
+      ShowCaption = False
+      TabOrder = 3
+    end
+  end
+  object pnlShortCuts: TPanel
+    Left = 2145
+    Top = 0
+    Width = 350
+    Height = 853
+    Align = alRight
+    BevelOuter = bvNone
+    Caption = 'pnlShortCuts'
+    Color = clWindow
+    ParentBackground = False
+    ShowCaption = False
+    TabOrder = 5
+    object labShortCutsTitle: TStaticText
+      AlignWithMargins = True
+      Left = 3
+      Top = 3
+      Width = 344
+      Height = 34
+      Align = alTop
+      AutoSize = False
+      Caption = 'ShortCuts (F7)'
+      TabOrder = 0
+    end
+    object lbShortCuts: TListBox
+      AlignWithMargins = True
+      Left = 33
+      Top = 43
+      Width = 284
+      Height = 807
+      Align = alClient
+      ItemHeight = 21
+      Sorted = True
+      TabOrder = 1
+      OnDblClick = lbShortCutsDblClick
+      OnKeyUp = lbShortCutsKeyUp
+    end
+    object pnlShortCutsFocusLeft: TPanel
+      AlignWithMargins = True
+      Left = 3
+      Top = 43
+      Width = 24
+      Height = 807
+      Align = alLeft
+      Color = clBlack
+      ParentBackground = False
+      ShowCaption = False
+      TabOrder = 2
+    end
+    object pnlShortCutsFocusRight: TPanel
+      AlignWithMargins = True
+      Left = 323
       Top = 43
       Width = 24
       Height = 807
