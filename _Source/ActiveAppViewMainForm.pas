@@ -90,7 +90,9 @@ type
     fApps: TAppList;
     fOrgAppOnActivate: TNotifyEvent;
     fChatMonitor: TChatMonitor;
+    fLastFormFocusTick: UInt64;
     procedure AppOnActivate(Sender: TObject);
+    procedure MarkFormFocused;
     procedure UpdateGui;
     procedure UpdateScriptsList;
 
@@ -146,6 +148,7 @@ const
   cHideMaskFileName = 'HideMask.txt';
   cPrefixMaskFileName = 'PrefixMask.txt';
   cSettingsFileName = 'settings.ini';
+  cIgnoreF4AfterFocusMs = 200;
 
 resourcestring
   rsShortCutTargetMissing = 'ShortCut target not found: %s';
@@ -200,6 +203,7 @@ end;
 
 procedure TAppsViewMainFrm.AppOnActivate(Sender: TObject);
 begin
+  MarkFormFocused;
   UpdateGui;
   if assigned(fOrgAppOnActivate) then
     fOrgAppOnActivate(Sender);
@@ -575,6 +579,7 @@ end;
 
 procedure TAppsViewMainFrm.FormActivate(Sender: TObject);
 begin
+  MarkFormFocused;
   UpdateGui;
 end;
 
@@ -614,6 +619,12 @@ end;
 procedure TAppsViewMainFrm.FormKeyUp(Sender: TObject; var Key: Word;
   Shift: TShiftState);
 begin
+  if (Key = VK_F4) and ((GetTickCount64 - fLastFormFocusTick) < cIgnoreF4AfterFocusMs) then
+  begin
+    Key := 0;
+    Exit;
+  end;
+
   if Key = VK_F5 then
     UpdateGui
   else if Key = vk_F1 then
@@ -709,6 +720,11 @@ procedure TAppsViewMainFrm.lbShortCutsKeyUp(Sender: TObject; var Key: Word;
 begin
   if Key = VK_RETURN then
     ActivateShortCutItem;
+end;
+
+procedure TAppsViewMainFrm.MarkFormFocused;
+begin
+  fLastFormFocusTick := GetTickCount64;
 end;
 
 procedure TAppsViewMainFrm.LoadPrefixRules(l: TObjectList<TStringList>);
