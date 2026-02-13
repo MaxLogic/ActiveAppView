@@ -1,0 +1,7 @@
+.codex=\\wsl.localhost\Ubuntu\home\pawel\.codex
+pr agents="D:\Pawel\Prompts\Coding\agents (parts)\"
+prompts=D:\Pawel\Prompts
+pr commands=D:\Pawel\Prompts\Coding\Commands
+putty="C:\Program Files\PuTTY\putty.exe"
+d11 statuspro=F:\projects\Statuspro\_git\StartDelphiForStatusPro.cmd
+tmp on WSL=\\wsl.localhost\Ubuntu\tmp
