@@ -92,16 +92,31 @@ object AppsViewMainFrm: TAppsViewMainFrm
       ParentFont = False
       TabOrder = 0
     end
-    object lbApps: TListBox
+    object chkChatNotificationSound: TCheckBox
       AlignWithMargins = True
       Left = 33
       Top = 43
       Width = 440
-      Height = 434
+      Height = 29
+      Margins.Top = 3
+      Margins.Bottom = 0
+      Align = alTop
+      Caption = 'Play chat notification sounds'
+      Checked = True
+      State = cbChecked
+      TabOrder = 1
+      OnClick = chkChatNotificationSoundClick
+    end
+    object lbApps: TListBox
+      AlignWithMargins = True
+      Left = 33
+      Top = 75
+      Width = 440
+      Height = 402
       Align = alClient
       ItemHeight = 21
       Sorted = True
-      TabOrder = 1
+      TabOrder = 2
       OnClick = lbAppsClick
       OnDblClick = lbAppsDblClick
       OnKeyUp = lbAppsKeyUp
@@ -109,28 +124,28 @@ object AppsViewMainFrm: TAppsViewMainFrm
     object pnlAppFocusLeft: TPanel
       AlignWithMargins = True
       Left = 3
-      Top = 43
+      Top = 75
       Width = 24
-      Height = 434
+      Height = 402
       Align = alLeft
       Caption = 'Panel1'
       Color = clBlack
       ParentBackground = False
       ShowCaption = False
-      TabOrder = 2
+      TabOrder = 3
     end
     object pnlAppsFocusRight: TPanel
       AlignWithMargins = True
       Left = 479
-      Top = 43
+      Top = 75
       Width = 24
-      Height = 434
+      Height = 402
       Align = alRight
       Caption = 'Panel1'
       Color = clBlack
       ParentBackground = False
       ShowCaption = False
-      TabOrder = 3
+      TabOrder = 4
     end
     object pnlAppDetails: TPanel
       AlignWithMargins = True
@@ -143,7 +158,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Color = clWindow
       ParentBackground = False
       ShowCaption = False
-      TabOrder = 4
+      TabOrder = 5
       object imgAppScreenshot: TImage
         AlignWithMargins = True
         Left = 4

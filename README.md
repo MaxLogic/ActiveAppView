@@ -21,3 +21,19 @@ Accessibility tool for active application / explorer quick selection
 - Lines starting with `#` or `;`, or empty lines, are ignored.
 - Double-quoted VALUE is supported for paths with spaces; arguments are allowed, e.g.:
   - `putty="C:\Program Files\PuTTY\putty.exe" --start prod`
+
+## ChatReviewMask.txt (next to ActiveAppView.exe)
+- PrefixMask-style file used to select which apps are reviewed by chat monitoring.
+- One comma-separated `key=value` rule per line.
+- Supported keys: `caption`, `filename`, `AppUserModelID`, `CmdParams`.
+- Lines starting with `#` or `;`, or empty lines, are ignored.
+- Behavior:
+  - This file is the only source for selecting monitored apps.
+  - If file is missing or has no active rules, no apps are reviewed.
+  - If rules exist, an app is reviewed only when it matches at least one rule.
+  - Unread state is detected by caption pattern `(\d+)` (number inside parentheses).
+
+## Chat Notification Sound Toggle
+- Main form includes `Play chat notification sounds` checkbox.
+- Checkbox value is persisted to `settings.ini` under `[ChatMonitor] SoundEnabled`.
+- Toggle applies immediately and controls unread + PWA-closed sound notifications.

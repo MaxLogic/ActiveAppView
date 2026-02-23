@@ -1,0 +1,19 @@
+; PrefixMask-style chat review filter
+; One comma-separated key=value list per line.
+; Supported keys:
+; caption       - match window caption mask
+; filename      - match full executable path mask
+; AppUserModelID - match app user model id (useful for Edge PWA profiles)
+; CmdParams     - match command line params
+;
+; Behavior:
+; - This file is the only source of chat monitor app selection.
+; - If this file is empty (or missing), no app is reviewed.
+; - If at least one rule exists, an app is reviewed only when it matches at least one rule.
+; - Unread detection is automatic and checks caption for a numeric counter pattern: (\d+)
+;
+; Examples:
+
+caption=*teams*
+filename=*msedge.exe,CmdParams=*Teams*
+AppUserModelID=*teams*
