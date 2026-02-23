@@ -6,7 +6,8 @@ uses
   System.Classes, System.Generics.Collections, System.SysUtils, System.Variants,
   Winapi.Messages, Winapi.Windows,
   Vcl.Buttons, Vcl.Controls, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.Forms, Vcl.Graphics, Vcl.StdCtrls,
-  ActiveAppView.ChatMonitor, ActiveAppViewCore; // Add this new unit,
+  maxAsync,
+  ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore;
 
 type
   TAppsViewMainFrm = class(TForm)
@@ -90,30 +91,50 @@ type
   private
 
     fApps: TAppList;
+    fAuxListRefresh: iAsync;
+    fAuxListRefreshBusy: Integer;
+    fAuxListRefreshPending: Integer;
+    fChatMonitorBusy: Integer;
+    fChatMonitorPending: Integer;
+    fChatMonitorTask: iAsync;
+    fConfigCache: TConfigCache;
     fOrgAppOnActivate: TNotifyEvent;
     fChatMonitor: TChatMonitor;
+    fGuiRefreshQueued: Integer;
     fLastFormFocusTick: UInt64;
+    fPendingAuxSnapshot: TObject;
+    fSharedAppsSnapshot: TArray<TChatAppSnapshot>;
+    fSharedAppsSnapshotTick: UInt64;
     procedure AppOnActivate(Sender: TObject);
+    procedure ApplyAuxListsSnapshot(aSnapshotObject: TObject);
+    procedure ApplyDesktopSnapshot(const aItems: TNamedValueArray);
+    procedure ApplyScriptsSnapshot(const aScripts: TStringArray);
+    procedure ApplyShortCutsSnapshot(const aItems: TNamedValueArray);
+    function BuildAuxListsSnapshot: TObject;
     procedure MarkFormFocused;
+    procedure OnAuxListsRefreshDone;
+    procedure OnChatMonitorDone;
+    procedure QueueGuiRefresh;
+    procedure RebuildSharedAppsSnapshot;
+    procedure RunAuxListsRefresh;
+    procedure RunChatMonitorSnapshot;
+    procedure StartAuxListsRefresh;
+    procedure StartChatMonitorProcessing;
+    procedure EnsureSharedAppsSnapshotFresh(const aMaxAgeMs: UInt64);
     procedure UpdateGui;
-    procedure UpdateScriptsList;
 
     procedure BringToFrontFocusedApp(lb: TListBox);
     procedure UpdateAppDetail;
-    procedure LoadPrefixRules(l: TObjectList<TStringList>);
-    procedure CheckPrefixRule(var s: string; app: TAppInfo; l: TObjectList<TStringList>);
-    function ExcludeByMask(app: TAppInfo; l: TStringList): boolean;
+    procedure CheckPrefixRule(var s: string; app: TAppInfo; const aRules: TPrefixRuleArray);
+    function ExcludeByMask(app: TAppInfo; const aMasks: TStringArray): boolean;
     procedure RestoreItemIndex(lb: TListBox; wnd: hwnd; oldItemIndex: integer; const aOldItemCaption: string);
     function GetWnd(lb: TListBox): hwnd;
     procedure ActiveControlChanged(Sender: TObject);
     procedure ClearListBoxItemData(lb: TListBox);
     procedure UpdateTitlePrefix(st: TStaticText; const aPrefix: string; aEnabled: boolean);
-    function IsTerminalApp(const aFileName: string; aPatterns: TStringList): boolean;
-    procedure LoadTerminalPatterns(l: TStringList);
+    function IsTerminalApp(const aFileName: string; const aPatterns: TStringArray): boolean;
     function TryGetKnownFolderPath(const aFolderId: TGUID; out aPath: string): boolean;
-    procedure AddDesktopItemsFromFolder(const aFolder: string);
-    procedure UpdateDesktopList;
-    procedure UpdateShortCutsList;
+    procedure AddDesktopItemsFromFolder(const aFolder: string; var aItems: TNamedValueArray);
     function TryParseShortCutValue(const aValue: string; out aTargetPath: string;
       out aParams: string): boolean;
     procedure ActivateDesktopItem;
@@ -129,7 +150,7 @@ var
 implementation
 
 uses
-  System.IniFiles, System.IOUtils, System.StrUtils,
+  System.IniFiles, System.IOUtils, System.StrUtils, System.SyncObjs,
   Winapi.ActiveX, Winapi.KnownFolders, Winapi.MMSystem, Winapi.ShellAPI, Winapi.ShlObj,
   AutoFree, bsUtils, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils,
   srDesktop;
@@ -141,6 +162,13 @@ type
   public
     Value: string;
     constructor Create(const aValue: string);
+  end;
+
+  TAuxListsSnapshot = class
+  public
+    DesktopItems: TNamedValueArray;
+    Scripts: TStringArray;
+    ShortCuts: TNamedValueArray;
   end;
 
 const
@@ -206,7 +234,7 @@ end;
 procedure TAppsViewMainFrm.AppOnActivate(Sender: TObject);
 begin
   MarkFormFocused;
-  UpdateGui;
+  QueueGuiRefresh;
   if assigned(fOrgAppOnActivate) then
     fOrgAppOnActivate(Sender);
 end;
@@ -257,39 +285,17 @@ begin
   end;
 end;
 
-function TAppsViewMainFrm.IsTerminalApp(const aFileName: string; aPatterns: TStringList): boolean;
+function TAppsViewMainFrm.IsTerminalApp(const aFileName: string; const aPatterns: TStringArray): boolean;
 var
   lPattern: string;
 begin
   Result := False;
-  if (aFileName = '') or (aPatterns = nil) then
+  if aFileName = '' then
     Exit;
 
   for lPattern in aPatterns do
     if maxLogic.StrUtils.StringMatches(aFileName, lPattern, False) then
       Exit(True);
-end;
-
-procedure TAppsViewMainFrm.LoadTerminalPatterns(l: TStringList);
-var
-  lFileName: string;
-  X: integer;
-  s: string;
-begin
-  l.Clear;
-  lFileName := CombinePath([GetInstallDir, cTerminalPatternsFileName]);
-  if not TFile.Exists(lFileName) then
-    Exit;
-
-  l.LoadFromFile(lFileName, TEncoding.Utf8);
-  for X := l.Count - 1 downto 0 do
-  begin
-    s := l[X].Trim;
-    if (s = '') or StartsText('#', s) or StartsText(';', s) then
-      l.Delete(X)
-    else
-      l[X] := s;
-  end;
 end;
 
 function TAppsViewMainFrm.TryGetKnownFolderPath(const aFolderId: TGUID; out aPath: string): boolean;
@@ -306,52 +312,99 @@ begin
     CoTaskMemFree(lPtr);
 end;
 
-procedure TAppsViewMainFrm.AddDesktopItemsFromFolder(const aFolder: string);
+procedure TAppsViewMainFrm.AddDesktopItemsFromFolder(const aFolder: string; var aItems: TNamedValueArray);
 var
   lDir: string;
   lFile: string;
-  lName: string;
-  lItem: TListBoxItemData;
+  lItem: TNamedValue;
 begin
   if not DirectoryExists(aFolder) then
     Exit;
 
   for lDir in TDirectory.GetDirectories(aFolder) do
   begin
-    lName := ExtractFileName(lDir);
-    if lName = '' then
-      lName := lDir;
-    lItem := TListBoxItemData.Create(lDir);
-    lbDesktop.Items.AddObject(lName, lItem);
+    lItem.Name := ExtractFileName(lDir);
+    if lItem.Name = '' then
+      lItem.Name := lDir;
+    lItem.Value := lDir;
+    SetLength(aItems, Length(aItems) + 1);
+    aItems[High(aItems)] := lItem;
   end;
 
   for lFile in TDirectory.GetFiles(aFolder, '*.*') do
   begin
-    lName := ExtractFileName(lFile);
-    if lName = '' then
-      lName := lFile;
-    lItem := TListBoxItemData.Create(lFile);
-    lbDesktop.Items.AddObject(lName, lItem);
+    lItem.Name := ExtractFileName(lFile);
+    if lItem.Name = '' then
+      lItem.Name := lFile;
+    lItem.Value := lFile;
+    SetLength(aItems, Length(aItems) + 1);
+    aItems[High(aItems)] := lItem;
   end;
 end;
 
-procedure TAppsViewMainFrm.UpdateDesktopList;
+function TAppsViewMainFrm.BuildAuxListsSnapshot: TObject;
 var
-  lUserDesktop: string;
+  lExt: string;
+  lItem: TNamedValue;
+  lScriptFile: string;
+  lScriptsDir: string;
   lPublicDesktop: string;
+  lSnapshot: TAuxListsSnapshot;
+  lUserDesktop: string;
+begin
+  lSnapshot := TAuxListsSnapshot.Create;
+  try
+    SetLength(lSnapshot.DesktopItems, 0);
+    if TryGetKnownFolderPath(FOLDERID_Desktop, lUserDesktop) then
+      AddDesktopItemsFromFolder(lUserDesktop, lSnapshot.DesktopItems);
+    if TryGetKnownFolderPath(FOLDERID_PublicDesktop, lPublicDesktop) then
+      if not SameText(lUserDesktop, lPublicDesktop) then
+        AddDesktopItemsFromFolder(lPublicDesktop, lSnapshot.DesktopItems);
+
+    lSnapshot.ShortCuts := fConfigCache.GetShortCuts(cShortCutsFileName);
+
+    SetLength(lSnapshot.Scripts, 0);
+    lScriptsDir := CombinePath([GetInstallDir, cScriptsFolderName]);
+    if TDirectory.Exists(lScriptsDir) then
+    begin
+      for lScriptFile in TDirectory.GetFiles(lScriptsDir, '*.*') do
+      begin
+        lExt := ExtractFileExt(lScriptFile);
+        if System.StrUtils.MatchText(lExt, ['.cmd', '.bat', '.ps1', '.exe', '.py']) then
+        begin
+          lItem.Name := ExtractFileName(lScriptFile);
+          lItem.Value := '';
+          SetLength(lSnapshot.Scripts, Length(lSnapshot.Scripts) + 1);
+          lSnapshot.Scripts[High(lSnapshot.Scripts)] := lItem.Name;
+        end;
+      end;
+    end;
+
+    Result := lSnapshot;
+  except
+    lSnapshot.Free;
+    raise;
+  end;
+end;
+
+procedure TAppsViewMainFrm.ApplyDesktopSnapshot(const aItems: TNamedValueArray);
+var
+  lIndex: Integer;
+  lItem: TListBoxItemData;
   lPrevCaption: string;
 begin
+  lPrevCaption := '';
   if lbDesktop.ItemIndex <> -1 then
     lPrevCaption := lbDesktop.Items[lbDesktop.ItemIndex];
 
   lbDesktop.Items.BeginUpdate;
   try
     ClearListBoxItemData(lbDesktop);
-    if TryGetKnownFolderPath(FOLDERID_Desktop, lUserDesktop) then
-      AddDesktopItemsFromFolder(lUserDesktop);
-    if TryGetKnownFolderPath(FOLDERID_PublicDesktop, lPublicDesktop) then
-      if not SameText(lUserDesktop, lPublicDesktop) then
-        AddDesktopItemsFromFolder(lPublicDesktop);
+    for lIndex := 0 to High(aItems) do
+    begin
+      lItem := TListBoxItemData.Create(aItems[lIndex].Value);
+      lbDesktop.Items.AddObject(aItems[lIndex].Name, lItem);
+    end;
   finally
     lbDesktop.Items.EndUpdate;
   end;
@@ -359,52 +412,115 @@ begin
   RestoreSelectedItem(lbDesktop, lPrevCaption);
 end;
 
-procedure TAppsViewMainFrm.UpdateShortCutsList;
+procedure TAppsViewMainFrm.ApplyShortCutsSnapshot(const aItems: TNamedValueArray);
 var
-  lFileName: string;
-  lPrevCaption: string;
-  lLines: TStringList;
-  lLine: string;
-  lKey: string;
-  lValue: string;
-  lPos: integer;
+  lIndex: Integer;
   lItem: TListBoxItemData;
-  X: integer;
+  lPrevCaption: string;
 begin
+  lPrevCaption := '';
   if lbShortCuts.ItemIndex <> -1 then
     lPrevCaption := lbShortCuts.Items[lbShortCuts.ItemIndex];
 
   lbShortCuts.Items.BeginUpdate;
   try
     ClearListBoxItemData(lbShortCuts);
-    lFileName := CombinePath([GetInstallDir, cShortCutsFileName]);
-    if TFile.Exists(lFileName) then
+    for lIndex := 0 to High(aItems) do
     begin
-      gc(lLines, TStringList.Create);
-      lLines.LoadFromFile(lFileName, TEncoding.Utf8);
-      for X := 0 to lLines.Count - 1 do
-      begin
-        lLine := lLines[X].Trim;
-        if (lLine = '') or StartsText('#', lLine) or StartsText(';', lLine) then
-          Continue;
-        lPos := Pos('=', lLine);
-        if lPos <= 0 then
-          Continue;
-
-        lKey := Trim(Copy(lLine, 1, lPos - 1));
-        lValue := Trim(Copy(lLine, lPos + 1, MaxInt));
-        if (lKey = '') or (lValue = '') then
-          Continue;
-
-        lItem := TListBoxItemData.Create(lValue);
-        lbShortCuts.Items.AddObject(lKey, lItem);
-      end;
+      lItem := TListBoxItemData.Create(aItems[lIndex].Value);
+      lbShortCuts.Items.AddObject(aItems[lIndex].Name, lItem);
     end;
   finally
     lbShortCuts.Items.EndUpdate;
   end;
 
   RestoreSelectedItem(lbShortCuts, lPrevCaption);
+end;
+
+procedure TAppsViewMainFrm.ApplyScriptsSnapshot(const aScripts: TStringArray);
+var
+  lIndex: Integer;
+  lItemIndex: Integer;
+  lScriptName: string;
+  lPrevFocused: string;
+begin
+  lPrevFocused := '';
+  if lbScripts.ItemIndex <> -1 then
+    lPrevFocused := lbScripts.Items[lbScripts.ItemIndex];
+
+  lbScripts.Items.BeginUpdate;
+  try
+    lbScripts.ItemIndex := -1;
+    lbScripts.Items.Clear;
+    for lIndex := 0 to High(aScripts) do
+    begin
+      lScriptName := aScripts[lIndex];
+      lItemIndex := lbScripts.Items.Add(lScriptName);
+      if (lbScripts.ItemIndex = -1) and SameText(lPrevFocused, lScriptName) then
+        lbScripts.ItemIndex := lItemIndex;
+    end;
+  finally
+    lbScripts.Items.EndUpdate;
+  end;
+end;
+
+procedure TAppsViewMainFrm.ApplyAuxListsSnapshot(aSnapshotObject: TObject);
+var
+  lSnapshot: TAuxListsSnapshot;
+begin
+  if not (aSnapshotObject is TAuxListsSnapshot) then
+    Exit;
+
+  lSnapshot := TAuxListsSnapshot(aSnapshotObject);
+  ApplyScriptsSnapshot(lSnapshot.Scripts);
+  ApplyDesktopSnapshot(lSnapshot.DesktopItems);
+  ApplyShortCutsSnapshot(lSnapshot.ShortCuts);
+end;
+
+procedure TAppsViewMainFrm.RunAuxListsRefresh;
+begin
+  fPendingAuxSnapshot := BuildAuxListsSnapshot;
+end;
+
+procedure TAppsViewMainFrm.OnAuxListsRefreshDone;
+begin
+  try
+    if Assigned(fPendingAuxSnapshot) then
+    begin
+      ApplyAuxListsSnapshot(fPendingAuxSnapshot);
+      FreeAndNil(fPendingAuxSnapshot);
+    end;
+  finally
+    TInterlocked.Exchange(fAuxListRefreshBusy, 0);
+    if TInterlocked.Exchange(fAuxListRefreshPending, 0) = 1 then
+      StartAuxListsRefresh;
+  end;
+end;
+
+procedure TAppsViewMainFrm.StartAuxListsRefresh;
+begin
+  if TInterlocked.CompareExchange(fAuxListRefreshBusy, 1, 0) <> 0 then
+  begin
+    TInterlocked.Exchange(fAuxListRefreshPending, 1);
+    Exit;
+  end;
+
+  fAuxListRefresh := SimpleAsyncCall(RunAuxListsRefresh, 'ActiveAppView.AuxListRefresh', OnAuxListsRefreshDone);
+end;
+
+procedure TAppsViewMainFrm.QueueGuiRefresh;
+begin
+  if TInterlocked.CompareExchange(fGuiRefreshQueued, 1, 0) <> 0 then
+    Exit;
+
+  TThread.Queue(nil,
+    procedure
+    begin
+      TInterlocked.Exchange(fGuiRefreshQueued, 0);
+      if csDestroying in ComponentState then
+        Exit;
+      UpdateGui;
+    end);
 end;
 
 function TAppsViewMainFrm.TryParseShortCutValue(const aValue: string; out aTargetPath: string;
@@ -529,60 +645,46 @@ begin
     lb.ItemIndex := 0;
 end;
 
-procedure TAppsViewMainFrm.CheckPrefixRule(var s: string; app: TAppInfo;
-  l: TObjectList<TStringList>);
+procedure TAppsViewMainFrm.CheckPrefixRule(var s: string; app: TAppInfo; const aRules: TPrefixRuleArray);
 var
-  ls: TStringList;
-  lCmdParams, lAppUserModelID, lCaption, lFileName: string;
+  lRule: TPrefixRule;
 begin
-  for ls in l do
+  for lRule in aRules do
   begin
-    ls.CaseSensitive:= False;
-    lCaption := ls.Values['caption'];
-    lFileName := ls.Values['filename'];
-    lAppUserModelID:= ls.Values['AppUserModelID'];
-    lCmdParams:= ls.Values['CmdParams'];
-
-    if ((lCaption <> '') and maxLogic.StrUtils.StringMatches(app.caption, lCaption, False))
-      or ((lFileName <> '') and maxLogic.StrUtils.StringMatches(app.FileName, lFileName, False))
-      or ((lAppUserModelID <> '') and maxLogic.StrUtils.StringMatches(app.AppUserModelID, lAppUserModelID, False))
-      or ((lCmdParams<> '') and maxLogic.StrUtils.StringMatches(app.CommandLineParams, lCmdParams, False)) then
+    if ((lRule.CaptionMask <> '') and maxLogic.StrUtils.StringMatches(app.caption, lRule.CaptionMask, False))
+      or ((lRule.FileNameMask <> '') and maxLogic.StrUtils.StringMatches(app.FileName, lRule.FileNameMask, False))
+      or ((lRule.AppUserModelIDMask <> '') and maxLogic.StrUtils.StringMatches(app.AppUserModelID, lRule.AppUserModelIDMask, False))
+      or ((lRule.CmdParamsMask <> '') and maxLogic.StrUtils.StringMatches(app.CommandLineParams, lRule.CmdParamsMask, False)) then
     begin
-      s := ls.Values['prefix'] + ' - ' + s;
-      exit;
+      if lRule.Prefix <> '' then
+        s := lRule.Prefix + ' - ' + s;
+      Exit;
     end;
   end;
 end;
 
-function TAppsViewMainFrm.ExcludeByMask(app: TAppInfo;
-  l: TStringList): boolean;
+function TAppsViewMainFrm.ExcludeByMask(app: TAppInfo; const aMasks: TStringArray): boolean;
 var
-  X: integer;
-  m: string;
+  lMask: string;
 begin
   Result := False;
-  // first only the caption
-  for X := 0 to l.Count - 1 do
+  for lMask in aMasks do
   begin
-    m := l[X];
-    if maxLogic.StrUtils.StringMatches(app.caption, m, False) then
-      exit(True);
+    if maxLogic.StrUtils.StringMatches(app.caption, lMask, False) then
+      Exit(True);
   end;
 
-  // if the caption is ok, then go by the file name
-  // but note, that retriving the file name takes a bit longer, so if we are lucky, we already excluded the item
-  for X := 0 to l.Count - 1 do
+  for lMask in aMasks do
   begin
-    m := l[X];
-    if maxLogic.StrUtils.StringMatches(app.FileName, m, False) then
-      exit(True);
+    if maxLogic.StrUtils.StringMatches(app.FileName, lMask, False) then
+      Exit(True);
   end;
 end;
 
 procedure TAppsViewMainFrm.FormActivate(Sender: TObject);
 begin
   MarkFormFocused;
-  UpdateGui;
+  QueueGuiRefresh;
 end;
 
 procedure TAppsViewMainFrm.FormCreate(Sender: TObject);
@@ -590,6 +692,7 @@ var
   lIniFile: TMemIniFile;
 begin
   fApps := TAppList.Create;
+  fConfigCache := TConfigCache.Create(GetInstallDir);
   AddToAutoStart;
   Screen.OnActiveControlChange := ActiveControlChanged;
   labAppTitle.Height := labTemplateActiv.Height;
@@ -604,19 +707,38 @@ begin
 
   gc(lIniFile, TMemIniFile.Create(CombinePath([GetInstallDir, cSettingsFileName]), TEncoding.Utf8, False));
   fChatMonitor := TChatMonitor.Create(lIniFile);
+  fChatMonitor.UseConfigCache(fConfigCache);
   chkChatNotificationSound.Checked := lIniFile.ReadBool('ChatMonitor', 'SoundEnabled', True);
   chkChatNotificationSound.Enabled := lIniFile.ReadBool('ChatMonitor', 'Enabled', False);
   fChatMonitor.SoundEnabled := chkChatNotificationSound.Checked;
   tmrChatMonitor.Interval := lIniFile.ReadInteger('ChatMonitor', 'CheckIntervalSeconds', 5) * 1000;
   tmrChatMonitor.Enabled:= lIniFile.ReadBool('ChatMonitor', 'Enabled', False);
+  SetLength(fSharedAppsSnapshot, 0);
+  fSharedAppsSnapshotTick := 0;
 end;
 
 procedure TAppsViewMainFrm.FormDestroy(Sender: TObject);
 begin
+  tmrChatMonitor.Enabled := False;
+  TInterlocked.Exchange(fChatMonitorPending, 0);
+  TInterlocked.Exchange(fAuxListRefreshPending, 0);
+  TInterlocked.Exchange(fChatMonitorBusy, 0);
+  TInterlocked.Exchange(fAuxListRefreshBusy, 0);
+
+  if Assigned(fAuxListRefresh) then
+    TWaiter.WaitFor([fAuxListRefresh], INFINITE, True);
+  if Assigned(fChatMonitorTask) then
+    TWaiter.WaitFor([fChatMonitorTask], INFINITE, True);
+
+  FreeAndNil(fPendingAuxSnapshot);
+  fAuxListRefresh := nil;
+  fChatMonitorTask := nil;
+
   application.OnActivate := fOrgAppOnActivate;
   ClearListBoxItemData(lbDesktop);
   ClearListBoxItemData(lbShortCuts);
   FreeAndNil(fChatMonitor);
+  FreeAndNil(fConfigCache);
   fApps.Free;
   Screen.OnActiveControlChange := nil;
 end;
@@ -648,7 +770,7 @@ end;
 
 procedure TAppsViewMainFrm.FormShow(Sender: TObject);
 begin
-  UpdateGui;
+  QueueGuiRefresh;
 end;
 
 function TAppsViewMainFrm.GetWnd(lb: TListBox): hwnd;
@@ -744,26 +866,58 @@ begin
   fLastFormFocusTick := GetTickCount64;
 end;
 
-procedure TAppsViewMainFrm.LoadPrefixRules(l: TObjectList<TStringList>);
+procedure TAppsViewMainFrm.EnsureSharedAppsSnapshotFresh(const aMaxAgeMs: UInt64);
 var
-  l1, l2: TStringList;
-  X: integer;
+  lNowTick: UInt64;
 begin
-  gc(l1, TStringList.Create);
+  lNowTick := GetTickCount64;
+  if (fSharedAppsSnapshotTick <> 0) and (aMaxAgeMs <> 0)
+    and ((lNowTick - fSharedAppsSnapshotTick) < aMaxAgeMs) then
+    Exit;
 
-  l1.LoadFromFile(CombinePath([GetInstallDir, cPrefixMaskFileName]), TEncoding.Utf8);
-  for X := 0 to l1.Count - 1 do
+  fApps.Update;
+  RebuildSharedAppsSnapshot;
+end;
+
+procedure TAppsViewMainFrm.RebuildSharedAppsSnapshot;
+var
+  lIndex: Integer;
+begin
+  SetLength(fSharedAppsSnapshot, fApps.Count);
+  for lIndex := 0 to fApps.Count - 1 do
   begin
-    if l1[X] <> '' then
-      if l1[X][1] <> ';' then
-      begin
-        l2 := TStringList.Create;
-        l2.CaseSensitive := False;
-        l2.StrictDelimiter:= True;
-        l2.Commatext := l1[X];
-        l.Add(l2);
-      end;
+    fSharedAppsSnapshot[lIndex].Wnd := fApps[lIndex].Wnd;
+    fSharedAppsSnapshot[lIndex].Caption := fApps[lIndex].Caption;
   end;
+  fSharedAppsSnapshotTick := GetTickCount64;
+end;
+
+procedure TAppsViewMainFrm.RunChatMonitorSnapshot;
+begin
+  if Assigned(fChatMonitor) then
+    fChatMonitor.ProcessSnapshot(fSharedAppsSnapshot);
+end;
+
+procedure TAppsViewMainFrm.OnChatMonitorDone;
+begin
+  TInterlocked.Exchange(fChatMonitorBusy, 0);
+  if (TInterlocked.Exchange(fChatMonitorPending, 0) = 1) and (not (csDestroying in ComponentState)) then
+    StartChatMonitorProcessing;
+end;
+
+procedure TAppsViewMainFrm.StartChatMonitorProcessing;
+begin
+  if not Assigned(fChatMonitor) then
+    Exit;
+
+  EnsureSharedAppsSnapshotFresh(900);
+  if TInterlocked.CompareExchange(fChatMonitorBusy, 1, 0) <> 0 then
+  begin
+    TInterlocked.Exchange(fChatMonitorPending, 1);
+    Exit;
+  end;
+
+  fChatMonitorTask := SimpleAsyncCall(RunChatMonitorSnapshot, 'ActiveAppView.ChatMonitor', OnChatMonitorDone);
 end;
 
 procedure TAppsViewMainFrm.RestoreItemIndex(lb: TListBox; wnd: hwnd;
@@ -806,8 +960,7 @@ end;
 
 procedure TAppsViewMainFrm.tmrChatMonitorTimer(Sender: TObject);
 begin
-  if Assigned(fChatMonitor) then
-    fChatMonitor.Process;
+  StartChatMonitorProcessing;
 end;
 
 procedure TAppsViewMainFrm.UpdateAppDetail;
@@ -832,35 +985,30 @@ end;
 
 procedure TAppsViewMainFrm.UpdateGui;
 var
-  lOldAppsIndex: integer;
-  lOldConsoleIndex: integer;
-  lOldExplorerIndex: integer;
-  lAppsFocusedCaption: string;
-  lConsoleFocusedCaption: string;
-  lExplorerFocusedCaption: string;
-  lAppsWnd: hwnd;
-  lConsoleWnd: hwnd;
-  lExplorerWnd: hwnd;
   lApp: TAppInfo;
-  lExcludeList: TStringList;
-  lPrefixRules: TObjectList<TStringList>;
-  lTerminalPatterns: TStringList;
-  s: string;
+  lAppsFocusedCaption: string;
+  lAppsWnd: hWnd;
+  lConsoleFocusedCaption: string;
+  lConsoleWnd: hWnd;
+  lExcludeMasks: TStringArray;
   lExplorers: TList<TAppInfo>;
-  X: integer;
+  lExplorerFocusedCaption: string;
+  lExplorerWnd: hWnd;
+  lOldAppsIndex: Integer;
+  lOldConsoleIndex: Integer;
+  lOldExplorerIndex: Integer;
+  lPrefixRules: TPrefixRuleArray;
+  lTerminalPatterns: TStringArray;
+  lTitle: string;
+  lIndex: Integer;
 begin
-  gc(lExcludeList, TStringList.Create);
-  gc(lPrefixRules, TObjectList<TStringList>.Create);
-  gc(lExplorers, TList<TAppInfo>.Create);
-  gc(lTerminalPatterns, TStringList.Create);
-  LoadPrefixRules(lPrefixRules);
-  LoadTerminalPatterns(lTerminalPatterns);
-  lExcludeList.LoadFromFile(CombinePath([GetInstallDir, cHideMaskFileName]));
+  EnsureSharedAppsSnapshotFresh(250);
 
-  // preprocess and remove irrelevant items
-  for X := lExcludeList.Count - 1 downto 0 do
-    if (lExcludeList[X].Trim = '') or StartsText(';', lExcludeList[X].Trim) then
-      lExcludeList.delete(X);
+  lExcludeMasks := fConfigCache.GetHideMasks(cHideMaskFileName);
+  lPrefixRules := fConfigCache.GetPrefixRules(cPrefixMaskFileName);
+  lTerminalPatterns := fConfigCache.GetTerminalPatterns(cTerminalPatternsFileName);
+
+  gc(lExplorers, TList<TAppInfo>.Create);
 
   lOldAppsIndex := lbApps.ItemIndex;
   lAppsFocusedCaption := '';
@@ -877,29 +1025,28 @@ begin
   lbApps.Items.BeginUpdate;
   lbConsole.Items.BeginUpdate;
   try
-    fApps.Update;
     lbApps.Items.Clear;
     lbConsole.Items.Clear;
-    for X := 0 to fApps.Count - 1 do
+    for lIndex := 0 to fApps.Count - 1 do
     begin
-      lApp := fApps[X];
+      lApp := fApps[lIndex];
 
       if (lApp.wnd = application.Handle)
         or (lApp.wnd = self.Handle) then
         Continue;
 
       if lApp.caption <> '' then
-        if (not ExcludeByMask(lApp, lExcludeList)) then
+        if (not ExcludeByMask(lApp, lExcludeMasks)) then
           if SameText('explorer.exe', ExtractFileName(lApp.FileName)) then
             lExplorers.Add(lApp)
           else
           begin
-            s := Trim(lApp.DisplayCaption);
-            CheckPrefixRule(s, lApp, lPrefixRules);
+            lTitle := Trim(lApp.DisplayCaption);
+            CheckPrefixRule(lTitle, lApp, lPrefixRules);
             if IsTerminalApp(lApp.FileName, lTerminalPatterns) then
-              lbConsole.Items.AddObject(s, TObject(lApp.wnd))
+              lbConsole.Items.AddObject(lTitle, TObject(lApp.wnd))
             else
-              lbApps.Items.AddObject(s, TObject(lApp.wnd));
+              lbApps.Items.AddObject(lTitle, TObject(lApp.wnd));
           end;
     end;
   finally
@@ -925,42 +1072,7 @@ begin
   end;
   RestoreItemIndex(lbExplorer, lExplorerWnd, lOldExplorerIndex, lExplorerFocusedCaption);
 
-  UpdateScriptsList;
-  UpdateDesktopList;
-  UpdateShortCutsList;
-end;
-
-procedure TAppsViewMainFrm.UpdateScriptsList;
-var
-  lExt: string;
-  s, lPrevFocused: string;
-  i: integer;
-  lScriptsDir: string;
-begin
-  if lbScripts.ItemIndex <> -1 then
-    lPrevFocused := lbScripts.Items[lbScripts.ItemIndex];
-  lbScripts.Items.BeginUpdate;
-  try
-    lbScripts.ItemIndex := -1;
-    lbScripts.Items.Clear;
-    lScriptsDir := CombinePath([GetInstallDir, cScriptsFolderName]);
-    for var fn in TDirectory.GetFiles(lScriptsDir, '*.*') do
-    begin
-      lExt := ExtractFileExt(fn);
-      if System.StrUtils.MatchText(lExt, ['.cmd', '.bat', '.ps1', '.exe', '.py']) then
-      begin
-        s := ExtractFileName(fn);
-        i := lbScripts.Items.Add(s);
-        if lbScripts.ItemIndex = -1 then
-          if SameText(lPrevFocused, s) then
-            lbScripts.ItemIndex := i;
-
-      end;
-    end;
-  finally
-    lbScripts.Items.EndUpdate;
-  end;
-
+  StartAuxListsRefresh;
 end;
 
 end.
