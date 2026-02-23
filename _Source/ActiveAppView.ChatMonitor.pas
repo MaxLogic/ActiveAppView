@@ -10,13 +10,6 @@ type
   TChatMonitor = class
   private
     type
-      // Rule for identifying a specific chat application
-      TChatAppRule = record
-        ExeNameMask: string;
-        CaptionMask: string;
-        UnreadPattern: string;
-      end;
-
       // Holds the runtime state of a monitored application window
       TMonitoredAppState = record
         AppInfo: TAppInfo;
@@ -27,31 +20,40 @@ type
 
   private
     fApps: TAppList;
-    fRules: TList<TChatAppRule>;
     fMonitoredApps: TDictionary<hWnd, TMonitoredAppState>;
+    fReviewRules: TObjectList<TStringList>;
 
     // Configuration
     fEnabled: Boolean;
+    fSoundEnabled: Boolean;
     fUnreadMessageSound: string;
     fUnreadMessageSoundInterval: Integer;
     fPwaClosedSound: string;
     fSoundThrottling: TDictionary<String, TDateTime>;
 
     procedure LoadConfiguration(aIni: TmemIniFile);
+    procedure LoadReviewRules(const aFileName: string);
+    function MatchesReviewRule(const aApp: TAppInfo; const aRule: TStringList): Boolean;
+    function ShouldReviewApp(const aApp: TAppInfo): Boolean;
     procedure PlaySoundFile(const aFileName: string);
+    procedure SetSoundEnabled(const aValue: Boolean);
 
   public
     constructor Create(aSettings: TMemIniFile);
     destructor Destroy; override;
 
     procedure Process;
+    property SoundEnabled: Boolean read fSoundEnabled write SetSoundEnabled;
   end;
 
 implementation
 
 uses
-  Winapi.MMSystem, System.RegularExpressions, System.IOUtils, system.DateUtils,
+  Winapi.MMSystem, System.RegularExpressions, System.IOUtils, system.DateUtils, System.StrUtils,
   maxLogic.StrUtils, AutoFree;
+
+const
+  cUnreadMessagesPattern = '\(\d+\)';
 
 { TChatMonitor }
 
@@ -60,62 +62,106 @@ begin
   inherited Create;
   fSoundThrottling:= TDictionary<String, TDateTime>.Create;
   fApps := TAppList.Create;
-  fRules := TList<TChatAppRule>.Create;
   fMonitoredApps := TDictionary<hWnd, TMonitoredAppState>.Create;
+  fReviewRules := TObjectList<TStringList>.Create;
   LoadConfiguration(aSettings);
 end;
 
 destructor TChatMonitor.Destroy;
 begin
-  fRules.Free;
+  fReviewRules.Free;
   fMonitoredApps.Free;
   fApps.Free;
   fSoundThrottling.Free;
   inherited;
 end;
 
-procedure TChatMonitor.LoadConfiguration;
+procedure TChatMonitor.LoadConfiguration(aIni: TMemIniFile);
 var
-  lRuleRecord: TChatAppRule;
-  lRuleStrings: TArray<String>;
-  i: Integer;
-  lRuleKey: string;
-  lKeys: TStringList;
-  s: String;
+  lReviewMaskFileName: string;
 begin
   fEnabled := aIni.ReadBool('ChatMonitor', 'Enabled', False);
+  fSoundEnabled := aIni.ReadBool('ChatMonitor', 'SoundEnabled', True);
   if not fEnabled then
     Exit;
 
   fUnreadMessageSound := aIni.ReadString('ChatMonitor', 'UnreadMessageSound', '');
   fUnreadMessageSoundInterval := aIni.ReadInteger('ChatMonitor', 'UnreadMessageSoundIntervalSeconds', 30);
   fPwaClosedSound := aIni.ReadString('ChatMonitor', 'PwaClosedSound', '');
+  lReviewMaskFileName := aIni.ReadString('ChatMonitor', 'ReviewMaskFile', 'ChatReviewMask.txt');
+  if TPath.IsRelativePath(lReviewMaskFileName) then
+    lReviewMaskFileName := TPath.Combine(ExtractFilePath(ParamStr(0)), lReviewMaskFileName);
+  LoadReviewRules(lReviewMaskFileName);
+end;
 
-  fRules.Clear;
-  gc(lKeys, TStringList.Create);
-  aIni.ReadSection('ChatMonitor.Rules', lKeys);
-  for lRuleKey in lKeys do
+procedure TChatMonitor.LoadReviewRules(const aFileName: string);
+var
+  lLine: string;
+  lLines: TStringList;
+  lRule: TStringList;
+  X: Integer;
+begin
+  fReviewRules.Clear;
+  if not TFile.Exists(aFileName) then
+    Exit;
+
+  gc(lLines, TStringList.Create);
+  lLines.LoadFromFile(aFileName, TEncoding.Utf8);
+  for X := 0 to lLines.Count - 1 do
   begin
-    lRuleRecord:= default(TChatAppRule);
-    s:= aIni.ReadString('ChatMonitor.Rules', lRuleKey, '');
-    if s.Trim = '' then
-      continue;
-    lRuleStrings := s.Split(['|']);
-    if Length(lRuleStrings) < 3 then
-      continue;
-    lRuleRecord.ExeNameMask := lRuleStrings[0];
-    lRuleRecord.CaptionMask := lRuleStrings[1];
-    lRuleRecord.UnreadPattern := lRuleStrings[2];
+    lLine := lLines[X].Trim;
+    if (lLine = '') or StartsText(';', lLine) or StartsText('#', lLine) then
+      Continue;
 
-    fRules.Add(lRuleRecord);
+    lRule := TStringList.Create;
+    lRule.CaseSensitive := False;
+    lRule.StrictDelimiter := True;
+    lRule.CommaText := lLine;
+    fReviewRules.Add(lRule);
   end;
+end;
+
+function TChatMonitor.MatchesReviewRule(const aApp: TAppInfo; const aRule: TStringList): Boolean;
+var
+  lAppUserModelIDMask: string;
+  lCaptionMask: string;
+  lCmdParamsMask: string;
+  lFileNameMask: string;
+begin
+  aRule.CaseSensitive := False;
+  lCaptionMask := aRule.Values['caption'];
+  lFileNameMask := aRule.Values['filename'];
+  lAppUserModelIDMask := aRule.Values['AppUserModelID'];
+  lCmdParamsMask := aRule.Values['CmdParams'];
+
+  Result := ((lCaptionMask <> '') and StringMatches(aApp.Caption, lCaptionMask, False))
+    or ((lFileNameMask <> '') and StringMatches(aApp.FileName, lFileNameMask, False))
+    or ((lAppUserModelIDMask <> '') and StringMatches(aApp.AppUserModelID, lAppUserModelIDMask, False))
+    or ((lCmdParamsMask <> '') and StringMatches(aApp.CommandLineParams, lCmdParamsMask, False));
+end;
+
+function TChatMonitor.ShouldReviewApp(const aApp: TAppInfo): Boolean;
+var
+  lRule: TStringList;
+begin
+  if fReviewRules.Count = 0 then
+    Exit(False);
+
+  for lRule in fReviewRules do
+    if MatchesReviewRule(aApp, lRule) then
+      Exit(True);
+
+  Result := False;
 end;
 
 procedure TChatMonitor.PlaySoundFile(const aFileName: string);
 var
   lKey, lFullPath: string;
-  dt: TDateTime;
+  lLastPlayedTime: TDateTime;
 begin
+  if not fSoundEnabled then
+    Exit;
+
   if aFileName = '' then
     Exit;
 
@@ -128,18 +174,22 @@ begin
 
   // prevent playing the same sound simultanously multiple times
   lKey:= lFullPath.ToLower;
-  if fSoundThrottling.TryGetValue(lKey, dt) then
-    if secondsBetween(now, dt) < 5 then
+  if fSoundThrottling.TryGetValue(lKey, lLastPlayedTime) then
+    if secondsBetween(now, lLastPlayedTime) < 5 then
       exit;
   fSoundThrottling.addOrSetValue(lKey, now);
 
   Winapi.MMSystem.PlaySound(PChar(lFullPath), 0, SND_FILENAME or SND_ASYNC);
 end;
 
+procedure TChatMonitor.SetSoundEnabled(const aValue: Boolean);
+begin
+  fSoundEnabled := aValue;
+end;
+
 procedure TChatMonitor.Process;
 var
   lApp: TAppInfo;
-  lRule: TChatAppRule;
   lFoundApps: TDictionary<hWnd, TMonitoredAppState>;
   lNewState: TMonitoredAppState;
   lOldState: TMonitoredAppState;
@@ -151,31 +201,24 @@ begin
   fApps.Update;
   lFoundApps := TDictionary<hWnd, TMonitoredAppState>.Create;
   try
-    // 1. Identify all currently running apps that match our rules
+    // 1. Identify all currently running apps that match review-mask rules
     for var x:=0 to fApps.Count -1 do
     begin
       lApp:= fApps[x];
+      if not ShouldReviewApp(lApp) then
+        Continue;
 
-      for lRule in fRules do
-      begin
-        if StringMatches(ExtractFileName(lApp.FileName), lRule.ExeNameMask, false) then
-        if StringMatches(lApp.Caption, lRule.CaptionMask, false) then
-        begin
-          // Found a matching app, determine its state
-          lNewState.AppInfo := lApp;
-          lNewState.HasUnreadMessages := TRegEx.IsMatch(lApp.Caption, lRule.UnreadPattern);
-          lNewState.IsPwa := SameText(ExtractFileName(lApp.FileName), 'msedge.exe');
+      lNewState.AppInfo := lApp;
+      lNewState.HasUnreadMessages := TRegEx.IsMatch(lApp.Caption, cUnreadMessagesPattern);
+      lNewState.IsPwa := SameText(ExtractFileName(lApp.FileName), 'msedge.exe');
 
-          // Preserve the last sound played time if the app was already monitored
-          if fMonitoredApps.TryGetValue(lApp.Wnd, lOldState) then
-            lNewState.LastSoundPlayed := lOldState.LastSoundPlayed
-          else
-            lNewState.LastSoundPlayed := 0; // Far in the past
+      // Preserve the last sound played time if the app was already monitored
+      if fMonitoredApps.TryGetValue(lApp.Wnd, lOldState) then
+        lNewState.LastSoundPlayed := lOldState.LastSoundPlayed
+      else
+        lNewState.LastSoundPlayed := 0; // Far in the past
 
-          lFoundApps.AddOrsetValue(lApp.Wnd, lNewState);
-          Break; // Move to the next app once a rule matches
-        end;
-      end;
+      lFoundApps.AddOrsetValue(lApp.Wnd, lNewState);
     end;
 
     // 2. Check for newly closed PWAs

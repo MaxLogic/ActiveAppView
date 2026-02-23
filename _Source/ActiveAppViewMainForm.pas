@@ -65,6 +65,7 @@ type
     labAppUserModelID: TStaticText;
     edRelaunchCommand: TEdit;
     labRelaunchCommand: TStaticText;
+    chkChatNotificationSound: TCheckBox;
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure FormActivate(Sender: TObject);
@@ -85,6 +86,7 @@ type
     procedure lbShortCutsKeyUp(Sender: TObject; var Key: Word;
       Shift: TShiftState);
     procedure tmrChatMonitorTimer(Sender: TObject);
+    procedure chkChatNotificationSoundClick(aSender: TObject);
   private
 
     fApps: TAppList;
@@ -602,6 +604,9 @@ begin
 
   gc(lIniFile, TMemIniFile.Create(CombinePath([GetInstallDir, cSettingsFileName]), TEncoding.Utf8, False));
   fChatMonitor := TChatMonitor.Create(lIniFile);
+  chkChatNotificationSound.Checked := lIniFile.ReadBool('ChatMonitor', 'SoundEnabled', True);
+  chkChatNotificationSound.Enabled := lIniFile.ReadBool('ChatMonitor', 'Enabled', False);
+  fChatMonitor.SoundEnabled := chkChatNotificationSound.Checked;
   tmrChatMonitor.Interval := lIniFile.ReadInteger('ChatMonitor', 'CheckIntervalSeconds', 5) * 1000;
   tmrChatMonitor.Enabled:= lIniFile.ReadBool('ChatMonitor', 'Enabled', False);
 end;
@@ -720,6 +725,18 @@ procedure TAppsViewMainFrm.lbShortCutsKeyUp(Sender: TObject; var Key: Word;
 begin
   if Key = VK_RETURN then
     ActivateShortCutItem;
+end;
+
+procedure TAppsViewMainFrm.chkChatNotificationSoundClick(aSender: TObject);
+var
+  lIniFile: TMemIniFile;
+begin
+  if Assigned(fChatMonitor) then
+    fChatMonitor.SoundEnabled := chkChatNotificationSound.Checked;
+
+  gc(lIniFile, TMemIniFile.Create(CombinePath([GetInstallDir, cSettingsFileName]), TEncoding.Utf8, False));
+  lIniFile.WriteBool('ChatMonitor', 'SoundEnabled', chkChatNotificationSound.Checked);
+  lIniFile.UpdateFile;
 end;
 
 procedure TAppsViewMainFrm.MarkFormFocused;
