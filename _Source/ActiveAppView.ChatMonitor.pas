@@ -1,84 +1,244 @@
-﻿unit ActiveAppView.ChatMonitor;
+unit ActiveAppView.ChatMonitor;
 
 interface
 
 uses
-  winApi.windows, System.Classes, System.SysUtils, System.Generics.Collections, System.IniFiles,
-  ActiveAppViewCore;
+  Winapi.Windows, System.Classes, System.Generics.Collections, System.IniFiles, System.SysUtils,
+  MaxLogic.Cache,
+  ActiveAppView.ConfigCache;
 
 type
+  TChatAppSnapshot = record
+    Wnd: hWnd;
+    Caption: string;
+  end;
+
+  IChatAppMetadata = interface(IInterface)
+    ['{AC67D233-026B-49A9-9828-6508E7C478E1}']
+    function GetAppUserModelID: string;
+    function GetCommandLineParams: string;
+    function GetFileName: string;
+    property AppUserModelID: string read GetAppUserModelID;
+    property CommandLineParams: string read GetCommandLineParams;
+    property FileName: string read GetFileName;
+  end;
+
   TChatMonitor = class
   private
     type
-      // Holds the runtime state of a monitored application window
       TMonitoredAppState = record
-        AppInfo: TAppInfo;
         HasUnreadMessages: Boolean;
-        LastSoundPlayed: TDateTime;
         IsPwa: Boolean;
+        LastSoundPlayed: TDateTime;
       end;
-
   private
-    fApps: TAppList;
-    fMonitoredApps: TDictionary<hWnd, TMonitoredAppState>;
-    fReviewRules: TObjectList<TStringList>;
-
-    // Configuration
+    fConfigCache: TConfigCache;
     fEnabled: Boolean;
+    fMetadataCache: IMaxCache;
+    fMonitoredApps: TDictionary<hWnd, TMonitoredAppState>;
+    fOwnConfigCache: Boolean;
+    fPwaClosedSound: string;
+    fReviewMaskFileName: string;
     fSoundEnabled: Boolean;
+    fSoundThrottling: TDictionary<string, TDateTime>;
     fUnreadMessageSound: string;
     fUnreadMessageSoundInterval: Integer;
-    fPwaClosedSound: string;
-    fSoundThrottling: TDictionary<String, TDateTime>;
 
-    procedure LoadConfiguration(aIni: TmemIniFile);
-    procedure LoadReviewRules(const aFileName: string);
-    function MatchesReviewRule(const aApp: TAppInfo; const aRule: TStringList): Boolean;
-    function ShouldReviewApp(const aApp: TAppInfo): Boolean;
+    class function AnyRuleNeedsMetadata(const aRules: TReviewRuleArray): Boolean; static;
+    class function HasUnreadMessageCountInCaption(const aCaption: string): Boolean; static;
+    class function ParseCommandLineParams(const aCommandLine: string): string; static;
+    function GetMetadataCached(const aWnd: hWnd): IChatAppMetadata;
+    procedure LoadConfiguration(aIni: TMemIniFile);
+    function MatchesReviewRule(
+      const aAppCaption: string;
+      const aMetadata: IChatAppMetadata;
+      const aRule: TReviewRule): Boolean;
     procedure PlaySoundFile(const aFileName: string);
+    function PrefetchMetadataInParallel(
+      const aApps: TArray<TChatAppSnapshot>): TArray<IChatAppMetadata>;
     procedure SetSoundEnabled(const aValue: Boolean);
-
+    function ShouldReviewApp(
+      const aAppCaption: string;
+      const aMetadata: IChatAppMetadata;
+      const aRules: TReviewRuleArray): Boolean;
   public
     constructor Create(aSettings: TMemIniFile);
     destructor Destroy; override;
 
     procedure Process;
+    procedure ProcessSnapshot(const aApps: TArray<TChatAppSnapshot>);
+    procedure UseConfigCache(aConfigCache: TConfigCache);
     property SoundEnabled: Boolean read fSoundEnabled write SetSoundEnabled;
   end;
 
 implementation
 
 uses
-  Winapi.MMSystem, System.RegularExpressions, System.IOUtils, system.DateUtils, System.StrUtils,
-  maxLogic.StrUtils, AutoFree;
+  System.DateUtils, System.IOUtils, System.StrUtils, System.Threading,
+  Winapi.MMSystem,
+  maxLogic.StrUtils, srDesktop;
+
+type
+  TChatAppMetadata = class(TInterfacedObject, IChatAppMetadata)
+  private
+    fAppUserModelID: string;
+    fCommandLineParams: string;
+    fFileName: string;
+  public
+    constructor Create(
+      const aFileName: string;
+      const aAppUserModelID: string;
+      const aCommandLineParams: string);
+    function GetAppUserModelID: string;
+    function GetCommandLineParams: string;
+    function GetFileName: string;
+  end;
 
 const
-  cUnreadMessagesPattern = '\(\d+\)';
+  cMetadataCacheNamespace = 'activeappview.chat-monitor.metadata';
+
+{ TChatAppMetadata }
+
+constructor TChatAppMetadata.Create(
+  const aFileName: string;
+  const aAppUserModelID: string;
+  const aCommandLineParams: string);
+begin
+  inherited Create;
+  fFileName := aFileName;
+  fAppUserModelID := aAppUserModelID;
+  fCommandLineParams := aCommandLineParams;
+end;
+
+function TChatAppMetadata.GetAppUserModelID: string;
+begin
+  Result := fAppUserModelID;
+end;
+
+function TChatAppMetadata.GetCommandLineParams: string;
+begin
+  Result := fCommandLineParams;
+end;
+
+function TChatAppMetadata.GetFileName: string;
+begin
+  Result := fFileName;
+end;
 
 { TChatMonitor }
 
+class function TChatMonitor.AnyRuleNeedsMetadata(const aRules: TReviewRuleArray): Boolean;
+var
+  lRule: TReviewRule;
+begin
+  for lRule in aRules do
+    if (lRule.FileNameMask <> '') or (lRule.AppUserModelIDMask <> '') or (lRule.CmdParamsMask <> '') then
+      Exit(True);
+
+  Result := False;
+end;
+
 constructor TChatMonitor.Create(aSettings: TMemIniFile);
+var
+  lCacheConfig: TMaxCacheConfig;
 begin
   inherited Create;
-  fSoundThrottling:= TDictionary<String, TDateTime>.Create;
-  fApps := TAppList.Create;
   fMonitoredApps := TDictionary<hWnd, TMonitoredAppState>.Create;
-  fReviewRules := TObjectList<TStringList>.Create;
+  fSoundThrottling := TDictionary<string, TDateTime>.Create;
+  fOwnConfigCache := True;
+  fConfigCache := TConfigCache.Create(ExtractFilePath(ParamStr(0)));
+
+  lCacheConfig := TMaxCacheConfig.Default;
+  lCacheConfig.CaseSensitiveKeys := False;
+  lCacheConfig.SweepIntervalMs := 0;
+  fMetadataCache := TMaxCache.New(lCacheConfig);
+
   LoadConfiguration(aSettings);
 end;
 
 destructor TChatMonitor.Destroy;
 begin
-  fReviewRules.Free;
-  fMonitoredApps.Free;
-  fApps.Free;
   fSoundThrottling.Free;
+  fMonitoredApps.Free;
+  if fOwnConfigCache and Assigned(fConfigCache) then
+    fConfigCache.Free;
   inherited;
 end;
 
-procedure TChatMonitor.LoadConfiguration(aIni: TMemIniFile);
+function TChatMonitor.GetMetadataCached(const aWnd: hWnd): IChatAppMetadata;
 var
-  lReviewMaskFileName: string;
+  lCacheValue: IInterface;
+  lMetadata: IChatAppMetadata;
+  lOptions: TMaxCacheOptions;
+  lPid: Cardinal;
+  lWndKey: string;
+begin
+  lWndKey := IntToHex(NativeInt(aWnd), SizeOf(NativeInt) * 2);
+  lOptions := TMaxCacheOptions.Create;
+  try
+    lOptions.TtlMs := 15000;
+    lOptions.ValidateIntervalMs := 2500;
+    lCacheValue := fMetadataCache.GetOrCreate(
+      cMetadataCacheNamespace,
+      lWndKey,
+      function: IInterface
+      var
+        lAppUserModelID: string;
+        lCommandLine: string;
+        lCommandLineParams: string;
+        lFileName: string;
+      begin
+        lFileName := srDesktop.GetFileName(aWnd);
+        lAppUserModelID := RetrieveAppUserModelID(aWnd);
+
+        lPid := RetrievePID(aWnd);
+        if lPid = 0 then
+          lCommandLine := ''
+        else
+          lCommandLine := RetrieveCommandLine(lPid);
+        lCommandLineParams := ParseCommandLineParams(lCommandLine);
+        Result := TChatAppMetadata.Create(lFileName, lAppUserModelID, lCommandLineParams);
+      end,
+      lOptions);
+  finally
+    lOptions.Free;
+  end;
+
+  if Supports(lCacheValue, IChatAppMetadata, lMetadata) then
+    Result := lMetadata
+  else
+    Result := nil;
+end;
+
+class function TChatMonitor.HasUnreadMessageCountInCaption(const aCaption: string): Boolean;
+var
+  lIndex: Integer;
+  lLen: Integer;
+begin
+  Result := False;
+  lLen := Length(aCaption);
+  if lLen < 3 then
+    Exit;
+
+  lIndex := 1;
+  while lIndex <= lLen - 2 do
+  begin
+    if aCaption[lIndex] = '(' then
+    begin
+      Inc(lIndex);
+      if (lIndex <= lLen) and CharInSet(aCaption[lIndex], ['0'..'9']) then
+      begin
+        while (lIndex <= lLen) and CharInSet(aCaption[lIndex], ['0'..'9']) do
+          Inc(lIndex);
+        if (lIndex <= lLen) and (aCaption[lIndex] = ')') then
+          Exit(True);
+      end;
+    end;
+    Inc(lIndex);
+  end;
+end;
+
+procedure TChatMonitor.LoadConfiguration(aIni: TMemIniFile);
 begin
   fEnabled := aIni.ReadBool('ChatMonitor', 'Enabled', False);
   fSoundEnabled := aIni.ReadBool('ChatMonitor', 'SoundEnabled', True);
@@ -88,75 +248,50 @@ begin
   fUnreadMessageSound := aIni.ReadString('ChatMonitor', 'UnreadMessageSound', '');
   fUnreadMessageSoundInterval := aIni.ReadInteger('ChatMonitor', 'UnreadMessageSoundIntervalSeconds', 30);
   fPwaClosedSound := aIni.ReadString('ChatMonitor', 'PwaClosedSound', '');
-  lReviewMaskFileName := aIni.ReadString('ChatMonitor', 'ReviewMaskFile', 'ChatReviewMask.txt');
-  if TPath.IsRelativePath(lReviewMaskFileName) then
-    lReviewMaskFileName := TPath.Combine(ExtractFilePath(ParamStr(0)), lReviewMaskFileName);
-  LoadReviewRules(lReviewMaskFileName);
+  fReviewMaskFileName := aIni.ReadString('ChatMonitor', 'ReviewMaskFile', 'ChatReviewMask.txt');
 end;
 
-procedure TChatMonitor.LoadReviewRules(const aFileName: string);
-var
-  lLine: string;
-  lLines: TStringList;
-  lRule: TStringList;
-  X: Integer;
+function TChatMonitor.MatchesReviewRule(
+  const aAppCaption: string;
+  const aMetadata: IChatAppMetadata;
+  const aRule: TReviewRule): Boolean;
 begin
-  fReviewRules.Clear;
-  if not TFile.Exists(aFileName) then
-    Exit;
+  Result := ((aRule.CaptionMask <> '') and StringMatches(aAppCaption, aRule.CaptionMask, False));
+  if Result then
+    Exit(True);
 
-  gc(lLines, TStringList.Create);
-  lLines.LoadFromFile(aFileName, TEncoding.Utf8);
-  for X := 0 to lLines.Count - 1 do
-  begin
-    lLine := lLines[X].Trim;
-    if (lLine = '') or StartsText(';', lLine) or StartsText('#', lLine) then
-      Continue;
-
-    lRule := TStringList.Create;
-    lRule.CaseSensitive := False;
-    lRule.StrictDelimiter := True;
-    lRule.CommaText := lLine;
-    fReviewRules.Add(lRule);
-  end;
-end;
-
-function TChatMonitor.MatchesReviewRule(const aApp: TAppInfo; const aRule: TStringList): Boolean;
-var
-  lAppUserModelIDMask: string;
-  lCaptionMask: string;
-  lCmdParamsMask: string;
-  lFileNameMask: string;
-begin
-  aRule.CaseSensitive := False;
-  lCaptionMask := aRule.Values['caption'];
-  lFileNameMask := aRule.Values['filename'];
-  lAppUserModelIDMask := aRule.Values['AppUserModelID'];
-  lCmdParamsMask := aRule.Values['CmdParams'];
-
-  Result := ((lCaptionMask <> '') and StringMatches(aApp.Caption, lCaptionMask, False))
-    or ((lFileNameMask <> '') and StringMatches(aApp.FileName, lFileNameMask, False))
-    or ((lAppUserModelIDMask <> '') and StringMatches(aApp.AppUserModelID, lAppUserModelIDMask, False))
-    or ((lCmdParamsMask <> '') and StringMatches(aApp.CommandLineParams, lCmdParamsMask, False));
-end;
-
-function TChatMonitor.ShouldReviewApp(const aApp: TAppInfo): Boolean;
-var
-  lRule: TStringList;
-begin
-  if fReviewRules.Count = 0 then
+  if not Assigned(aMetadata) then
     Exit(False);
 
-  for lRule in fReviewRules do
-    if MatchesReviewRule(aApp, lRule) then
-      Exit(True);
+  Result := ((aRule.FileNameMask <> '') and StringMatches(aMetadata.FileName, aRule.FileNameMask, False))
+    or ((aRule.AppUserModelIDMask <> '') and StringMatches(aMetadata.AppUserModelID, aRule.AppUserModelIDMask, False))
+    or ((aRule.CmdParamsMask <> '') and StringMatches(aMetadata.CommandLineParams, aRule.CmdParamsMask, False));
+end;
 
-  Result := False;
+class function TChatMonitor.ParseCommandLineParams(const aCommandLine: string): string;
+var
+  lCommandLine: string;
+  lSplitIndex: Integer;
+begin
+  lCommandLine := Trim(aCommandLine);
+  if lCommandLine = '' then
+    Exit('');
+
+  if StartsText('"', lCommandLine) then
+    lSplitIndex := PosEx('"', lCommandLine, 2)
+  else
+    lSplitIndex := PosEx(' ', lCommandLine, 1);
+
+  if lSplitIndex <= 0 then
+    Exit('');
+
+  Result := Trim(Copy(lCommandLine, lSplitIndex + 1, MaxInt));
 end;
 
 procedure TChatMonitor.PlaySoundFile(const aFileName: string);
 var
-  lKey, lFullPath: string;
+  lFullPath: string;
+  lKey: string;
   lLastPlayedTime: TDateTime;
 begin
   if not fSoundEnabled then
@@ -172,69 +307,91 @@ begin
   if not TFile.Exists(lFullPath) then
     Exit;
 
-  // prevent playing the same sound simultanously multiple times
-  lKey:= lFullPath.ToLower;
+  lKey := lFullPath.ToLower;
   if fSoundThrottling.TryGetValue(lKey, lLastPlayedTime) then
-    if secondsBetween(now, lLastPlayedTime) < 5 then
-      exit;
-  fSoundThrottling.addOrSetValue(lKey, now);
+    if SecondsBetween(Now, lLastPlayedTime) < 5 then
+      Exit;
+  fSoundThrottling.AddOrSetValue(lKey, Now);
 
   Winapi.MMSystem.PlaySound(PChar(lFullPath), 0, SND_FILENAME or SND_ASYNC);
 end;
 
-procedure TChatMonitor.SetSoundEnabled(const aValue: Boolean);
+function TChatMonitor.PrefetchMetadataInParallel(
+  const aApps: TArray<TChatAppSnapshot>): TArray<IChatAppMetadata>;
+var
+  lMetadata: TArray<IChatAppMetadata>;
 begin
-  fSoundEnabled := aValue;
+  SetLength(lMetadata, Length(aApps));
+  if Length(aApps) = 0 then
+    Exit(lMetadata);
+
+  TParallel.&For(0, High(aApps),
+    procedure(aIndex: Integer)
+    begin
+      lMetadata[aIndex] := GetMetadataCached(aApps[aIndex].Wnd);
+    end);
+  Result := lMetadata;
 end;
 
 procedure TChatMonitor.Process;
 var
-  lApp: TAppInfo;
+  lApps: TArray<TChatAppSnapshot>;
+begin
+  SetLength(lApps, 0);
+  ProcessSnapshot(lApps);
+end;
+
+procedure TChatMonitor.ProcessSnapshot(const aApps: TArray<TChatAppSnapshot>);
+var
   lFoundApps: TDictionary<hWnd, TMonitoredAppState>;
+  lIndex: Integer;
+  lMetadata: TArray<IChatAppMetadata>;
   lNewState: TMonitoredAppState;
   lOldState: TMonitoredAppState;
+  lRequiresMetadata: Boolean;
+  lReviewRules: TReviewRuleArray;
   lWnd: hWnd;
 begin
   if not fEnabled then
     Exit;
 
-  fApps.Update;
+  lReviewRules := fConfigCache.GetReviewRules(fReviewMaskFileName);
+  lRequiresMetadata := AnyRuleNeedsMetadata(lReviewRules);
+  SetLength(lMetadata, 0);
+  if lRequiresMetadata then
+    lMetadata := PrefetchMetadataInParallel(aApps);
+
   lFoundApps := TDictionary<hWnd, TMonitoredAppState>.Create;
   try
-    // 1. Identify all currently running apps that match review-mask rules
-    for var x:=0 to fApps.Count -1 do
+    for lIndex := 0 to High(aApps) do
     begin
-      lApp:= fApps[x];
-      if not ShouldReviewApp(lApp) then
-        Continue;
+      if lRequiresMetadata and (Length(lMetadata) > lIndex) then
+      begin
+        if not ShouldReviewApp(aApps[lIndex].Caption, lMetadata[lIndex], lReviewRules) then
+          Continue;
+      end else begin
+        if not ShouldReviewApp(aApps[lIndex].Caption, nil, lReviewRules) then
+          Continue;
+      end;
 
-      lNewState.AppInfo := lApp;
-      lNewState.HasUnreadMessages := TRegEx.IsMatch(lApp.Caption, cUnreadMessagesPattern);
-      lNewState.IsPwa := SameText(ExtractFileName(lApp.FileName), 'msedge.exe');
+      lNewState.HasUnreadMessages := HasUnreadMessageCountInCaption(aApps[lIndex].Caption);
+      lNewState.IsPwa := lRequiresMetadata and (Length(lMetadata) > lIndex)
+        and Assigned(lMetadata[lIndex])
+        and SameText(ExtractFileName(lMetadata[lIndex].FileName), 'msedge.exe');
 
-      // Preserve the last sound played time if the app was already monitored
-      if fMonitoredApps.TryGetValue(lApp.Wnd, lOldState) then
+      if fMonitoredApps.TryGetValue(aApps[lIndex].Wnd, lOldState) then
         lNewState.LastSoundPlayed := lOldState.LastSoundPlayed
       else
-        lNewState.LastSoundPlayed := 0; // Far in the past
+        lNewState.LastSoundPlayed := 0;
 
-      lFoundApps.AddOrsetValue(lApp.Wnd, lNewState);
+      lFoundApps.AddOrSetValue(aApps[lIndex].Wnd, lNewState);
     end;
 
-    // 2. Check for newly closed PWAs
     for lWnd in fMonitoredApps.Keys do
-    begin
       if not lFoundApps.ContainsKey(lWnd) then
-      begin
-        // This app was monitored but is now gone
         if fMonitoredApps[lWnd].IsPwa then
-        begin
           PlaySoundFile(fPwaClosedSound);
-        end;
-      end;
-    end;
 
-    // 3. Check for new unread messages and play sounds
     for lWnd in lFoundApps.Keys do
     begin
       lNewState := lFoundApps[lWnd];
@@ -244,20 +401,51 @@ begin
         begin
           PlaySoundFile(fUnreadMessageSound);
           lNewState.LastSoundPlayed := Now;
-          lFoundApps[lWnd] := lNewState; // Update the state with the new timestamp
+          lFoundApps[lWnd] := lNewState;
         end;
       end;
     end;
 
-    // 4. Swap the old state with the new state
     fMonitoredApps.Free;
     fMonitoredApps := lFoundApps;
-    lFoundApps := nil; // Ownership transferred
-
+    lFoundApps := nil;
   finally
     if Assigned(lFoundApps) then
       lFoundApps.Free;
   end;
+end;
+
+procedure TChatMonitor.SetSoundEnabled(const aValue: Boolean);
+begin
+  fSoundEnabled := aValue;
+end;
+
+function TChatMonitor.ShouldReviewApp(
+  const aAppCaption: string;
+  const aMetadata: IChatAppMetadata;
+  const aRules: TReviewRuleArray): Boolean;
+var
+  lRule: TReviewRule;
+begin
+  if Length(aRules) = 0 then
+    Exit(False);
+
+  for lRule in aRules do
+    if MatchesReviewRule(aAppCaption, aMetadata, lRule) then
+      Exit(True);
+
+  Result := False;
+end;
+
+procedure TChatMonitor.UseConfigCache(aConfigCache: TConfigCache);
+begin
+  if not Assigned(aConfigCache) then
+    Exit;
+
+  if fOwnConfigCache and Assigned(fConfigCache) then
+    fConfigCache.Free;
+  fConfigCache := aConfigCache;
+  fOwnConfigCache := False;
 end;
 
 end.
