@@ -76,7 +76,8 @@ implementation
 uses
   System.DateUtils, System.IOUtils, System.StrUtils, System.Threading,
   Winapi.MMSystem,
-  maxLogic.StrUtils, srDesktop;
+  maxLogic.StrUtils, srDesktop,
+  ActiveAppViewCore;
 
 type
   TChatAppMetadata = class(TInterfacedObject, IChatAppMetadata)
@@ -335,9 +336,26 @@ end;
 
 procedure TChatMonitor.Process;
 var
+  lAppList: TAppList;
   lApps: TArray<TChatAppSnapshot>;
+  lIndex: Integer;
 begin
-  SetLength(lApps, 0);
+  if not fEnabled then
+    Exit;
+
+  lAppList := TAppList.Create;
+  try
+    lAppList.Update;
+    SetLength(lApps, lAppList.Count);
+    for lIndex := 0 to lAppList.Count - 1 do
+    begin
+      lApps[lIndex].Wnd := lAppList[lIndex].Wnd;
+      lApps[lIndex].Caption := lAppList[lIndex].Caption;
+    end;
+  finally
+    lAppList.Free;
+  end;
+
   ProcessSnapshot(lApps);
 end;
 
