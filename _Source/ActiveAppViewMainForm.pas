@@ -3,7 +3,7 @@ unit ActiveAppViewMainForm;
 interface
 
 uses
-  System.Classes, System.Generics.Collections, System.SysUtils, System.Variants,
+  System.Classes, System.Generics.Collections, System.SyncObjs, System.SysUtils, System.Variants,
   Winapi.Messages, Winapi.Windows,
   Vcl.Buttons, Vcl.Controls, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.Forms, Vcl.Graphics, Vcl.StdCtrls,
   maxAsync,
@@ -99,6 +99,9 @@ type
     fChatMonitorPending: Integer;
     fChatMonitorTask: iAsync;
     fConfigCache: TConfigCache;
+    fDeepPrefixLoadBusy: Integer;
+    fDeepPrefixLoadTask: iAsync;
+    fDeepPrefixReady: Integer;
     fOrgAppOnActivate: TNotifyEvent;
     fChatMonitor: TChatMonitor;
     fGuiRefreshQueued: Integer;
@@ -109,6 +112,17 @@ type
     fStartupDataLoadBusy: Integer;
     fStartupDataLoadTask: iAsync;
     fStartupDataReady: Integer;
+    fStartupSkipSharedRefreshOnce: Integer;
+    fStartupProfileAuxReadyLogged: Integer;
+    fStartupProfileFirstGuiLogged: Integer;
+    fStartupProfileFullMetadataGuiLogged: Integer;
+    fStartupProfileDeepPrefixGuiLogged: Integer;
+    fStartupProfileLog: TStringList;
+    fStartupProfileLogFileName: string;
+    fStartupProfileLogSync: TCriticalSection;
+    fStartupProfileStartTick: Int64;
+    fStartupProfileWarmupDoneLogged: Integer;
+    fShuttingDown: Integer;
     procedure AppOnActivate(Sender: TObject);
     procedure ApplyAuxListsSnapshot(aSnapshotObject: TObject);
     procedure ApplyDesktopSnapshot(const aItems: TNamedValueArray);
@@ -118,22 +132,35 @@ type
     procedure MarkFormFocused;
     procedure OnAuxListsRefreshDone;
     procedure OnChatMonitorDone;
+    procedure OnDeepPrefixLoadDone;
     procedure OnStartupDataLoadDone;
     procedure QueueGuiRefresh;
     procedure RebuildSharedAppsSnapshot;
     procedure RunAuxListsRefresh;
     procedure RunChatMonitorSnapshot;
+    procedure RunDeepPrefixLoad;
     procedure RunStartupDataLoad;
     procedure StartAuxListsRefresh;
     procedure StartChatMonitorProcessing;
+    procedure StartDeepPrefixLoad;
     procedure StartStartupDataLoad;
     procedure EnsureSharedAppsSnapshotFresh(const aMaxAgeMs: UInt64);
+    procedure FlushStartupProfileLog;
+    function GetStartupElapsedMs: Int64;
+    function IsDeepPrefixReady: Boolean;
+    function IsStartupDataReady: Boolean;
+    function IsShuttingDown: Boolean;
+    procedure LogStartupTiming(const aPhase: string; const aDetails: string = '');
+    procedure RequestAsyncStop(const aAsync: iAsync);
+    procedure WaitAsyncWithShutdown(const aAsync: iAsync; const aTimeoutMs: Cardinal);
     procedure UpdateGui;
 
     procedure BringToFrontFocusedApp(lb: TListBox);
-    procedure UpdateAppDetail;
-    procedure CheckPrefixRule(var s: string; app: TAppInfo; const aRules: TPrefixRuleArray);
-    function ExcludeByMask(app: TAppInfo; const aMasks: TStringArray): boolean;
+    procedure UpdateAppDetail(const aAllowExtendedMetadata: Boolean = True);
+    procedure CheckPrefixRule(var s: string; app: TAppInfo; const aRules: TPrefixRuleArray;
+      aAllowFileNameMatching: Boolean; aAllowDeepMetadata: Boolean);
+    function ExcludeByMask(app: TAppInfo; const aMasks: TStringArray;
+      aAllowFileNameMatching: Boolean): boolean;
     procedure RestoreItemIndex(lb: TListBox; wnd: hwnd; oldItemIndex: integer; const aOldItemCaption: string);
     function GetWnd(lb: TListBox): hwnd;
     procedure ActiveControlChanged(Sender: TObject);
@@ -159,7 +186,7 @@ function RunMainFormSelfTests(const aArg: string): Integer;
 implementation
 
 uses
-  System.IniFiles, System.IOUtils, System.StrUtils, System.SyncObjs,
+  System.Diagnostics, System.IniFiles, System.IOUtils, System.StrUtils, System.Threading,
   Winapi.ActiveX, Winapi.KnownFolders, Winapi.MMSystem, Winapi.ShellAPI, Winapi.ShlObj,
   AutoFree, bsUtils, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils,
   srDesktop;
@@ -189,6 +216,7 @@ const
   cSettingsFileName = 'settings.ini';
   cRestoreItemIndexSelfTestArg = '--self-test-restore-item-index';
   cIgnoreF4AfterFocusMs = 200;
+  cShutdownTaskWaitTimeoutMs = 25;
 
 resourcestring
   rsShortCutTargetMissing = 'ShortCut target not found: %s';
@@ -229,6 +257,9 @@ var
   lIsActive: boolean;
   X: integer;
 begin
+  if IsShuttingDown then
+    Exit;
+
   lActive := self.ActiveControl;
 
   lPrefix := copy(labTemplateActiv.caption, 1, 2);
@@ -259,6 +290,9 @@ end;
 
 procedure TAppsViewMainFrm.AppOnActivate(Sender: TObject);
 begin
+  if IsShuttingDown then
+    Exit;
+
   MarkFormFocused;
   if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
     StartStartupDataLoad
@@ -381,14 +415,29 @@ var
   lSnapshot: TAuxListsSnapshot;
   lUserDesktop: string;
 begin
+  if IsShuttingDown then
+    Exit(nil);
+
   lSnapshot := TAuxListsSnapshot.Create;
   try
     SetLength(lSnapshot.DesktopItems, 0);
+    if IsShuttingDown then
+    begin
+      lSnapshot.Free;
+      Exit(nil);
+    end;
+
     if TryGetKnownFolderPath(FOLDERID_Desktop, lUserDesktop) then
       AddDesktopItemsFromFolder(lUserDesktop, lSnapshot.DesktopItems);
     if TryGetKnownFolderPath(FOLDERID_PublicDesktop, lPublicDesktop) then
       if not SameText(lUserDesktop, lPublicDesktop) then
         AddDesktopItemsFromFolder(lPublicDesktop, lSnapshot.DesktopItems);
+
+    if IsShuttingDown then
+    begin
+      lSnapshot.Free;
+      Exit(nil);
+    end;
 
     lSnapshot.ShortCuts := fConfigCache.GetShortCuts(cShortCutsFileName);
 
@@ -398,6 +447,12 @@ begin
     begin
       for lScriptFile in TDirectory.GetFiles(lScriptsDir, '*.*') do
       begin
+        if IsShuttingDown then
+        begin
+          lSnapshot.Free;
+          Exit(nil);
+        end;
+
         lExt := ExtractFileExt(lScriptFile);
         if System.StrUtils.MatchText(lExt, ['.cmd', '.bat', '.ps1', '.exe', '.py']) then
         begin
@@ -508,6 +563,9 @@ end;
 
 procedure TAppsViewMainFrm.RunAuxListsRefresh;
 begin
+  if IsShuttingDown then
+    Exit;
+
   fPendingAuxSnapshot := BuildAuxListsSnapshot;
 end;
 
@@ -516,18 +574,30 @@ begin
   try
     if Assigned(fPendingAuxSnapshot) then
     begin
-      ApplyAuxListsSnapshot(fPendingAuxSnapshot);
+      if not IsShuttingDown then
+      begin
+        ApplyAuxListsSnapshot(fPendingAuxSnapshot);
+        if TInterlocked.CompareExchange(fStartupProfileAuxReadyLogged, 1, 0) = 0 then
+          LogStartupTiming(
+            'AuxLists.Ready',
+            Format(
+              'scripts=%d desktop=%d shortcuts=%d',
+              [lbScripts.Items.Count, lbDesktop.Items.Count, lbShortCuts.Items.Count]));
+      end;
       FreeAndNil(fPendingAuxSnapshot);
     end;
   finally
     TInterlocked.Exchange(fAuxListRefreshBusy, 0);
-    if TInterlocked.Exchange(fAuxListRefreshPending, 0) = 1 then
+    if (TInterlocked.Exchange(fAuxListRefreshPending, 0) = 1) and (not IsShuttingDown) then
       StartAuxListsRefresh;
   end;
 end;
 
 procedure TAppsViewMainFrm.StartAuxListsRefresh;
 begin
+  if IsShuttingDown then
+    Exit;
+
   if TInterlocked.CompareExchange(fAuxListRefreshBusy, 1, 0) <> 0 then
   begin
     TInterlocked.Exchange(fAuxListRefreshPending, 1);
@@ -539,17 +609,94 @@ end;
 
 procedure TAppsViewMainFrm.RunStartupDataLoad;
 var
-  lApp: TAppInfo;
+  lApps: TArray<TAppInfo>;
+  lIndex: Integer;
+  lParallelPrefetchMs: Int64;
+  lRefreshSnapshotMs: Int64;
+  lWarmupWatch: TStopwatch;
+  lPhaseWatch: TStopwatch;
+begin
+  if IsShuttingDown then
+    Exit;
+
+  lWarmupWatch := TStopwatch.StartNew;
+
+  fConfigCache.GetHideMasks(cHideMaskFileName);
+  fConfigCache.GetPrefixRules(cPrefixMaskFileName);
+  fConfigCache.GetTerminalPatterns(cTerminalPatternsFileName);
+
+  lPhaseWatch := TStopwatch.StartNew;
+  EnsureSharedAppsSnapshotFresh(0);
+  lRefreshSnapshotMs := lPhaseWatch.ElapsedMilliseconds;
+  if IsShuttingDown then
+    Exit;
+
+  SetLength(lApps, fApps.Count);
+  for lIndex := 0 to fApps.Count - 1 do
+    lApps[lIndex] := fApps[lIndex];
+
+  if Length(lApps) = 0 then
+    Exit;
+
+  lPhaseWatch := TStopwatch.StartNew;
+  TParallel.&For(0, High(lApps),
+    procedure(aIndex: Integer)
+    var
+      lApp: TAppInfo;
+    begin
+      lApp := lApps[aIndex];
+      if IsShuttingDown then
+        Exit;
+
+      if (lApp = nil) or (lApp.Caption = '') then
+        Exit;
+
+      lApp.FileName;
+    end);
+  lParallelPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
+
+  if not IsShuttingDown then
+  begin
+    LogStartupTiming(
+      'Warmup.ThreadDone',
+      Format(
+        'apps=%d refreshSnapshot=%dms fileNamePrefetch=%dms total=%dms',
+        [Length(lApps), lRefreshSnapshotMs, lParallelPrefetchMs, lWarmupWatch.ElapsedMilliseconds]));
+    if TInterlocked.CompareExchange(fStartupDataReady, 1, 0) = 0 then
+    begin
+      TInterlocked.Exchange(fStartupSkipSharedRefreshOnce, 1);
+      TThread.Synchronize(nil,
+        procedure
+        begin
+          if IsShuttingDown then
+            Exit;
+
+          LogStartupTiming('Warmup.SynchronizeUi');
+          if TInterlocked.CompareExchange(fStartupProfileWarmupDoneLogged, 1, 0) = 0 then
+            LogStartupTiming('Warmup.Done');
+          tmrChatMonitor.Enabled := fChatMonitorConfiguredEnabled;
+          StartDeepPrefixLoad;
+          UpdateGui;
+        end);
+    end;
+  end;
+end;
+
+procedure TAppsViewMainFrm.RunDeepPrefixLoad;
+var
+  lApps: TArray<TAppInfo>;
   lIndex: Integer;
   lNeedAppUserModelID: Boolean;
   lNeedCmdParams: Boolean;
+  lPhaseWatch: TStopwatch;
+  lPrefixPrefetchMs: Int64;
   lPrefixRules: TPrefixRuleArray;
   lRule: TPrefixRule;
 begin
-  fConfigCache.GetHideMasks(cHideMaskFileName);
-  lPrefixRules := fConfigCache.GetPrefixRules(cPrefixMaskFileName);
-  fConfigCache.GetTerminalPatterns(cTerminalPatternsFileName);
+  if IsShuttingDown then
+    Exit;
 
+  lPrefixRules := fConfigCache.GetPrefixRules(cPrefixMaskFileName);
   lNeedAppUserModelID := False;
   lNeedCmdParams := False;
   for lRule in lPrefixRules do
@@ -562,36 +709,104 @@ begin
       Break;
   end;
 
-  EnsureSharedAppsSnapshotFresh(0);
-
-  for lIndex := 0 to fApps.Count - 1 do
+  if not (lNeedAppUserModelID or lNeedCmdParams) then
   begin
-    lApp := fApps[lIndex];
-    if lApp.Caption = '' then
-      Continue;
-
-    lApp.FileName;
-    if lNeedAppUserModelID then
-      lApp.AppUserModelID;
-    if lNeedCmdParams then
-      lApp.CommandLineParams;
+    LogStartupTiming('DeepPrefix.ThreadDone', 'skipped no-deep-rules');
+    Exit;
   end;
+
+  SetLength(lApps, fApps.Count);
+  for lIndex := 0 to fApps.Count - 1 do
+    lApps[lIndex] := fApps[lIndex];
+
+  if Length(lApps) = 0 then
+  begin
+    LogStartupTiming('DeepPrefix.ThreadDone', 'skipped no-apps');
+    Exit;
+  end;
+
+  lPhaseWatch := TStopwatch.StartNew;
+  TParallel.&For(0, High(lApps),
+    procedure(aIndex: Integer)
+    var
+      lApp: TAppInfo;
+    begin
+      lApp := lApps[aIndex];
+      if IsShuttingDown then
+        Exit;
+
+      if (lApp = nil) or (lApp.Caption = '') then
+        Exit;
+
+      if lNeedAppUserModelID then
+        lApp.AppUserModelID;
+      if lNeedCmdParams then
+        lApp.CommandLineParams;
+    end);
+  lPrefixPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
+
+  if not IsShuttingDown then
+    LogStartupTiming(
+      'DeepPrefix.ThreadDone',
+      Format(
+        'apps=%d appUserModelId=%s cmdParams=%s prefetch=%dms',
+        [Length(lApps), BoolToStr(lNeedAppUserModelID, True), BoolToStr(lNeedCmdParams, True),
+         lPrefixPrefetchMs]));
+end;
+
+procedure TAppsViewMainFrm.OnDeepPrefixLoadDone;
+begin
+  TInterlocked.Exchange(fDeepPrefixLoadBusy, 0);
+  TInterlocked.Exchange(fDeepPrefixReady, 1);
+
+  if IsShuttingDown then
+    Exit;
+
+  LogStartupTiming('DeepPrefix.Done');
+  QueueGuiRefresh;
+end;
+
+procedure TAppsViewMainFrm.StartDeepPrefixLoad;
+begin
+  if IsShuttingDown then
+    Exit;
+
+  if TInterlocked.CompareExchange(fDeepPrefixReady, 0, 0) <> 0 then
+    Exit;
+
+  if TInterlocked.CompareExchange(fDeepPrefixLoadBusy, 1, 0) <> 0 then
+    Exit;
+
+  fDeepPrefixLoadTask := SimpleAsyncCall(
+    RunDeepPrefixLoad,
+    'ActiveAppView.DeepPrefixLoad',
+    OnDeepPrefixLoadDone);
 end;
 
 procedure TAppsViewMainFrm.OnStartupDataLoadDone;
 begin
   TInterlocked.Exchange(fStartupDataLoadBusy, 0);
-  TInterlocked.Exchange(fStartupDataReady, 1);
-
-  if csDestroying in ComponentState then
+  if TInterlocked.CompareExchange(fStartupDataReady, 1, 0) <> 0 then
     Exit;
 
+  TInterlocked.Exchange(fStartupSkipSharedRefreshOnce, 1);
+
+  if IsShuttingDown then
+    Exit;
+
+  if TInterlocked.CompareExchange(fStartupProfileWarmupDoneLogged, 1, 0) = 0 then
+    LogStartupTiming('Warmup.Done');
+
   tmrChatMonitor.Enabled := fChatMonitorConfiguredEnabled;
+  StartDeepPrefixLoad;
   QueueGuiRefresh;
 end;
 
 procedure TAppsViewMainFrm.StartStartupDataLoad;
 begin
+  if IsShuttingDown then
+    Exit;
+
   if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) <> 0 then
   begin
     QueueGuiRefresh;
@@ -609,6 +824,9 @@ end;
 
 procedure TAppsViewMainFrm.QueueGuiRefresh;
 begin
+  if IsShuttingDown then
+    Exit;
+
   if TInterlocked.CompareExchange(fGuiRefreshQueued, 1, 0) <> 0 then
     Exit;
 
@@ -616,7 +834,7 @@ begin
     procedure
     begin
       TInterlocked.Exchange(fGuiRefreshQueued, 0);
-      if csDestroying in ComponentState then
+      if IsShuttingDown then
         Exit;
       UpdateGui;
     end);
@@ -744,16 +962,20 @@ begin
     lb.ItemIndex := 0;
 end;
 
-procedure TAppsViewMainFrm.CheckPrefixRule(var s: string; app: TAppInfo; const aRules: TPrefixRuleArray);
+procedure TAppsViewMainFrm.CheckPrefixRule(var s: string; app: TAppInfo; const aRules: TPrefixRuleArray;
+  aAllowFileNameMatching: Boolean; aAllowDeepMetadata: Boolean);
 var
   lRule: TPrefixRule;
 begin
   for lRule in aRules do
   begin
     if ((lRule.CaptionMask <> '') and maxLogic.StrUtils.StringMatches(app.caption, lRule.CaptionMask, False))
-      or ((lRule.FileNameMask <> '') and maxLogic.StrUtils.StringMatches(app.FileName, lRule.FileNameMask, False))
-      or ((lRule.AppUserModelIDMask <> '') and maxLogic.StrUtils.StringMatches(app.AppUserModelID, lRule.AppUserModelIDMask, False))
-      or ((lRule.CmdParamsMask <> '') and maxLogic.StrUtils.StringMatches(app.CommandLineParams, lRule.CmdParamsMask, False)) then
+      or (aAllowFileNameMatching and (lRule.FileNameMask <> '')
+      and maxLogic.StrUtils.StringMatches(app.FileName, lRule.FileNameMask, False))
+      or (aAllowDeepMetadata and (lRule.AppUserModelIDMask <> '')
+      and maxLogic.StrUtils.StringMatches(app.AppUserModelID, lRule.AppUserModelIDMask, False))
+      or (aAllowDeepMetadata and (lRule.CmdParamsMask <> '')
+      and maxLogic.StrUtils.StringMatches(app.CommandLineParams, lRule.CmdParamsMask, False)) then
     begin
       if lRule.Prefix <> '' then
         s := lRule.Prefix + ' - ' + s;
@@ -762,7 +984,8 @@ begin
   end;
 end;
 
-function TAppsViewMainFrm.ExcludeByMask(app: TAppInfo; const aMasks: TStringArray): boolean;
+function TAppsViewMainFrm.ExcludeByMask(app: TAppInfo; const aMasks: TStringArray;
+  aAllowFileNameMatching: Boolean): boolean;
 var
   lMask: string;
 begin
@@ -773,6 +996,9 @@ begin
       Exit(True);
   end;
 
+  if not aAllowFileNameMatching then
+    Exit(False);
+
   for lMask in aMasks do
   begin
     if maxLogic.StrUtils.StringMatches(app.FileName, lMask, False) then
@@ -782,6 +1008,9 @@ end;
 
 procedure TAppsViewMainFrm.FormActivate(Sender: TObject);
 begin
+  if IsShuttingDown then
+    Exit;
+
   MarkFormFocused;
   if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
     StartStartupDataLoad
@@ -793,6 +1022,19 @@ procedure TAppsViewMainFrm.FormCreate(Sender: TObject);
 var
   lIniFile: TMemIniFile;
 begin
+  fStartupProfileLog := TStringList.Create;
+  fStartupProfileLogSync := TCriticalSection.Create;
+  fStartupProfileLogFileName := CombinePath([GetInstallDir, 'startup-profile.log']);
+  fStartupProfileStartTick := TStopwatch.GetTimeStamp;
+  TInterlocked.Exchange(fStartupProfileAuxReadyLogged, 0);
+  TInterlocked.Exchange(fStartupProfileDeepPrefixGuiLogged, 0);
+  TInterlocked.Exchange(fStartupProfileFirstGuiLogged, 0);
+  TInterlocked.Exchange(fStartupProfileFullMetadataGuiLogged, 0);
+  TInterlocked.Exchange(fStartupProfileWarmupDoneLogged, 0);
+  fStartupProfileLog.Add('----------------------------------------');
+  fStartupProfileLog.Add(Format('Run started at %s', [FormatDateTime('yyyy-mm-dd hh:nn:ss.zzz', Now)]));
+  LogStartupTiming('FormCreate.Start');
+
   fApps := TAppList.Create;
   fConfigCache := TConfigCache.Create(GetInstallDir);
   AddToAutoStart;
@@ -818,37 +1060,51 @@ begin
   tmrChatMonitor.Enabled := False;
   SetLength(fSharedAppsSnapshot, 0);
   fSharedAppsSnapshotTick := 0;
+  TInterlocked.Exchange(fDeepPrefixLoadBusy, 0);
+  TInterlocked.Exchange(fDeepPrefixReady, 0);
   TInterlocked.Exchange(fStartupDataReady, 0);
+  TInterlocked.Exchange(fStartupSkipSharedRefreshOnce, 0);
+  TInterlocked.Exchange(fShuttingDown, 0);
+  LogStartupTiming(
+    'FormCreate.Done',
+    Format('chatMonitorEnabled=%s chatSoundEnabled=%s',
+      [BoolToStr(fChatMonitorConfiguredEnabled, True), BoolToStr(chkChatNotificationSound.Checked, True)]));
 end;
 
 procedure TAppsViewMainFrm.FormDestroy(Sender: TObject);
 begin
+  LogStartupTiming('FormDestroy.Start');
+  TInterlocked.Exchange(fShuttingDown, 1);
   tmrChatMonitor.Enabled := False;
   TInterlocked.Exchange(fChatMonitorPending, 0);
   TInterlocked.Exchange(fAuxListRefreshPending, 0);
-  TInterlocked.Exchange(fChatMonitorBusy, 0);
-  TInterlocked.Exchange(fAuxListRefreshBusy, 0);
-  TInterlocked.Exchange(fStartupDataLoadBusy, 0);
+  application.OnActivate := fOrgAppOnActivate;
+  Screen.OnActiveControlChange := nil;
 
-  if Assigned(fAuxListRefresh) then
-    TWaiter.WaitFor([fAuxListRefresh], INFINITE, True);
-  if Assigned(fChatMonitorTask) then
-    TWaiter.WaitFor([fChatMonitorTask], INFINITE, True);
-  if Assigned(fStartupDataLoadTask) then
-    TWaiter.WaitFor([fStartupDataLoadTask], INFINITE, True);
+  RequestAsyncStop(fAuxListRefresh);
+  RequestAsyncStop(fChatMonitorTask);
+  RequestAsyncStop(fDeepPrefixLoadTask);
+  RequestAsyncStop(fStartupDataLoadTask);
+
+  WaitAsyncWithShutdown(fAuxListRefresh, cShutdownTaskWaitTimeoutMs);
+  WaitAsyncWithShutdown(fChatMonitorTask, cShutdownTaskWaitTimeoutMs);
+  WaitAsyncWithShutdown(fDeepPrefixLoadTask, cShutdownTaskWaitTimeoutMs);
+  WaitAsyncWithShutdown(fStartupDataLoadTask, cShutdownTaskWaitTimeoutMs);
 
   FreeAndNil(fPendingAuxSnapshot);
   fAuxListRefresh := nil;
   fChatMonitorTask := nil;
+  fDeepPrefixLoadTask := nil;
   fStartupDataLoadTask := nil;
-
-  application.OnActivate := fOrgAppOnActivate;
   ClearListBoxItemData(lbDesktop);
   ClearListBoxItemData(lbShortCuts);
   FreeAndNil(fChatMonitor);
   FreeAndNil(fConfigCache);
   fApps.Free;
-  Screen.OnActiveControlChange := nil;
+  LogStartupTiming('FormDestroy.Flush');
+  FlushStartupProfileLog;
+  FreeAndNil(fStartupProfileLog);
+  FreeAndNil(fStartupProfileLogSync);
 end;
 
 procedure TAppsViewMainFrm.FormKeyUp(Sender: TObject; var Key: Word;
@@ -878,7 +1134,13 @@ end;
 
 procedure TAppsViewMainFrm.FormShow(Sender: TObject);
 begin
+  if IsShuttingDown then
+    Exit;
+
+  LogStartupTiming('FormShow');
+  StartAuxListsRefresh;
   StartStartupDataLoad;
+  QueueGuiRefresh;
 end;
 
 function TAppsViewMainFrm.GetWnd(lb: TListBox): hwnd;
@@ -974,10 +1236,126 @@ begin
   fLastFormFocusTick := GetTickCount64;
 end;
 
+function TAppsViewMainFrm.GetStartupElapsedMs: Int64;
+var
+  lNowTick: Int64;
+begin
+  if fStartupProfileStartTick = 0 then
+    Exit(0);
+
+  lNowTick := TStopwatch.GetTimeStamp;
+  Result := ((lNowTick - fStartupProfileStartTick) * 1000) div TStopwatch.Frequency;
+end;
+
+procedure TAppsViewMainFrm.FlushStartupProfileLog;
+begin
+  if (not Assigned(fStartupProfileLog)) or (not Assigned(fStartupProfileLogSync)) then
+    Exit;
+
+  fStartupProfileLogSync.Enter;
+  try
+    fStartupProfileLog.SaveToFile(fStartupProfileLogFileName, TEncoding.UTF8);
+  finally
+    fStartupProfileLogSync.Leave;
+  end;
+end;
+
+procedure TAppsViewMainFrm.LogStartupTiming(const aPhase: string; const aDetails: string);
+var
+  lMessage: string;
+begin
+  if (fStartupProfileStartTick = 0) or (not Assigned(fStartupProfileLog))
+    or (not Assigned(fStartupProfileLogSync)) then
+    Exit;
+
+  if aDetails = '' then
+    lMessage := Format('ActiveAppView startup +%dms [%s]', [GetStartupElapsedMs, aPhase])
+  else
+    lMessage := Format('ActiveAppView startup +%dms [%s] %s', [GetStartupElapsedMs, aPhase, aDetails]);
+
+  fStartupProfileLogSync.Enter;
+  try
+    fStartupProfileLog.Add(lMessage);
+  finally
+    fStartupProfileLogSync.Leave;
+  end;
+end;
+
+function TAppsViewMainFrm.IsShuttingDown: Boolean;
+begin
+  Result := (TInterlocked.CompareExchange(fShuttingDown, 0, 0) <> 0);
+end;
+
+function TAppsViewMainFrm.IsStartupDataReady: Boolean;
+begin
+  Result := (TInterlocked.CompareExchange(fStartupDataReady, 0, 0) <> 0);
+end;
+
+function TAppsViewMainFrm.IsDeepPrefixReady: Boolean;
+begin
+  Result := (TInterlocked.CompareExchange(fDeepPrefixReady, 0, 0) <> 0);
+end;
+
+procedure TAppsViewMainFrm.RequestAsyncStop(const aAsync: iAsync);
+var
+  lAsyncIntern: iAsyncIntern;
+  lThreadData: iThreadData;
+begin
+  if not Assigned(aAsync) then
+    Exit;
+
+  if not Supports(aAsync, iAsyncIntern, lAsyncIntern) then
+    Exit;
+
+  lThreadData := lAsyncIntern.GetThreadData;
+  if not Assigned(lThreadData) then
+    Exit;
+
+  lThreadData.KeepAlive := False;
+  lThreadData.SetThreadToTerminated;
+  lThreadData.WakeUpSignal.setSignaled;
+  lThreadData.StartSignal.setSignaled;
+end;
+
+procedure TAppsViewMainFrm.WaitAsyncWithShutdown(const aAsync: iAsync; const aTimeoutMs: Cardinal);
+var
+  lAsyncIntern: iAsyncIntern;
+  lThreadData: iThreadData;
+  lThread: TThread;
+begin
+  if not Assigned(aAsync) then
+    Exit;
+
+  RequestAsyncStop(aAsync);
+  if TWaiter.WaitFor([aAsync], aTimeoutMs, True) then
+    Exit;
+
+  if not Supports(aAsync, iAsyncIntern, lAsyncIntern) then
+    Exit;
+
+  lThreadData := lAsyncIntern.GetThreadData;
+  if not Assigned(lThreadData) then
+    Exit;
+
+  lThread := lThreadData.Thread;
+  if not Assigned(lThread) then
+    Exit;
+
+  if WaitForSingleObject(lThread.Handle, 0) = WAIT_OBJECT_0 then
+    Exit;
+
+  LogStartupTiming('Shutdown.TerminateThread', Format('threadId=%d', [lThread.ThreadID]));
+  // Last-resort shutdown path: avoid zombie instances when a worker is stuck in blocking OS calls.
+  TerminateThread(lThread.Handle, 1);
+end;
+
 procedure TAppsViewMainFrm.EnsureSharedAppsSnapshotFresh(const aMaxAgeMs: UInt64);
 var
   lNowTick: UInt64;
 begin
+  if IsShuttingDown then
+    Exit;
+
   lNowTick := GetTickCount64;
   if (fSharedAppsSnapshotTick <> 0) and (aMaxAgeMs <> 0)
     and ((lNowTick - fSharedAppsSnapshotTick) < aMaxAgeMs) then
@@ -1002,6 +1380,9 @@ end;
 
 procedure TAppsViewMainFrm.RunChatMonitorSnapshot;
 begin
+  if IsShuttingDown then
+    Exit;
+
   if Assigned(fChatMonitor) then
     fChatMonitor.ProcessSnapshot(fSharedAppsSnapshot);
 end;
@@ -1009,12 +1390,15 @@ end;
 procedure TAppsViewMainFrm.OnChatMonitorDone;
 begin
   TInterlocked.Exchange(fChatMonitorBusy, 0);
-  if (TInterlocked.Exchange(fChatMonitorPending, 0) = 1) and (not (csDestroying in ComponentState)) then
+  if (TInterlocked.Exchange(fChatMonitorPending, 0) = 1) and (not IsShuttingDown) then
     StartChatMonitorProcessing;
 end;
 
 procedure TAppsViewMainFrm.StartChatMonitorProcessing;
 begin
+  if IsShuttingDown then
+    Exit;
+
   if not Assigned(fChatMonitor) then
     Exit;
 
@@ -1093,10 +1477,13 @@ end;
 
 procedure TAppsViewMainFrm.tmrChatMonitorTimer(Sender: TObject);
 begin
+  if IsShuttingDown then
+    Exit;
+
   StartChatMonitorProcessing;
 end;
 
-procedure TAppsViewMainFrm.UpdateAppDetail;
+procedure TAppsViewMainFrm.UpdateAppDetail(const aAllowExtendedMetadata: Boolean);
 var
   app: TAppInfo;
 begin
@@ -1105,13 +1492,23 @@ begin
   else
   begin
     pnlAppDetails.Visible := True;
-    imgAppScreenshot.Picture.Graphic := app.Icon;
     edAppCaption.Text := app.caption;
-    edAppFileName.Text := app.FileName;
-    edCommandLineParams.Text := app.CommandLineParams;
     edPid.Text := app.PID.ToString;
-    edRelaunchCommand.Text:= app.RelaunchCommand;
-    edAppUserModelID.Text:= app.AppUserModelID;
+    if aAllowExtendedMetadata then
+    begin
+      imgAppScreenshot.Picture.Graphic := app.Icon;
+      edAppFileName.Text := app.FileName;
+      edCommandLineParams.Text := app.CommandLineParams;
+      edRelaunchCommand.Text:= app.RelaunchCommand;
+      edAppUserModelID.Text:= app.AppUserModelID;
+    end
+    else
+    begin
+      edAppFileName.Text := '';
+      edCommandLineParams.Text := '';
+      edRelaunchCommand.Text := '';
+      edAppUserModelID.Text := '';
+    end;
   end;
 
 end;
@@ -1130,18 +1527,32 @@ var
   lOldAppsIndex: Integer;
   lOldConsoleIndex: Integer;
   lOldExplorerIndex: Integer;
+  lDeepPrefixReady: Boolean;
   lPrefixRules: TPrefixRuleArray;
+  lSkipSharedRefreshOnce: Boolean;
+  lStartupDataReady: Boolean;
   lTerminalPatterns: TStringArray;
   lTitle: string;
+  lIsExplorer: Boolean;
+  lIsTerminal: Boolean;
   lIndex: Integer;
 begin
-  if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
+  if IsShuttingDown then
+    Exit;
+
+  lStartupDataReady := IsStartupDataReady;
+  if not lStartupDataReady then
   begin
     StartStartupDataLoad;
-    Exit;
+    if TInterlocked.CompareExchange(fStartupProfileFirstGuiLogged, 0, 0) <> 0 then
+      Exit;
   end;
+  lDeepPrefixReady := IsDeepPrefixReady;
 
-  EnsureSharedAppsSnapshotFresh(250);
+  lSkipSharedRefreshOnce := lStartupDataReady
+    and (TInterlocked.CompareExchange(fStartupSkipSharedRefreshOnce, 0, 1) = 1);
+  if not lSkipSharedRefreshOnce then
+    EnsureSharedAppsSnapshotFresh(250);
 
   lExcludeMasks := fConfigCache.GetHideMasks(cHideMaskFileName);
   lPrefixRules := fConfigCache.GetPrefixRules(cPrefixMaskFileName);
@@ -1174,19 +1585,41 @@ begin
         or (lApp.wnd = self.Handle) then
         Continue;
 
-      if lApp.caption <> '' then
-        if (not ExcludeByMask(lApp, lExcludeMasks)) then
-          if SameText('explorer.exe', ExtractFileName(lApp.FileName)) then
-            lExplorers.Add(lApp)
-          else
-          begin
-            lTitle := Trim(lApp.DisplayCaption);
-            CheckPrefixRule(lTitle, lApp, lPrefixRules);
-            if IsTerminalApp(lApp.FileName, lTerminalPatterns) then
-              lbConsole.Items.AddObject(lTitle, TObject(lApp.wnd))
-            else
-              lbApps.Items.AddObject(lTitle, TObject(lApp.wnd));
-          end;
+      if lApp.caption = '' then
+        Continue;
+      if ExcludeByMask(lApp, lExcludeMasks, lStartupDataReady) then
+        Continue;
+
+      lIsExplorer := False;
+      lIsTerminal := False;
+      if lStartupDataReady then
+      begin
+        lIsExplorer := SameText('explorer.exe', ExtractFileName(lApp.FileName));
+        if not lIsExplorer then
+          lIsTerminal := IsTerminalApp(lApp.FileName, lTerminalPatterns);
+      end;
+
+      if lIsExplorer then
+      begin
+        lExplorers.Add(lApp);
+        Continue;
+      end;
+
+      if lStartupDataReady then
+        lTitle := Trim(lApp.DisplayCaption)
+      else
+        lTitle := Trim(lApp.Caption);
+
+      if lIsTerminal then
+      begin
+        CheckPrefixRule(lTitle, lApp, lPrefixRules, lStartupDataReady, False);
+        lbConsole.Items.AddObject(lTitle, TObject(lApp.wnd));
+      end
+      else
+      begin
+        CheckPrefixRule(lTitle, lApp, lPrefixRules, lStartupDataReady, lDeepPrefixReady);
+        lbApps.Items.AddObject(lTitle, TObject(lApp.wnd));
+      end;
     end;
   finally
     lbConsole.Items.EndUpdate;
@@ -1194,7 +1627,7 @@ begin
   end;
   RestoreItemIndex(lbApps, lAppsWnd, lOldAppsIndex, lAppsFocusedCaption);
   RestoreItemIndex(lbConsole, lConsoleWnd, lOldConsoleIndex, lConsoleFocusedCaption);
-  UpdateAppDetail;
+  UpdateAppDetail(False);
 
   lExplorerWnd := GetWnd(lbExplorer);
   lOldExplorerIndex := lbExplorer.ItemIndex;
@@ -1210,6 +1643,28 @@ begin
     lbExplorer.Items.EndUpdate;
   end;
   RestoreItemIndex(lbExplorer, lExplorerWnd, lOldExplorerIndex, lExplorerFocusedCaption);
+
+  if TInterlocked.CompareExchange(fStartupProfileFirstGuiLogged, 1, 0) = 0 then
+    LogStartupTiming(
+      'Gui.FirstPopulate',
+      Format(
+        'startupDataReady=%s skipRefresh=%s apps=%d console=%d explorer=%d',
+        [BoolToStr(lStartupDataReady, True), BoolToStr(lSkipSharedRefreshOnce, True),
+         lbApps.Items.Count, lbConsole.Items.Count, lbExplorer.Items.Count]));
+
+  if lStartupDataReady and (TInterlocked.CompareExchange(fStartupProfileFullMetadataGuiLogged, 1, 0) = 0) then
+    LogStartupTiming(
+      'Gui.FullMetadata',
+      Format(
+        'skipRefresh=%s apps=%d console=%d explorer=%d',
+        [BoolToStr(lSkipSharedRefreshOnce, True), lbApps.Items.Count, lbConsole.Items.Count, lbExplorer.Items.Count]));
+
+  if lDeepPrefixReady and (TInterlocked.CompareExchange(fStartupProfileDeepPrefixGuiLogged, 1, 0) = 0) then
+    LogStartupTiming(
+      'Gui.DeepPrefixReady',
+      Format(
+        'apps=%d console=%d explorer=%d',
+        [lbApps.Items.Count, lbConsole.Items.Count, lbExplorer.Items.Count]));
 
   StartAuxListsRefresh;
 end;

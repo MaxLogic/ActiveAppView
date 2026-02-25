@@ -33,3 +33,4 @@ __recovery
 *.cmds
 /ShortCuts.txt
 /PrefixMask.txt
+_analysis/

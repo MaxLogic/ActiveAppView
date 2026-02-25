@@ -58,6 +58,10 @@ begin
   if Result <> -1 then
     Exit;
 
+  Result := RunChatMonitorSelfTests(ParamStr(1));
+  if Result <> -1 then
+    Exit;
+
   Result := -1;
   if SameText(ParamStr(1), cInvalidWndMetadataSelfTestArg) then
   begin
