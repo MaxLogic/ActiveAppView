@@ -136,7 +136,10 @@ begin
       else
         i := posEx(' ', s, 1);
 
-      fCommandLineParams := Copy(s, i + 1, Length(s)).Trim;
+      if i <= 0 then
+        fCommandLineParams := ''
+      else
+        fCommandLineParams := Copy(s, i + 1, Length(s)).Trim;
     end;
   end;
 
@@ -204,13 +207,18 @@ begin
 end;
 
 procedure TAppInfo.SHOW;
+var
+  lWnd: hWnd;
 begin
-  if winApi.Windows.IsWindow(Wnd) then
+  lWnd := fWnd;
+  if winApi.Windows.IsWindow(lWnd) then
   begin
     // ShowWindow( Wnd, SW_SHOW);
     // r43dWindows.SetWindowPlacement(wnd, @wp);
-    TThread.CreateAnonymousThread(procedure begin
-        srDesktop.ForceForegroundWindow(Wnd);
+    TThread.CreateAnonymousThread(
+      procedure
+      begin
+        srDesktop.ForceForegroundWindow(lWnd);
       end).start;
   end;
 end;
