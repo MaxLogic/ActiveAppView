@@ -147,6 +147,8 @@ type
 var
   AppsViewMainFrm: TAppsViewMainFrm;
 
+function RunMainFormSelfTests(const aArg: string): Integer;
+
 implementation
 
 uses
@@ -178,10 +180,27 @@ const
   cHideMaskFileName = 'HideMask.txt';
   cPrefixMaskFileName = 'PrefixMask.txt';
   cSettingsFileName = 'settings.ini';
+  cRestoreItemIndexSelfTestArg = '--self-test-restore-item-index';
   cIgnoreF4AfterFocusMs = 200;
 
 resourcestring
   rsShortCutTargetMissing = 'ShortCut target not found: %s';
+
+function FindSortedCaptionIndex(const aItems: TStrings; const aOldItemCaption: string): Integer;
+var
+  lItems: TStringList;
+  lIndex: Integer;
+begin
+  Result := -1;
+  if aOldItemCaption = '' then
+    Exit;
+
+  gc(lItems, TStringList.Create);
+  lItems.Assign(aItems);
+  lItems.Sorted := True;
+  if lItems.Find(aOldItemCaption, lIndex) then
+    Result := lIndex;
+end;
 
 { TListBoxItemData }
 
@@ -923,8 +942,8 @@ end;
 procedure TAppsViewMainFrm.RestoreItemIndex(lb: TListBox; wnd: hwnd;
   oldItemIndex: integer; const aOldItemCaption: string);
 var
-  i, X: integer;
-  l: TStringList;
+  lIndex: integer;
+  X: integer;
 begin
   if lb.Items.Count = 0 then
   begin
@@ -940,22 +959,47 @@ begin
 
   if (aOldItemCaption <> '') and lb.Sorted then
   begin
-    gc(l, TStringList.Create);
-    l.Assign(lb.Items);
-    l.Sorted := True;
-    l.find(aOldItemCaption, i);
-    if i <> -1 then
+    lIndex := FindSortedCaptionIndex(lb.Items, aOldItemCaption);
+    if lIndex <> -1 then
     begin
-      lb.ItemIndex := i;
+      lb.ItemIndex := lIndex;
       exit;
     end;
   end;
 
-  if oldItemIndex >= lb.Items.Count then
+  if (oldItemIndex >= 0) and (oldItemIndex < lb.Items.Count) then
+    lb.ItemIndex := oldItemIndex
+  else if oldItemIndex >= lb.Items.Count then
     lb.ItemIndex := lb.Items.Count - 1
   else if oldItemIndex < 0 then
     lb.ItemIndex := 0;
 
+end;
+
+function RunMainFormSelfTests(const aArg: string): Integer;
+var
+  lItems: TStringList;
+  lResultIndex: Integer;
+begin
+  Result := -1;
+  if not SameText(aArg, cRestoreItemIndexSelfTestArg) then
+    Exit;
+
+  Result := 0;
+  lItems := TStringList.Create;
+  try
+    lItems.Sorted := True;
+    lItems.Add('A');
+    lItems.Add('C');
+    lResultIndex := FindSortedCaptionIndex(lItems, 'Z');
+    if lResultIndex <> -1 then
+    begin
+      Writeln(Format('SELFTEST FAILED: expected missing caption index=-1, got %d', [lResultIndex]));
+      Result := 1;
+    end;
+  finally
+    lItems.Free;
+  end;
 end;
 
 procedure TAppsViewMainFrm.tmrChatMonitorTimer(Sender: TObject);

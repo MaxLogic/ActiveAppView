@@ -9,7 +9,7 @@ implementation
 uses
   System.Classes, System.IniFiles, System.IOUtils, System.SysUtils,
   Winapi.Windows,
-  ActiveAppView.ChatMonitor;
+  ActiveAppView.ChatMonitor, ActiveAppViewMainForm;
 
 const
   cInvalidWndMetadataSelfTestArg = '--self-test-chat-monitor-invalid-wnd';
@@ -54,6 +54,10 @@ end;
 
 function RunSelfTests: Integer;
 begin
+  Result := RunMainFormSelfTests(ParamStr(1));
+  if Result <> -1 then
+    Exit;
+
   Result := -1;
   if SameText(ParamStr(1), cInvalidWndMetadataSelfTestArg) then
   begin
