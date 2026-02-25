@@ -213,6 +213,7 @@ end;
 
 class function TChatMonitor.HasUnreadMessageCountInCaption(const aCaption: string): Boolean;
 var
+  lDigitIndex: Integer;
   lIndex: Integer;
   lLen: Integer;
 begin
@@ -226,12 +227,12 @@ begin
   begin
     if aCaption[lIndex] = '(' then
     begin
-      Inc(lIndex);
-      if (lIndex <= lLen) and CharInSet(aCaption[lIndex], ['0'..'9']) then
+      lDigitIndex := lIndex + 1;
+      if (lDigitIndex <= lLen) and CharInSet(aCaption[lDigitIndex], ['0'..'9']) then
       begin
-        while (lIndex <= lLen) and CharInSet(aCaption[lIndex], ['0'..'9']) do
-          Inc(lIndex);
-        if (lIndex <= lLen) and (aCaption[lIndex] = ')') then
+        while (lDigitIndex <= lLen) and CharInSet(aCaption[lDigitIndex], ['0'..'9']) do
+          Inc(lDigitIndex);
+        if (lDigitIndex <= lLen) and (aCaption[lDigitIndex] = ')') then
           Exit(True);
       end;
     end;
