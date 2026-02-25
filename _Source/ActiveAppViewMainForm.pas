@@ -910,13 +910,13 @@ begin
   if not Assigned(fChatMonitor) then
     Exit;
 
-  EnsureSharedAppsSnapshotFresh(900);
   if TInterlocked.CompareExchange(fChatMonitorBusy, 1, 0) <> 0 then
   begin
     TInterlocked.Exchange(fChatMonitorPending, 1);
     Exit;
   end;
 
+  EnsureSharedAppsSnapshotFresh(900);
   fChatMonitorTask := SimpleAsyncCall(RunChatMonitorSnapshot, 'ActiveAppView.ChatMonitor', OnChatMonitorDone);
 end;
 
