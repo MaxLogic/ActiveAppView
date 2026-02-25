@@ -7,6 +7,8 @@ uses
   MaxLogic.Cache,
   ActiveAppView.ConfigCache;
 
+function RunChatMonitorSelfTests(const aArg: string): Integer;
+
 type
   TChatAppSnapshot = record
     Wnd: hWnd;
@@ -46,6 +48,9 @@ type
 
     class function AnyRuleNeedsMetadata(const aRules: TReviewRuleArray): Boolean; static;
     class function HasUnreadMessageCountInCaption(const aCaption: string): Boolean; static;
+    class function IsUnreadCounterPaddingChar(aChar: Char): Boolean; static;
+    class function IsUnreadCounterStartChar(aChar: Char): Boolean; static;
+    class function IsUnreadCounterTerminatorChar(aChar: Char): Boolean; static;
     class function ParseCommandLineParams(const aCommandLine: string): string; static;
     function GetMetadataCached(const aWnd: hWnd): IChatAppMetadata;
     procedure LoadConfiguration(aIni: TMemIniFile);
@@ -97,6 +102,96 @@ type
 
 const
   cMetadataCacheNamespace = 'activeappview.chat-monitor.metadata';
+  cUnreadCaptionSelfTestArg = '--self-test-chat-monitor-unread-caption';
+
+function BoolToText(aValue: Boolean): string;
+begin
+  if aValue then
+    Result := 'true'
+  else
+    Result := 'false';
+end;
+
+function CheckUnreadCaptionCase(const aCaseName: string; const aCaption: string;
+  aExpected: Boolean): string;
+var
+  lActual: Boolean;
+begin
+  lActual := TChatMonitor.HasUnreadMessageCountInCaption(aCaption);
+  if lActual = aExpected then
+    Exit('');
+
+  Result := Format('SELFTEST FAILED: %s expected=%s actual=%s caption="%s"',
+    [aCaseName, BoolToText(aExpected), BoolToText(lActual), aCaption]);
+end;
+
+function RunUnreadCaptionSelfTest: Integer;
+var
+  lFailure: string;
+begin
+  Result := 0;
+
+  lFailure := CheckUnreadCaptionCase('classic-parentheses', 'Teams (1)', True);
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
+
+  lFailure := CheckUnreadCaptionCase('broken-closing-parenthesis', 'Teams (1(', True);
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
+
+  lFailure := CheckUnreadCaptionCase('bidi-marks-padding',
+    'Teams (' + #$200E + '12' + #$200F + ')', True);
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
+
+  lFailure := CheckUnreadCaptionCase('fullwidth-parentheses',
+    'Teams ' + #$FF08 + '3' + #$FF09, True);
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
+
+  lFailure := CheckUnreadCaptionCase('empty-parentheses', 'Teams ()', False);
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
+
+  lFailure := CheckUnreadCaptionCase('non-digit-content', 'Teams (abc)', False);
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
+end;
+
+function RunChatMonitorSelfTests(const aArg: string): Integer;
+begin
+  Result := -1;
+  if not SameText(aArg, cUnreadCaptionSelfTestArg) then
+    Exit;
+
+  try
+    Result := RunUnreadCaptionSelfTest;
+  except
+    on lException: Exception do
+    begin
+      Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+      Result := 1;
+    end;
+  end;
+end;
 
 { TChatAppMetadata }
 
@@ -236,31 +331,65 @@ end;
 
 class function TChatMonitor.HasUnreadMessageCountInCaption(const aCaption: string): Boolean;
 var
-  lDigitIndex: Integer;
+  lDigitCount: Integer;
   lIndex: Integer;
   lLen: Integer;
+  lScanIndex: Integer;
 begin
   Result := False;
   lLen := Length(aCaption);
-  if lLen < 3 then
+  if lLen < 2 then
     Exit;
 
-  lIndex := 1;
-  while lIndex <= lLen - 2 do
+  for lIndex := 1 to lLen do
   begin
-    if aCaption[lIndex] = '(' then
+    if IsUnreadCounterStartChar(aCaption[lIndex]) then
     begin
-      lDigitIndex := lIndex + 1;
-      if (lDigitIndex <= lLen) and CharInSet(aCaption[lDigitIndex], ['0'..'9']) then
+      lScanIndex := lIndex + 1;
+      while (lScanIndex <= lLen) and IsUnreadCounterPaddingChar(aCaption[lScanIndex]) do
+        Inc(lScanIndex);
+
+      lDigitCount := 0;
+      while (lScanIndex <= lLen) and CharInSet(aCaption[lScanIndex], ['0'..'9']) do
       begin
-        while (lDigitIndex <= lLen) and CharInSet(aCaption[lDigitIndex], ['0'..'9']) do
-          Inc(lDigitIndex);
-        if (lDigitIndex <= lLen) and (aCaption[lDigitIndex] = ')') then
+        Inc(lDigitCount);
+        Inc(lScanIndex);
+      end;
+
+      if lDigitCount > 0 then
+      begin
+        while (lScanIndex <= lLen) and IsUnreadCounterPaddingChar(aCaption[lScanIndex]) do
+          Inc(lScanIndex);
+        if (lScanIndex <= lLen) and IsUnreadCounterTerminatorChar(aCaption[lScanIndex]) then
           Exit(True);
       end;
     end;
-    Inc(lIndex);
   end;
+end;
+
+class function TChatMonitor.IsUnreadCounterPaddingChar(aChar: Char): Boolean;
+begin
+  case aChar of
+    #9, #10, #13, ' ':
+      Exit(True);
+  end;
+
+  Result := (aChar = #$200B) or (aChar = #$200C) or (aChar = #$200D)
+    or (aChar = #$200E) or (aChar = #$200F)
+    or (aChar = #$202A) or (aChar = #$202B) or (aChar = #$202C)
+    or (aChar = #$202D) or (aChar = #$202E)
+    or (aChar = #$2066) or (aChar = #$2067) or (aChar = #$2068) or (aChar = #$2069)
+    or (aChar = #$FEFF);
+end;
+
+class function TChatMonitor.IsUnreadCounterStartChar(aChar: Char): Boolean;
+begin
+  Result := (aChar = '(') or (aChar = #$FF08);
+end;
+
+class function TChatMonitor.IsUnreadCounterTerminatorChar(aChar: Char): Boolean;
+begin
+  Result := (aChar = ')') or (aChar = '(') or (aChar = #$FF09);
 end;
 
 procedure TChatMonitor.LoadConfiguration(aIni: TMemIniFile);
