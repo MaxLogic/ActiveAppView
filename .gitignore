@@ -34,3 +34,6 @@ __recovery
 /ShortCuts.txt
 /PrefixMask.txt
 _analysis/
+.agent/
+.agents/
+/_build_verify
