@@ -94,6 +94,7 @@ type
     fAuxListRefresh: iAsync;
     fAuxListRefreshBusy: Integer;
     fAuxListRefreshPending: Integer;
+    fChatMonitorConfiguredEnabled: Boolean;
     fChatMonitorBusy: Integer;
     fChatMonitorPending: Integer;
     fChatMonitorTask: iAsync;
@@ -105,6 +106,9 @@ type
     fPendingAuxSnapshot: TObject;
     fSharedAppsSnapshot: TArray<TChatAppSnapshot>;
     fSharedAppsSnapshotTick: UInt64;
+    fStartupDataLoadBusy: Integer;
+    fStartupDataLoadTask: iAsync;
+    fStartupDataReady: Integer;
     procedure AppOnActivate(Sender: TObject);
     procedure ApplyAuxListsSnapshot(aSnapshotObject: TObject);
     procedure ApplyDesktopSnapshot(const aItems: TNamedValueArray);
@@ -114,12 +118,15 @@ type
     procedure MarkFormFocused;
     procedure OnAuxListsRefreshDone;
     procedure OnChatMonitorDone;
+    procedure OnStartupDataLoadDone;
     procedure QueueGuiRefresh;
     procedure RebuildSharedAppsSnapshot;
     procedure RunAuxListsRefresh;
     procedure RunChatMonitorSnapshot;
+    procedure RunStartupDataLoad;
     procedure StartAuxListsRefresh;
     procedure StartChatMonitorProcessing;
+    procedure StartStartupDataLoad;
     procedure EnsureSharedAppsSnapshotFresh(const aMaxAgeMs: UInt64);
     procedure UpdateGui;
 
@@ -253,7 +260,10 @@ end;
 procedure TAppsViewMainFrm.AppOnActivate(Sender: TObject);
 begin
   MarkFormFocused;
-  QueueGuiRefresh;
+  if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
+    StartStartupDataLoad
+  else
+    QueueGuiRefresh;
   if assigned(fOrgAppOnActivate) then
     fOrgAppOnActivate(Sender);
 end;
@@ -527,6 +537,76 @@ begin
   fAuxListRefresh := SimpleAsyncCall(RunAuxListsRefresh, 'ActiveAppView.AuxListRefresh', OnAuxListsRefreshDone);
 end;
 
+procedure TAppsViewMainFrm.RunStartupDataLoad;
+var
+  lApp: TAppInfo;
+  lIndex: Integer;
+  lNeedAppUserModelID: Boolean;
+  lNeedCmdParams: Boolean;
+  lPrefixRules: TPrefixRuleArray;
+  lRule: TPrefixRule;
+begin
+  fConfigCache.GetHideMasks(cHideMaskFileName);
+  lPrefixRules := fConfigCache.GetPrefixRules(cPrefixMaskFileName);
+  fConfigCache.GetTerminalPatterns(cTerminalPatternsFileName);
+
+  lNeedAppUserModelID := False;
+  lNeedCmdParams := False;
+  for lRule in lPrefixRules do
+  begin
+    if lRule.AppUserModelIDMask <> '' then
+      lNeedAppUserModelID := True;
+    if lRule.CmdParamsMask <> '' then
+      lNeedCmdParams := True;
+    if lNeedAppUserModelID and lNeedCmdParams then
+      Break;
+  end;
+
+  EnsureSharedAppsSnapshotFresh(0);
+
+  for lIndex := 0 to fApps.Count - 1 do
+  begin
+    lApp := fApps[lIndex];
+    if lApp.Caption = '' then
+      Continue;
+
+    lApp.FileName;
+    if lNeedAppUserModelID then
+      lApp.AppUserModelID;
+    if lNeedCmdParams then
+      lApp.CommandLineParams;
+  end;
+end;
+
+procedure TAppsViewMainFrm.OnStartupDataLoadDone;
+begin
+  TInterlocked.Exchange(fStartupDataLoadBusy, 0);
+  TInterlocked.Exchange(fStartupDataReady, 1);
+
+  if csDestroying in ComponentState then
+    Exit;
+
+  tmrChatMonitor.Enabled := fChatMonitorConfiguredEnabled;
+  QueueGuiRefresh;
+end;
+
+procedure TAppsViewMainFrm.StartStartupDataLoad;
+begin
+  if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) <> 0 then
+  begin
+    QueueGuiRefresh;
+    Exit;
+  end;
+
+  if TInterlocked.CompareExchange(fStartupDataLoadBusy, 1, 0) <> 0 then
+    Exit;
+
+  fStartupDataLoadTask := SimpleAsyncCall(
+    RunStartupDataLoad,
+    'ActiveAppView.StartupDataLoad',
+    OnStartupDataLoadDone);
+end;
+
 procedure TAppsViewMainFrm.QueueGuiRefresh;
 begin
   if TInterlocked.CompareExchange(fGuiRefreshQueued, 1, 0) <> 0 then
@@ -703,7 +783,10 @@ end;
 procedure TAppsViewMainFrm.FormActivate(Sender: TObject);
 begin
   MarkFormFocused;
-  QueueGuiRefresh;
+  if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
+    StartStartupDataLoad
+  else
+    QueueGuiRefresh;
 end;
 
 procedure TAppsViewMainFrm.FormCreate(Sender: TObject);
@@ -728,12 +811,14 @@ begin
   fChatMonitor := TChatMonitor.Create(lIniFile);
   fChatMonitor.UseConfigCache(fConfigCache);
   chkChatNotificationSound.Checked := lIniFile.ReadBool('ChatMonitor', 'SoundEnabled', True);
-  chkChatNotificationSound.Enabled := lIniFile.ReadBool('ChatMonitor', 'Enabled', False);
+  fChatMonitorConfiguredEnabled := lIniFile.ReadBool('ChatMonitor', 'Enabled', False);
+  chkChatNotificationSound.Enabled := fChatMonitorConfiguredEnabled;
   fChatMonitor.SoundEnabled := chkChatNotificationSound.Checked;
   tmrChatMonitor.Interval := lIniFile.ReadInteger('ChatMonitor', 'CheckIntervalSeconds', 5) * 1000;
-  tmrChatMonitor.Enabled:= lIniFile.ReadBool('ChatMonitor', 'Enabled', False);
+  tmrChatMonitor.Enabled := False;
   SetLength(fSharedAppsSnapshot, 0);
   fSharedAppsSnapshotTick := 0;
+  TInterlocked.Exchange(fStartupDataReady, 0);
 end;
 
 procedure TAppsViewMainFrm.FormDestroy(Sender: TObject);
@@ -743,15 +828,19 @@ begin
   TInterlocked.Exchange(fAuxListRefreshPending, 0);
   TInterlocked.Exchange(fChatMonitorBusy, 0);
   TInterlocked.Exchange(fAuxListRefreshBusy, 0);
+  TInterlocked.Exchange(fStartupDataLoadBusy, 0);
 
   if Assigned(fAuxListRefresh) then
     TWaiter.WaitFor([fAuxListRefresh], INFINITE, True);
   if Assigned(fChatMonitorTask) then
     TWaiter.WaitFor([fChatMonitorTask], INFINITE, True);
+  if Assigned(fStartupDataLoadTask) then
+    TWaiter.WaitFor([fStartupDataLoadTask], INFINITE, True);
 
   FreeAndNil(fPendingAuxSnapshot);
   fAuxListRefresh := nil;
   fChatMonitorTask := nil;
+  fStartupDataLoadTask := nil;
 
   application.OnActivate := fOrgAppOnActivate;
   ClearListBoxItemData(lbDesktop);
@@ -789,7 +878,7 @@ end;
 
 procedure TAppsViewMainFrm.FormShow(Sender: TObject);
 begin
-  QueueGuiRefresh;
+  StartStartupDataLoad;
 end;
 
 function TAppsViewMainFrm.GetWnd(lb: TListBox): hwnd;
@@ -1046,6 +1135,12 @@ var
   lTitle: string;
   lIndex: Integer;
 begin
+  if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
+  begin
+    StartStartupDataLoad;
+    Exit;
+  end;
+
   EnsureSharedAppsSnapshotFresh(250);
 
   lExcludeMasks := fConfigCache.GetHideMasks(cHideMaskFileName);
