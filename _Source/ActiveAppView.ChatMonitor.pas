@@ -179,28 +179,51 @@ begin
   try
     lOptions.TtlMs := 15000;
     lOptions.ValidateIntervalMs := 2500;
-    lCacheValue := fMetadataCache.GetOrCreate(
-      cMetadataCacheNamespace,
-      lWndKey,
-      function: IInterface
-      var
-        lAppUserModelID: string;
-        lCommandLine: string;
-        lCommandLineParams: string;
-        lFileName: string;
-      begin
-        lFileName := srDesktop.GetFileName(aWnd);
-        lAppUserModelID := RetrieveAppUserModelID(aWnd);
+    try
+      lCacheValue := fMetadataCache.GetOrCreate(
+        cMetadataCacheNamespace,
+        lWndKey,
+        function: IInterface
+        var
+          lAppUserModelID: string;
+          lCommandLine: string;
+          lCommandLineParams: string;
+          lFileName: string;
+        begin
+          lFileName := '';
+          lAppUserModelID := '';
+          lCommandLine := '';
+          lCommandLineParams := '';
 
-        lPid := RetrievePID(aWnd);
-        if lPid = 0 then
-          lCommandLine := ''
-        else
-          lCommandLine := RetrieveCommandLine(lPid);
-        lCommandLineParams := ParseCommandLineParams(lCommandLine);
-        Result := TChatAppMetadata.Create(lFileName, lAppUserModelID, lCommandLineParams);
-      end,
-      lOptions);
+          try
+            lFileName := srDesktop.GetFileName(aWnd);
+          except
+            lFileName := '';
+          end;
+
+          try
+            lAppUserModelID := RetrieveAppUserModelID(aWnd);
+          except
+            lAppUserModelID := '';
+          end;
+
+          try
+            lPid := RetrievePID(aWnd);
+            if lPid = 0 then
+              lCommandLine := ''
+            else
+              lCommandLine := RetrieveCommandLine(lPid);
+          except
+            lCommandLine := '';
+          end;
+
+          lCommandLineParams := ParseCommandLineParams(lCommandLine);
+          Result := TChatAppMetadata.Create(lFileName, lAppUserModelID, lCommandLineParams);
+        end,
+        lOptions);
+    except
+      lCacheValue := nil;
+    end;
   finally
     lOptions.Free;
   end;
