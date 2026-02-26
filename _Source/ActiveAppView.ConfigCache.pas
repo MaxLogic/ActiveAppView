@@ -65,6 +65,11 @@ type
   private
     fCache: IMaxCache;
     fInstallDir: string;
+    class function TryReadCommaSeparatedPart(
+      const aLine: string;
+      var aIndex: Integer;
+      out aPart: string): Boolean; static;
+    class function UnquoteCsvValue(const aValue: string): string; static;
     function ResolveFileName(const aFileName: string): string;
     class function ReadNormalizedLines(const aFileName: string): TStringArray; static;
     class function ParsePrefixRules(const aFileName: string): TPrefixRuleArray; static;
@@ -196,6 +201,50 @@ begin
     Result := TPath.Combine(fInstallDir, Result);
 end;
 
+class function TConfigCache.TryReadCommaSeparatedPart(
+  const aLine: string;
+  var aIndex: Integer;
+  out aPart: string): Boolean;
+var
+  lInQuotes: Boolean;
+  lLength: Integer;
+  lPartStart: Integer;
+begin
+  lLength := Length(aLine);
+  if aIndex > lLength then
+  begin
+    aPart := '';
+    Exit(False);
+  end;
+
+  lPartStart := aIndex;
+  lInQuotes := False;
+  while aIndex <= lLength do
+  begin
+    if aLine[aIndex] = '"' then
+      lInQuotes := not lInQuotes
+    else if (aLine[aIndex] = ',') and (not lInQuotes) then
+      Break;
+    Inc(aIndex);
+  end;
+
+  aPart := Trim(Copy(aLine, lPartStart, aIndex - lPartStart));
+  if (aIndex <= lLength) and (aLine[aIndex] = ',') then
+    Inc(aIndex);
+  Result := True;
+end;
+
+class function TConfigCache.UnquoteCsvValue(const aValue: string): string;
+begin
+  Result := aValue;
+  if (Length(Result) >= 2) and (Result[1] = '"') and (Result[Length(Result)] = '"') then
+  begin
+    Result := Copy(Result, 2, Length(Result) - 2);
+    if Pos('""', Result) > 0 then
+      Result := StringReplace(Result, '""', '"', [rfReplaceAll]);
+  end;
+end;
+
 class function TConfigCache.ReadNormalizedLines(const aFileName: string): TStringArray;
 var
   lLines: TStringList;
@@ -229,12 +278,11 @@ end;
 class function TConfigCache.ParsePrefixRules(const aFileName: string): TPrefixRuleArray;
 var
   lEqPos: Integer;
-  lIndex: Integer;
   lKey: string;
   lLine: string;
   lLines: TStringArray;
-  lParts: TStringList;
   lPart: string;
+  lPartIndex: Integer;
   lResultIndex: Integer;
   lRule: TPrefixRule;
   lValue: string;
@@ -244,65 +292,57 @@ begin
   if Length(lLines) = 0 then
     Exit;
 
-  lParts := TStringList.Create;
-  try
-    lParts.CaseSensitive := False;
-    lParts.StrictDelimiter := True;
-    SetLength(Result, Length(lLines));
-    lResultIndex := 0;
-    for lLine in lLines do
+  SetLength(Result, Length(lLines));
+  lResultIndex := 0;
+  for lLine in lLines do
+  begin
+    lRule := Default(TPrefixRule);
+    lPartIndex := 1;
+    while TryReadCommaSeparatedPart(lLine, lPartIndex, lPart) do
     begin
-      lParts.CommaText := lLine;
-      lRule := Default(TPrefixRule);
-      for lIndex := 0 to lParts.Count - 1 do
-      begin
-        lPart := Trim(lParts[lIndex]);
-        if lPart = '' then
-          Continue;
-
-        lEqPos := Pos('=', lPart);
-        if lEqPos <= 1 then
-          Continue;
-
-        lKey := Trim(Copy(lPart, 1, lEqPos - 1));
-        if lKey = '' then
-          Continue;
-
-        lValue := Trim(Copy(lPart, lEqPos + 1, MaxInt));
-        if SameText(lKey, 'prefix') then
-          lRule.Prefix := lValue
-        else if SameText(lKey, 'caption') then
-          lRule.CaptionMask := lValue
-        else if SameText(lKey, 'filename') then
-          lRule.FileNameMask := lValue
-        else if SameText(lKey, 'AppUserModelID') then
-          lRule.AppUserModelIDMask := lValue
-        else if SameText(lKey, 'CmdParams') then
-          lRule.CmdParamsMask := lValue;
-      end;
-
-      if (lRule.Prefix = '') and (lRule.CaptionMask = '') and (lRule.FileNameMask = '')
-        and (lRule.AppUserModelIDMask = '') and (lRule.CmdParamsMask = '') then
+      if lPart = '' then
         Continue;
 
-      Result[lResultIndex] := lRule;
-      Inc(lResultIndex);
+      lEqPos := Pos('=', lPart);
+      if lEqPos <= 1 then
+        Continue;
+
+      lKey := Trim(Copy(lPart, 1, lEqPos - 1));
+      if lKey = '' then
+        Continue;
+
+      lValue := Trim(Copy(lPart, lEqPos + 1, MaxInt));
+      lValue := UnquoteCsvValue(lValue);
+      if SameText(lKey, 'prefix') then
+        lRule.Prefix := lValue
+      else if SameText(lKey, 'caption') then
+        lRule.CaptionMask := lValue
+      else if SameText(lKey, 'filename') then
+        lRule.FileNameMask := lValue
+      else if SameText(lKey, 'AppUserModelID') then
+        lRule.AppUserModelIDMask := lValue
+      else if SameText(lKey, 'CmdParams') then
+        lRule.CmdParamsMask := lValue;
     end;
-    SetLength(Result, lResultIndex);
-  finally
-    lParts.Free;
+
+    if (lRule.Prefix = '') and (lRule.CaptionMask = '') and (lRule.FileNameMask = '')
+      and (lRule.AppUserModelIDMask = '') and (lRule.CmdParamsMask = '') then
+      Continue;
+
+    Result[lResultIndex] := lRule;
+    Inc(lResultIndex);
   end;
+  SetLength(Result, lResultIndex);
 end;
 
 class function TConfigCache.ParseReviewRules(const aFileName: string): TReviewRuleArray;
 var
   lEqPos: Integer;
-  lIndex: Integer;
   lKey: string;
   lLine: string;
   lLines: TStringArray;
-  lParts: TStringList;
   lPart: string;
+  lPartIndex: Integer;
   lResultIndex: Integer;
   lRule: TReviewRule;
   lValue: string;
@@ -312,62 +352,55 @@ begin
   if Length(lLines) = 0 then
     Exit;
 
-  lParts := TStringList.Create;
-  try
-    lParts.CaseSensitive := False;
-    lParts.StrictDelimiter := True;
-    SetLength(Result, Length(lLines));
-    lResultIndex := 0;
-    for lLine in lLines do
+  SetLength(Result, Length(lLines));
+  lResultIndex := 0;
+  for lLine in lLines do
+  begin
+    lRule := Default(TReviewRule);
+    lPartIndex := 1;
+    while TryReadCommaSeparatedPart(lLine, lPartIndex, lPart) do
     begin
-      lParts.CommaText := lLine;
-      lRule := Default(TReviewRule);
-      for lIndex := 0 to lParts.Count - 1 do
-      begin
-        lPart := Trim(lParts[lIndex]);
-        if lPart = '' then
-          Continue;
-
-        lEqPos := Pos('=', lPart);
-        if lEqPos <= 1 then
-          Continue;
-
-        lKey := Trim(Copy(lPart, 1, lEqPos - 1));
-        if lKey = '' then
-          Continue;
-
-        lValue := Trim(Copy(lPart, lEqPos + 1, MaxInt));
-        if SameText(lKey, 'caption') then
-          lRule.CaptionMask := lValue
-        else if SameText(lKey, 'filename') then
-          lRule.FileNameMask := lValue
-        else if SameText(lKey, 'AppUserModelID') then
-          lRule.AppUserModelIDMask := lValue
-        else if SameText(lKey, 'CmdParams') then
-          lRule.CmdParamsMask := lValue
-        else if SameText(lKey, 'excludeCaption') then
-          lRule.ExcludeCaptionMask := lValue
-        else if SameText(lKey, 'excludeFileName') then
-          lRule.ExcludeFileNameMask := lValue
-        else if SameText(lKey, 'excludeAppUserModelID') then
-          lRule.ExcludeAppUserModelIDMask := lValue
-        else if SameText(lKey, 'excludeCmdParams') then
-          lRule.ExcludeCmdParamsMask := lValue;
-      end;
-
-      if (lRule.CaptionMask = '') and (lRule.FileNameMask = '')
-        and (lRule.AppUserModelIDMask = '') and (lRule.CmdParamsMask = '')
-        and (lRule.ExcludeCaptionMask = '') and (lRule.ExcludeFileNameMask = '')
-        and (lRule.ExcludeAppUserModelIDMask = '') and (lRule.ExcludeCmdParamsMask = '') then
+      if lPart = '' then
         Continue;
 
-      Result[lResultIndex] := lRule;
-      Inc(lResultIndex);
+      lEqPos := Pos('=', lPart);
+      if lEqPos <= 1 then
+        Continue;
+
+      lKey := Trim(Copy(lPart, 1, lEqPos - 1));
+      if lKey = '' then
+        Continue;
+
+      lValue := Trim(Copy(lPart, lEqPos + 1, MaxInt));
+      lValue := UnquoteCsvValue(lValue);
+      if SameText(lKey, 'caption') then
+        lRule.CaptionMask := lValue
+      else if SameText(lKey, 'filename') then
+        lRule.FileNameMask := lValue
+      else if SameText(lKey, 'AppUserModelID') then
+        lRule.AppUserModelIDMask := lValue
+      else if SameText(lKey, 'CmdParams') then
+        lRule.CmdParamsMask := lValue
+      else if SameText(lKey, 'excludeCaption') then
+        lRule.ExcludeCaptionMask := lValue
+      else if SameText(lKey, 'excludeFileName') then
+        lRule.ExcludeFileNameMask := lValue
+      else if SameText(lKey, 'excludeAppUserModelID') then
+        lRule.ExcludeAppUserModelIDMask := lValue
+      else if SameText(lKey, 'excludeCmdParams') then
+        lRule.ExcludeCmdParamsMask := lValue;
     end;
-    SetLength(Result, lResultIndex);
-  finally
-    lParts.Free;
+
+    if (lRule.CaptionMask = '') and (lRule.FileNameMask = '')
+      and (lRule.AppUserModelIDMask = '') and (lRule.CmdParamsMask = '')
+      and (lRule.ExcludeCaptionMask = '') and (lRule.ExcludeFileNameMask = '')
+      and (lRule.ExcludeAppUserModelIDMask = '') and (lRule.ExcludeCmdParamsMask = '') then
+      Continue;
+
+    Result[lResultIndex] := lRule;
+    Inc(lResultIndex);
   end;
+  SetLength(Result, lResultIndex);
 end;
 
 class function TConfigCache.ParseShortCuts(const aFileName: string): TNamedValueArray;
