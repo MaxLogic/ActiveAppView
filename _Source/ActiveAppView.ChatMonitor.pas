@@ -236,6 +236,13 @@ begin
     Exit(1);
   end;
 
+  lFailure := CheckUnreadCaptionCase('zero-count', 'Teams (0)', False);
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
+
   lFailure := CheckUnreadCaptionCase('empty-parentheses', 'Teams ()', False);
   if lFailure <> '' then
   begin
@@ -541,6 +548,7 @@ end;
 class function TChatMonitor.HasUnreadMessageCountInCaption(const aCaption: string): Boolean;
 var
   lDigitCount: Integer;
+  lHasNonZeroDigit: Boolean;
   lIndex: Integer;
   lLen: Integer;
   lScanIndex: Integer;
@@ -559,13 +567,16 @@ begin
         Inc(lScanIndex);
 
       lDigitCount := 0;
+      lHasNonZeroDigit := False;
       while (lScanIndex <= lLen) and CharInSet(aCaption[lScanIndex], ['0'..'9']) do
       begin
+        if aCaption[lScanIndex] <> '0' then
+          lHasNonZeroDigit := True;
         Inc(lDigitCount);
         Inc(lScanIndex);
       end;
 
-      if lDigitCount > 0 then
+      if (lDigitCount > 0) and lHasNonZeroDigit then
       begin
         while (lScanIndex <= lLen) and IsUnreadCounterPaddingChar(aCaption[lScanIndex]) do
           Inc(lScanIndex);
