@@ -58,6 +58,10 @@ type
       const aAppCaption: string;
       const aMetadata: IChatAppMetadata;
       const aRule: TReviewRule): Boolean;
+    function MatchesReviewExcludeRule(
+      const aAppCaption: string;
+      const aMetadata: IChatAppMetadata;
+      const aRule: TReviewRule): Boolean;
     procedure PlaySoundFile(const aFileName: string);
     function PrefetchMetadataInParallel(
       const aApps: TArray<TChatAppSnapshot>): TArray<IChatAppMetadata>;
@@ -228,7 +232,8 @@ var
   lRule: TReviewRule;
 begin
   for lRule in aRules do
-    if (lRule.FileNameMask <> '') or (lRule.AppUserModelIDMask <> '') or (lRule.CmdParamsMask <> '') then
+    if (lRule.FileNameMask <> '') or (lRule.AppUserModelIDMask <> '') or (lRule.CmdParamsMask <> '')
+      or (lRule.ExcludeFileNameMask <> '') or (lRule.ExcludeAppUserModelIDMask <> '') or (lRule.ExcludeCmdParamsMask <> '') then
       Exit(True);
 
   Result := False;
@@ -422,6 +427,23 @@ begin
     or ((aRule.CmdParamsMask <> '') and StringMatches(aMetadata.CommandLineParams, aRule.CmdParamsMask, False));
 end;
 
+function TChatMonitor.MatchesReviewExcludeRule(
+  const aAppCaption: string;
+  const aMetadata: IChatAppMetadata;
+  const aRule: TReviewRule): Boolean;
+begin
+  Result := ((aRule.ExcludeCaptionMask <> '') and StringMatches(aAppCaption, aRule.ExcludeCaptionMask, False));
+  if Result then
+    Exit(True);
+
+  if not Assigned(aMetadata) then
+    Exit(False);
+
+  Result := ((aRule.ExcludeFileNameMask <> '') and StringMatches(aMetadata.FileName, aRule.ExcludeFileNameMask, False))
+    or ((aRule.ExcludeAppUserModelIDMask <> '') and StringMatches(aMetadata.AppUserModelID, aRule.ExcludeAppUserModelIDMask, False))
+    or ((aRule.ExcludeCmdParamsMask <> '') and StringMatches(aMetadata.CommandLineParams, aRule.ExcludeCmdParamsMask, False));
+end;
+
 class function TChatMonitor.ParseCommandLineParams(const aCommandLine: string): string;
 var
   lCommandLine: string;
@@ -597,15 +619,25 @@ function TChatMonitor.ShouldReviewApp(
   const aRules: TReviewRuleArray): Boolean;
 var
   lRule: TReviewRule;
+  lExcludeMatches: Boolean;
+  lIncludeMatches: Boolean;
 begin
   if Length(aRules) = 0 then
     Exit(False);
 
-  for lRule in aRules do
-    if MatchesReviewRule(aAppCaption, aMetadata, lRule) then
-      Exit(True);
+  lExcludeMatches := False;
+  lIncludeMatches := False;
 
-  Result := False;
+  for lRule in aRules do
+  begin
+    if MatchesReviewExcludeRule(aAppCaption, aMetadata, lRule) then
+      lExcludeMatches := True;
+
+    if MatchesReviewRule(aAppCaption, aMetadata, lRule) then
+      lIncludeMatches := True;
+  end;
+
+  Result := lIncludeMatches and not lExcludeMatches;
 end;
 
 procedure TChatMonitor.UseConfigCache(aConfigCache: TConfigCache);

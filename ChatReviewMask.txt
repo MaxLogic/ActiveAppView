@@ -5,11 +5,16 @@
 ; filename      - match full executable path mask
 ; AppUserModelID - match app user model id (useful for Edge PWA profiles)
 ; CmdParams     - match command line params
+; excludeCaption - skip entries whose caption matches
+; excludeFilename - skip entries whose executable path matches
+; excludeAppUserModelID - skip entries whose app user model id matches
+; excludeCmdParams - skip entries whose command line params match
 ;
 ; Behavior:
 ; - This file is the only source of chat monitor app selection.
 ; - If this file is empty (or missing), no app is reviewed.
 ; - If at least one rule exists, an app is reviewed only when it matches at least one rule.
+; - Exclude masks are checked after includes; a match on any exclude mask prevents review.
 ; - Unread detection is automatic and checks caption for a numeric counter pattern: (\d+)
 ;
 ; Examples:
@@ -17,3 +22,5 @@
 caption=*teams*
 filename=*msedge.exe,CmdParams=*Teams*
 AppUserModelID=*teams*
+excludeCaption=*discord*
+excludeCaption=*facebook*
