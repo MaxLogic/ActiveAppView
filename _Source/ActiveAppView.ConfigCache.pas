@@ -228,12 +228,16 @@ end;
 
 class function TConfigCache.ParsePrefixRules(const aFileName: string): TPrefixRuleArray;
 var
+  lEqPos: Integer;
   lIndex: Integer;
+  lKey: string;
   lLine: string;
   lLines: TStringArray;
   lParts: TStringList;
+  lPart: string;
   lResultIndex: Integer;
   lRule: TPrefixRule;
+  lValue: string;
 begin
   lLines := ReadNormalizedLines(aFileName);
   SetLength(Result, 0);
@@ -249,13 +253,33 @@ begin
     for lLine in lLines do
     begin
       lParts.CommaText := lLine;
+      lRule := Default(TPrefixRule);
       for lIndex := 0 to lParts.Count - 1 do
-        lParts[lIndex] := Trim(lParts[lIndex]);
-      lRule.Prefix := Trim(lParts.Values['prefix']);
-      lRule.CaptionMask := Trim(lParts.Values['caption']);
-      lRule.FileNameMask := Trim(lParts.Values['filename']);
-      lRule.AppUserModelIDMask := Trim(lParts.Values['AppUserModelID']);
-      lRule.CmdParamsMask := Trim(lParts.Values['CmdParams']);
+      begin
+        lPart := Trim(lParts[lIndex]);
+        if lPart = '' then
+          Continue;
+
+        lEqPos := Pos('=', lPart);
+        if lEqPos <= 1 then
+          Continue;
+
+        lKey := Trim(Copy(lPart, 1, lEqPos - 1));
+        if lKey = '' then
+          Continue;
+
+        lValue := Trim(Copy(lPart, lEqPos + 1, MaxInt));
+        if SameText(lKey, 'prefix') then
+          lRule.Prefix := lValue
+        else if SameText(lKey, 'caption') then
+          lRule.CaptionMask := lValue
+        else if SameText(lKey, 'filename') then
+          lRule.FileNameMask := lValue
+        else if SameText(lKey, 'AppUserModelID') then
+          lRule.AppUserModelIDMask := lValue
+        else if SameText(lKey, 'CmdParams') then
+          lRule.CmdParamsMask := lValue;
+      end;
 
       if (lRule.Prefix = '') and (lRule.CaptionMask = '') and (lRule.FileNameMask = '')
         and (lRule.AppUserModelIDMask = '') and (lRule.CmdParamsMask = '') then
@@ -272,12 +296,16 @@ end;
 
 class function TConfigCache.ParseReviewRules(const aFileName: string): TReviewRuleArray;
 var
+  lEqPos: Integer;
   lIndex: Integer;
+  lKey: string;
   lLine: string;
   lLines: TStringArray;
   lParts: TStringList;
+  lPart: string;
   lResultIndex: Integer;
   lRule: TReviewRule;
+  lValue: string;
 begin
   lLines := ReadNormalizedLines(aFileName);
   SetLength(Result, 0);
@@ -293,16 +321,39 @@ begin
     for lLine in lLines do
     begin
       lParts.CommaText := lLine;
+      lRule := Default(TReviewRule);
       for lIndex := 0 to lParts.Count - 1 do
-        lParts[lIndex] := Trim(lParts[lIndex]);
-      lRule.CaptionMask := Trim(lParts.Values['caption']);
-      lRule.FileNameMask := Trim(lParts.Values['filename']);
-      lRule.AppUserModelIDMask := Trim(lParts.Values['AppUserModelID']);
-      lRule.CmdParamsMask := Trim(lParts.Values['CmdParams']);
-      lRule.ExcludeCaptionMask := Trim(lParts.Values['excludecaption']);
-      lRule.ExcludeFileNameMask := Trim(lParts.Values['excludefilename']);
-      lRule.ExcludeAppUserModelIDMask := Trim(lParts.Values['excludeappusermodelid']);
-      lRule.ExcludeCmdParamsMask := Trim(lParts.Values['excludecmdparams']);
+      begin
+        lPart := Trim(lParts[lIndex]);
+        if lPart = '' then
+          Continue;
+
+        lEqPos := Pos('=', lPart);
+        if lEqPos <= 1 then
+          Continue;
+
+        lKey := Trim(Copy(lPart, 1, lEqPos - 1));
+        if lKey = '' then
+          Continue;
+
+        lValue := Trim(Copy(lPart, lEqPos + 1, MaxInt));
+        if SameText(lKey, 'caption') then
+          lRule.CaptionMask := lValue
+        else if SameText(lKey, 'filename') then
+          lRule.FileNameMask := lValue
+        else if SameText(lKey, 'AppUserModelID') then
+          lRule.AppUserModelIDMask := lValue
+        else if SameText(lKey, 'CmdParams') then
+          lRule.CmdParamsMask := lValue
+        else if SameText(lKey, 'excludeCaption') then
+          lRule.ExcludeCaptionMask := lValue
+        else if SameText(lKey, 'excludeFileName') then
+          lRule.ExcludeFileNameMask := lValue
+        else if SameText(lKey, 'excludeAppUserModelID') then
+          lRule.ExcludeAppUserModelIDMask := lValue
+        else if SameText(lKey, 'excludeCmdParams') then
+          lRule.ExcludeCmdParamsMask := lValue;
+      end;
 
       if (lRule.CaptionMask = '') and (lRule.FileNameMask = '')
         and (lRule.AppUserModelIDMask = '') and (lRule.CmdParamsMask = '')
