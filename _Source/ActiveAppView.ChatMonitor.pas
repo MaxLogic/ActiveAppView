@@ -62,7 +62,7 @@ type
       const aAppCaption: string;
       const aMetadata: IChatAppMetadata;
       const aRule: TReviewRule): Boolean;
-    procedure PlaySoundFile(const aFileName: string);
+    function PlaySoundFile(const aFileName: string): Boolean;
     function PrefetchMetadataInParallel(
       const aApps: TArray<TChatAppSnapshot>): TArray<IChatAppMetadata>;
     procedure SetSoundEnabled(const aValue: Boolean);
@@ -109,6 +109,7 @@ const
   cMetadataCacheNamespace = 'activeappview.chat-monitor.metadata';
   cReviewRuleConjunctionSelfTestArg = '--self-test-chat-monitor-review-rule-conjunction';
   cSoundFallbackSelfTestArg = '--self-test-chat-monitor-sound-fallback';
+  cSoundToggleThrottleSelfTestArg = '--self-test-chat-monitor-sound-toggle-throttle';
   cUnreadCaptionSelfTestArg = '--self-test-chat-monitor-unread-caption';
 
 type
@@ -304,6 +305,67 @@ begin
   end;
 end;
 
+function RunSoundToggleThrottleSelfTest: Integer;
+var
+  lApps: TArray<TChatAppSnapshot>;
+  lIniFile: TMemIniFile;
+  lMaskFileName: string;
+  lMissingSoundFileName: string;
+  lMonitor: TChatMonitor;
+  lOriginalMessageBeepProc: TMessageBeepProc;
+  lSettingsFileName: string;
+begin
+  Result := 0;
+  lMaskFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.sound-toggle-mask.txt');
+  lMissingSoundFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.toggle-missing.wav');
+  lSettingsFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.sound-toggle.ini');
+  TFile.WriteAllText(lMaskFileName, 'caption=*Teams*', TEncoding.UTF8);
+  if TFile.Exists(lMissingSoundFileName) then
+    TFile.Delete(lMissingSoundFileName);
+
+  lIniFile := TMemIniFile.Create(lSettingsFileName, TEncoding.UTF8, False);
+  try
+    lIniFile.WriteBool('ChatMonitor', 'Enabled', True);
+    lIniFile.WriteBool('ChatMonitor', 'SoundEnabled', False);
+    lIniFile.WriteString('ChatMonitor', 'ReviewMaskFile', lMaskFileName);
+    lIniFile.WriteString('ChatMonitor', 'UnreadMessageSound', lMissingSoundFileName);
+    lIniFile.WriteInteger('ChatMonitor', 'UnreadMessageSoundIntervalSeconds', 30);
+    lIniFile.UpdateFile;
+
+    lMonitor := TChatMonitor.Create(lIniFile);
+    try
+      SetLength(lApps, 1);
+      lApps[0].Wnd := HWND(1);
+      lApps[0].Caption := 'Teams (3)';
+
+      lOriginalMessageBeepProc := gMessageBeepProc;
+      gSelfTestMessageBeepCount := 0;
+      gMessageBeepProc := SelfTestMessageBeep;
+      try
+        lMonitor.ProcessSnapshot(lApps);
+        lMonitor.SoundEnabled := True;
+        lMonitor.ProcessSnapshot(lApps);
+      finally
+        gMessageBeepProc := lOriginalMessageBeepProc;
+      end;
+    finally
+      lMonitor.Free;
+    end;
+  finally
+    lIniFile.Free;
+    if TFile.Exists(lMaskFileName) then
+      TFile.Delete(lMaskFileName);
+    if TFile.Exists(lSettingsFileName) then
+      TFile.Delete(lSettingsFileName);
+  end;
+
+  if gSelfTestMessageBeepCount <> 1 then
+  begin
+    Writeln(Format('SELFTEST FAILED: sound toggle expected=1 actual=%d', [gSelfTestMessageBeepCount]));
+    Result := 1;
+  end;
+end;
+
 function RunReviewRuleConjunctionSelfTest: Integer;
 var
   lIniFile: TMemIniFile;
@@ -398,6 +460,17 @@ begin
   begin
     try
       Result := RunSoundFallbackSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+  end else if SameText(aArg, cSoundToggleThrottleSelfTestArg) then
+  begin
+    try
+      Result := RunSoundToggleThrottleSelfTest;
     except
       on lException: Exception do
       begin
@@ -719,7 +792,7 @@ begin
   Result := Copy(lCommandLine, lSplitIndex, MaxInt);
 end;
 
-procedure TChatMonitor.PlaySoundFile(const aFileName: string);
+function TChatMonitor.PlaySoundFile(const aFileName: string): Boolean;
 var
   lHasSoundFile: Boolean;
   lFullPath: string;
@@ -727,11 +800,12 @@ var
   lLastPlayedTime: TDateTime;
   lPlayStarted: BOOL;
 begin
+  Result := False;
   if not fSoundEnabled then
-    Exit;
+    Exit(False);
 
   if aFileName = '' then
-    Exit;
+    Exit(False);
 
   lFullPath := aFileName;
   if TPath.IsRelativePath(lFullPath) then
@@ -740,7 +814,7 @@ begin
   lKey := lFullPath.ToLower;
   if fSoundThrottling.TryGetValue(lKey, lLastPlayedTime) then
     if SecondsBetween(Now, lLastPlayedTime) < 5 then
-      Exit;
+      Exit(False);
   fSoundThrottling.AddOrSetValue(lKey, Now);
 
   lHasSoundFile := TFile.Exists(lFullPath);
@@ -749,7 +823,9 @@ begin
     lPlayStarted := gPlaySoundProc(PChar(lFullPath), 0, SND_FILENAME or SND_ASYNC);
 
   if (not lHasSoundFile) or (not lPlayStarted) then
-    gMessageBeepProc(MB_ICONASTERISK);
+    Result := (gMessageBeepProc(MB_ICONASTERISK) <> False)
+  else
+    Result := True;
 end;
 
 function TChatMonitor.PrefetchMetadataInParallel(
@@ -852,9 +928,11 @@ begin
       begin
         if SecondsBetween(Now, lNewState.LastSoundPlayed) > fUnreadMessageSoundInterval then
         begin
-          PlaySoundFile(fUnreadMessageSound);
-          lNewState.LastSoundPlayed := Now;
-          lFoundApps[lWnd] := lNewState;
+          if PlaySoundFile(fUnreadMessageSound) then
+          begin
+            lNewState.LastSoundPlayed := Now;
+            lFoundApps[lWnd] := lNewState;
+          end;
         end;
       end;
     end;
