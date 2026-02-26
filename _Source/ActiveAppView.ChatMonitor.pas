@@ -105,6 +105,7 @@ type
   end;
 
 const
+  cCommandLineParamsSelfTestArg = '--self-test-chat-monitor-command-line-params';
   cMetadataCacheNamespace = 'activeappview.chat-monitor.metadata';
   cSoundFallbackSelfTestArg = '--self-test-chat-monitor-sound-fallback';
   cUnreadCaptionSelfTestArg = '--self-test-chat-monitor-unread-caption';
@@ -143,6 +144,59 @@ begin
 
   Result := Format('SELFTEST FAILED: %s expected=%s actual=%s caption="%s"',
     [aCaseName, BoolToText(aExpected), BoolToText(lActual), aCaption]);
+end;
+
+function CheckCommandLineParamsCase(
+  const aCaseName: string;
+  const aCommandLine: string;
+  const aExpectedParams: string): string;
+var
+  lActualParams: string;
+begin
+  lActualParams := TChatMonitor.ParseCommandLineParams(aCommandLine);
+  if lActualParams = aExpectedParams then
+    Exit('');
+
+  Result := Format(
+    'SELFTEST FAILED: %s expected="%s" actual="%s" commandLine="%s"',
+    [aCaseName, aExpectedParams, lActualParams, aCommandLine]);
+end;
+
+function RunCommandLineParamsSelfTest: Integer;
+var
+  lFailure: string;
+begin
+  Result := 0;
+
+  lFailure := CheckCommandLineParamsCase(
+    'quoted-space-delimiter',
+    '"C:\Tools\tool.exe" --profile prod',
+    '--profile prod');
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
+
+  lFailure := CheckCommandLineParamsCase(
+    'unquoted-tab-delimiter',
+    'C:\Tools\tool.exe'#9'--profile prod',
+    '--profile prod');
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
+
+  lFailure := CheckCommandLineParamsCase(
+    'no-params',
+    'C:\Tools\tool.exe',
+    '');
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
 end;
 
 function RunUnreadCaptionSelfTest: Integer;
@@ -249,6 +303,17 @@ begin
   begin
     try
       Result := RunUnreadCaptionSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+  end else if SameText(aArg, cCommandLineParamsSelfTestArg) then
+  begin
+    try
+      Result := RunCommandLineParamsSelfTest;
     except
       on lException: Exception do
       begin
@@ -520,21 +585,36 @@ end;
 class function TChatMonitor.ParseCommandLineParams(const aCommandLine: string): string;
 var
   lCommandLine: string;
+  lLen: Integer;
   lSplitIndex: Integer;
 begin
   lCommandLine := Trim(aCommandLine);
   if lCommandLine = '' then
     Exit('');
 
+  lLen := Length(lCommandLine);
   if StartsText('"', lCommandLine) then
-    lSplitIndex := PosEx('"', lCommandLine, 2)
+  begin
+    lSplitIndex := PosEx('"', lCommandLine, 2);
+    if lSplitIndex <= 0 then
+      Exit('');
+    Inc(lSplitIndex);
+  end
   else
-    lSplitIndex := PosEx(' ', lCommandLine, 1);
+  begin
+    lSplitIndex := 1;
+    while (lSplitIndex <= lLen) and not CharInSet(lCommandLine[lSplitIndex], [#9, #10, #13, ' ']) do
+      Inc(lSplitIndex);
+    if lSplitIndex > lLen then
+      Exit('');
+  end;
 
-  if lSplitIndex <= 0 then
+  while (lSplitIndex <= lLen) and CharInSet(lCommandLine[lSplitIndex], [#9, #10, #13, ' ']) do
+    Inc(lSplitIndex);
+  if lSplitIndex > lLen then
     Exit('');
 
-  Result := Trim(Copy(lCommandLine, lSplitIndex + 1, MaxInt));
+  Result := Copy(lCommandLine, lSplitIndex, MaxInt);
 end;
 
 procedure TChatMonitor.PlaySoundFile(const aFileName: string);
