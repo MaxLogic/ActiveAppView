@@ -208,6 +208,9 @@ type
     ShortCuts: TNamedValueArray;
   end;
 
+  TAppPrefetchProc = reference to procedure(const aApp: TAppInfo);
+  TShutdownCheckProc = reference to function: Boolean;
+
 const
   cShortCutsFileName = 'ShortCuts.txt';
   cTerminalPatternsFileName = 'TerminalPatterns.txt';
@@ -216,6 +219,7 @@ const
   cPrefixMaskFileName = 'PrefixMask.txt';
   cSettingsFileName = 'settings.ini';
   cRestoreItemIndexSelfTestArg = '--self-test-restore-item-index';
+  cWarmupPrefetchSelfTestArg = '--self-test-startup-warmup-prefetch';
   cIgnoreF4AfterFocusMs = 200;
   cShutdownTaskWaitTimeoutMs = 25;
 
@@ -236,6 +240,43 @@ begin
   lItems.Sorted := True;
   if lItems.Find(aOldItemCaption, lIndex) then
     Result := lIndex;
+end;
+
+procedure PrefetchAppFileNamesInParallel(
+  const aApps: TArray<TAppInfo>;
+  const aIsShuttingDown: TShutdownCheckProc;
+  const aPrefetchProc: TAppPrefetchProc = nil);
+var
+  lPrefetchProc: TAppPrefetchProc;
+begin
+  if Length(aApps) = 0 then
+    Exit;
+
+  lPrefetchProc := aPrefetchProc;
+  TParallel.&For(0, High(aApps),
+    procedure(aIndex: Integer)
+    var
+      lApp: TAppInfo;
+    begin
+      if Assigned(aIsShuttingDown) and aIsShuttingDown() then
+        Exit;
+
+      lApp := aApps[aIndex];
+      try
+        if Assigned(lPrefetchProc) then
+        begin
+          lPrefetchProc(lApp);
+          Exit;
+        end;
+
+        if (lApp = nil) or (lApp.Caption = '') then
+          Exit;
+
+        lApp.FileName;
+      except
+        // Window metadata can disappear while we prefetch in parallel; skip transient failures.
+      end;
+    end);
 end;
 
 { TListBoxItemData }
@@ -640,19 +681,11 @@ begin
     Exit;
 
   lPhaseWatch := TStopwatch.StartNew;
-  TParallel.&For(0, High(lApps),
-    procedure(aIndex: Integer)
-    var
-      lApp: TAppInfo;
+  PrefetchAppFileNamesInParallel(
+    lApps,
+    function: Boolean
     begin
-      lApp := lApps[aIndex];
-      if IsShuttingDown then
-        Exit;
-
-      if (lApp = nil) or (lApp.Caption = '') then
-        Exit;
-
-      lApp.FileName;
+      Result := IsShuttingDown;
     end);
   lParallelPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
 
@@ -1465,27 +1498,54 @@ end;
 
 function RunMainFormSelfTests(const aArg: string): Integer;
 var
+  lApps: TArray<TAppInfo>;
   lItems: TStringList;
   lResultIndex: Integer;
 begin
   Result := -1;
-  if not SameText(aArg, cRestoreItemIndexSelfTestArg) then
+  if SameText(aArg, cRestoreItemIndexSelfTestArg) then
+  begin
+    Result := 0;
+    lItems := TStringList.Create;
+    try
+      lItems.Sorted := True;
+      lItems.Add('A');
+      lItems.Add('C');
+      lResultIndex := FindSortedCaptionIndex(lItems, 'Z');
+      if lResultIndex <> -1 then
+      begin
+        Writeln(Format('SELFTEST FAILED: expected missing caption index=-1, got %d', [lResultIndex]));
+        Result := 1;
+      end;
+    finally
+      lItems.Free;
+    end;
+    Exit;
+  end;
+
+  if not SameText(aArg, cWarmupPrefetchSelfTestArg) then
     Exit;
 
   Result := 0;
-  lItems := TStringList.Create;
+  SetLength(lApps, 1);
   try
-    lItems.Sorted := True;
-    lItems.Add('A');
-    lItems.Add('C');
-    lResultIndex := FindSortedCaptionIndex(lItems, 'Z');
-    if lResultIndex <> -1 then
+    PrefetchAppFileNamesInParallel(
+      lApps,
+      function: Boolean
+      begin
+        Result := False;
+      end,
+      procedure(const aApp: TAppInfo)
+      begin
+        raise Exception.Create('injected prefetch failure');
+      end);
+  except
+    on lException: Exception do
     begin
-      Writeln(Format('SELFTEST FAILED: expected missing caption index=-1, got %d', [lResultIndex]));
+      Writeln(Format('SELFTEST FAILED: startup warmup prefetch raised %s: %s',
+        [lException.ClassName, lException.Message]));
       Result := 1;
     end;
-  finally
-    lItems.Free;
   end;
 end;
 
