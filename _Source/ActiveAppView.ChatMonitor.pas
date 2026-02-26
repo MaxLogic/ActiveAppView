@@ -48,6 +48,7 @@ type
 
     class function AnyRuleNeedsMetadata(const aRules: TReviewRuleArray): Boolean; static;
     class function HasUnreadMessageCountInCaption(const aCaption: string): Boolean; static;
+    class function IsUnreadCounterDigit(aChar: Char; out aIsNonZeroDigit: Boolean): Boolean; static;
     class function IsUnreadCounterPaddingChar(aChar: Char): Boolean; static;
     class function IsUnreadCounterStartChar(aChar: Char): Boolean; static;
     class function IsUnreadCounterTerminatorChar(aChar: Char): Boolean; static;
@@ -109,6 +110,7 @@ const
   cMetadataCacheNamespace = 'activeappview.chat-monitor.metadata';
   cReviewRuleConjunctionSelfTestArg = '--self-test-chat-monitor-review-rule-conjunction';
   cSoundFallbackSelfTestArg = '--self-test-chat-monitor-sound-fallback';
+  cSoundThrottleFailureRetrySelfTestArg = '--self-test-chat-monitor-sound-throttle-failure-retry';
   cSoundToggleThrottleSelfTestArg = '--self-test-chat-monitor-sound-toggle-throttle';
   cUnreadCaptionSelfTestArg = '--self-test-chat-monitor-unread-caption';
 
@@ -125,6 +127,12 @@ function SelfTestMessageBeep(aType: UINT): BOOL; stdcall;
 begin
   Inc(gSelfTestMessageBeepCount);
   Result := True;
+end;
+
+function SelfTestMessageBeepFail(aType: UINT): BOOL; stdcall;
+begin
+  Inc(gSelfTestMessageBeepCount);
+  Result := False;
 end;
 
 function BoolToText(aValue: Boolean): string;
@@ -231,6 +239,14 @@ begin
 
   lFailure := CheckUnreadCaptionCase('fullwidth-parentheses',
     'Teams ' + #$FF08 + '3' + #$FF09, True);
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
+
+  lFailure := CheckUnreadCaptionCase('fullwidth-digits',
+    'Teams ' + #$FF08 + #$FF13 + #$FF09, True);
   if lFailure <> '' then
   begin
     Writeln(lFailure);
@@ -366,6 +382,53 @@ begin
   end;
 end;
 
+function RunSoundThrottleFailureRetrySelfTest: Integer;
+var
+  lIniFile: TMemIniFile;
+  lMissingSoundFileName: string;
+  lMonitor: TChatMonitor;
+  lOriginalMessageBeepProc: TMessageBeepProc;
+  lSettingsFileName: string;
+begin
+  Result := 0;
+  lMissingSoundFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.throttle-failure.wav');
+  lSettingsFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.throttle-failure.ini');
+  if TFile.Exists(lMissingSoundFileName) then
+    TFile.Delete(lMissingSoundFileName);
+
+  lIniFile := TMemIniFile.Create(lSettingsFileName, TEncoding.UTF8, False);
+  try
+    lIniFile.WriteBool('ChatMonitor', 'Enabled', True);
+    lIniFile.WriteBool('ChatMonitor', 'SoundEnabled', True);
+    lIniFile.UpdateFile;
+
+    lMonitor := TChatMonitor.Create(lIniFile);
+    try
+      lOriginalMessageBeepProc := gMessageBeepProc;
+      gSelfTestMessageBeepCount := 0;
+      gMessageBeepProc := SelfTestMessageBeepFail;
+      try
+        lMonitor.PlaySoundFile(lMissingSoundFileName);
+        lMonitor.PlaySoundFile(lMissingSoundFileName);
+      finally
+        gMessageBeepProc := lOriginalMessageBeepProc;
+      end;
+    finally
+      lMonitor.Free;
+    end;
+  finally
+    lIniFile.Free;
+    if TFile.Exists(lSettingsFileName) then
+      TFile.Delete(lSettingsFileName);
+  end;
+
+  if gSelfTestMessageBeepCount <> 2 then
+  begin
+    Writeln(Format('SELFTEST FAILED: throttle failure retry expected=2 actual=%d', [gSelfTestMessageBeepCount]));
+    Result := 1;
+  end;
+end;
+
 function RunReviewRuleConjunctionSelfTest: Integer;
 var
   lIniFile: TMemIniFile;
@@ -471,6 +534,17 @@ begin
   begin
     try
       Result := RunSoundToggleThrottleSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+  end else if SameText(aArg, cSoundThrottleFailureRetrySelfTestArg) then
+  begin
+    try
+      Result := RunSoundThrottleFailureRetrySelfTest;
     except
       on lException: Exception do
       begin
@@ -623,6 +697,7 @@ var
   lDigitCount: Integer;
   lHasNonZeroDigit: Boolean;
   lIndex: Integer;
+  lIsNonZeroDigit: Boolean;
   lLen: Integer;
   lScanIndex: Integer;
 begin
@@ -641,9 +716,9 @@ begin
 
       lDigitCount := 0;
       lHasNonZeroDigit := False;
-      while (lScanIndex <= lLen) and CharInSet(aCaption[lScanIndex], ['0'..'9']) do
+      while (lScanIndex <= lLen) and IsUnreadCounterDigit(aCaption[lScanIndex], lIsNonZeroDigit) do
       begin
-        if aCaption[lScanIndex] <> '0' then
+        if lIsNonZeroDigit then
           lHasNonZeroDigit := True;
         Inc(lDigitCount);
         Inc(lScanIndex);
@@ -658,6 +733,24 @@ begin
       end;
     end;
   end;
+end;
+
+class function TChatMonitor.IsUnreadCounterDigit(aChar: Char; out aIsNonZeroDigit: Boolean): Boolean;
+var
+  lDigitValue: Integer;
+begin
+  lDigitValue := -1;
+  if CharInSet(aChar, ['0'..'9']) then
+    lDigitValue := Ord(aChar) - Ord('0')
+  else if (aChar >= #$FF10) and (aChar <= #$FF19) then
+    lDigitValue := Ord(aChar) - $FF10
+  else if (aChar >= #$0660) and (aChar <= #$0669) then
+    lDigitValue := Ord(aChar) - $0660
+  else if (aChar >= #$06F0) and (aChar <= #$06F9) then
+    lDigitValue := Ord(aChar) - $06F0;
+
+  Result := (lDigitValue >= 0);
+  aIsNonZeroDigit := (lDigitValue > 0);
 end;
 
 class function TChatMonitor.IsUnreadCounterPaddingChar(aChar: Char): Boolean;
@@ -799,6 +892,7 @@ var
   lKey: string;
   lLastPlayedTime: TDateTime;
   lPlayStarted: BOOL;
+  lPlayedAt: TDateTime;
 begin
   Result := False;
   if not fSoundEnabled then
@@ -815,7 +909,6 @@ begin
   if fSoundThrottling.TryGetValue(lKey, lLastPlayedTime) then
     if SecondsBetween(Now, lLastPlayedTime) < 5 then
       Exit(False);
-  fSoundThrottling.AddOrSetValue(lKey, Now);
 
   lHasSoundFile := TFile.Exists(lFullPath);
   lPlayStarted := False;
@@ -826,6 +919,12 @@ begin
     Result := (gMessageBeepProc(MB_ICONASTERISK) <> False)
   else
     Result := True;
+
+  if Result then
+  begin
+    lPlayedAt := Now;
+    fSoundThrottling.AddOrSetValue(lKey, lPlayedAt);
+  end;
 end;
 
 function TChatMonitor.PrefetchMetadataInParallel(
