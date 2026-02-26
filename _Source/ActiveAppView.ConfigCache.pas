@@ -224,6 +224,7 @@ end;
 
 class function TConfigCache.ParsePrefixRules(const aFileName: string): TPrefixRuleArray;
 var
+  lIndex: Integer;
   lLine: string;
   lLines: TStringArray;
   lParts: TStringList;
@@ -241,6 +242,8 @@ begin
     for lLine in lLines do
     begin
       lParts.CommaText := lLine;
+      for lIndex := 0 to lParts.Count - 1 do
+        lParts[lIndex] := Trim(lParts[lIndex]);
       lRule.Prefix := Trim(lParts.Values['prefix']);
       lRule.CaptionMask := Trim(lParts.Values['caption']);
       lRule.FileNameMask := Trim(lParts.Values['filename']);
@@ -261,6 +264,7 @@ end;
 
 class function TConfigCache.ParseReviewRules(const aFileName: string): TReviewRuleArray;
 var
+  lIndex: Integer;
   lLine: string;
   lLines: TStringArray;
   lParts: TStringList;
@@ -278,6 +282,8 @@ begin
     for lLine in lLines do
     begin
       lParts.CommaText := lLine;
+      for lIndex := 0 to lParts.Count - 1 do
+        lParts[lIndex] := Trim(lParts[lIndex]);
       lRule.CaptionMask := Trim(lParts.Values['caption']);
       lRule.FileNameMask := Trim(lParts.Values['filename']);
       lRule.AppUserModelIDMask := Trim(lParts.Values['AppUserModelID']);
