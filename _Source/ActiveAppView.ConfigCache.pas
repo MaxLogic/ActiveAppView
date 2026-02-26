@@ -201,6 +201,7 @@ var
   lLines: TStringList;
   lLine: string;
   lIndex: Integer;
+  lResultIndex: Integer;
 begin
   SetLength(Result, 0);
   if not TFile.Exists(aFileName) then
@@ -209,14 +210,17 @@ begin
   lLines := TStringList.Create;
   try
     lLines.LoadFromFile(aFileName, TEncoding.UTF8);
+    SetLength(Result, lLines.Count);
+    lResultIndex := 0;
     for lIndex := 0 to lLines.Count - 1 do
     begin
       lLine := Trim(lLines[lIndex]);
       if (lLine = '') or StartsText('#', lLine) or StartsText(';', lLine) then
         Continue;
-      SetLength(Result, Length(Result) + 1);
-      Result[High(Result)] := lLine;
+      Result[lResultIndex] := lLine;
+      Inc(lResultIndex);
     end;
+    SetLength(Result, lResultIndex);
   finally
     lLines.Free;
   end;
@@ -228,6 +232,7 @@ var
   lLine: string;
   lLines: TStringArray;
   lParts: TStringList;
+  lResultIndex: Integer;
   lRule: TPrefixRule;
 begin
   lLines := ReadNormalizedLines(aFileName);
@@ -239,6 +244,8 @@ begin
   try
     lParts.CaseSensitive := False;
     lParts.StrictDelimiter := True;
+    SetLength(Result, Length(lLines));
+    lResultIndex := 0;
     for lLine in lLines do
     begin
       lParts.CommaText := lLine;
@@ -254,9 +261,10 @@ begin
         and (lRule.AppUserModelIDMask = '') and (lRule.CmdParamsMask = '') then
         Continue;
 
-      SetLength(Result, Length(Result) + 1);
-      Result[High(Result)] := lRule;
+      Result[lResultIndex] := lRule;
+      Inc(lResultIndex);
     end;
+    SetLength(Result, lResultIndex);
   finally
     lParts.Free;
   end;
@@ -268,6 +276,7 @@ var
   lLine: string;
   lLines: TStringArray;
   lParts: TStringList;
+  lResultIndex: Integer;
   lRule: TReviewRule;
 begin
   lLines := ReadNormalizedLines(aFileName);
@@ -279,6 +288,8 @@ begin
   try
     lParts.CaseSensitive := False;
     lParts.StrictDelimiter := True;
+    SetLength(Result, Length(lLines));
+    lResultIndex := 0;
     for lLine in lLines do
     begin
       lParts.CommaText := lLine;
@@ -299,9 +310,10 @@ begin
         and (lRule.ExcludeAppUserModelIDMask = '') and (lRule.ExcludeCmdParamsMask = '') then
         Continue;
 
-      SetLength(Result, Length(Result) + 1);
-      Result[High(Result)] := lRule;
+      Result[lResultIndex] := lRule;
+      Inc(lResultIndex);
     end;
+    SetLength(Result, lResultIndex);
   finally
     lParts.Free;
   end;
@@ -311,6 +323,7 @@ class function TConfigCache.ParseShortCuts(const aFileName: string): TNamedValue
 var
   lLine: string;
   lLines: TStringArray;
+  lResultIndex: Integer;
   lPos: Integer;
   lItem: TNamedValue;
 begin
@@ -319,6 +332,8 @@ begin
   if Length(lLines) = 0 then
     Exit;
 
+  SetLength(Result, Length(lLines));
+  lResultIndex := 0;
   for lLine in lLines do
   begin
     lPos := Pos('=', lLine);
@@ -330,9 +345,10 @@ begin
     if (lItem.Name = '') or (lItem.Value = '') then
       Continue;
 
-    SetLength(Result, Length(Result) + 1);
-    Result[High(Result)] := lItem;
+    Result[lResultIndex] := lItem;
+    Inc(lResultIndex);
   end;
+  SetLength(Result, lResultIndex);
 end;
 
 function TConfigCache.GetHideMasks(const aFileName: string): TStringArray;

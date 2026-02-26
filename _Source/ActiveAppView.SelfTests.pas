@@ -7,11 +7,12 @@ function RunSelfTests: Integer;
 implementation
 
 uses
-  System.Classes, System.IniFiles, System.IOUtils, System.SysUtils,
+  System.Classes, System.Diagnostics, System.IniFiles, System.IOUtils, System.SysUtils,
   Winapi.Windows,
   ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewMainForm;
 
 const
+  cConfigCacheParseBenchmarkSelfTestArg = '--self-test-config-cache-parse-benchmark';
   cConfigCacheRuleSpacingSelfTestArg = '--self-test-config-cache-rule-spacing';
   cInvalidWndMetadataSelfTestArg = '--self-test-chat-monitor-invalid-wnd';
 
@@ -138,6 +139,130 @@ begin
   end;
 end;
 
+function RunConfigCacheParseBenchmarkSelfTest: Integer;
+const
+  cBenchmarkIterations = 5;
+  cBenchmarkRuleCount = 5000;
+var
+  lCache: TConfigCache;
+  lElapsedMs: Int64;
+  lExpectedCount: Integer;
+  lIndex: Integer;
+  lIteration: Integer;
+  lLineBreak: string;
+  lPrefixBuilder: TStringBuilder;
+  lPrefixFileName: string;
+  lPrefixRules: TPrefixRuleArray;
+  lReviewBuilder: TStringBuilder;
+  lReviewFileName: string;
+  lReviewRules: TReviewRuleArray;
+  lShortCutBuilder: TStringBuilder;
+  lShortCutFileName: string;
+  lShortCuts: TNamedValueArray;
+  lWatch: TStopwatch;
+begin
+  Result := 0;
+  lExpectedCount := cBenchmarkRuleCount;
+  lLineBreak := sLineBreak;
+  lPrefixFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.bench.prefix.txt');
+  lReviewFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.bench.review.txt');
+  lShortCutFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.bench.shortcuts.txt');
+
+  lPrefixBuilder := TStringBuilder.Create;
+  lReviewBuilder := TStringBuilder.Create;
+  lShortCutBuilder := TStringBuilder.Create;
+  try
+    for lIndex := 1 to cBenchmarkRuleCount do
+    begin
+      lPrefixBuilder.Append('prefix=P');
+      lPrefixBuilder.Append(lIndex);
+      lPrefixBuilder.Append(', caption=*Chat');
+      lPrefixBuilder.Append(lIndex);
+      lPrefixBuilder.Append('*');
+      lPrefixBuilder.Append(', filename=*tool');
+      lPrefixBuilder.Append(lIndex);
+      lPrefixBuilder.Append('.exe');
+      lPrefixBuilder.Append(', AppUserModelID=*pwa');
+      lPrefixBuilder.Append(lIndex);
+      lPrefixBuilder.Append('*');
+      lPrefixBuilder.Append(', CmdParams=*--profile-');
+      lPrefixBuilder.Append(lIndex);
+      lPrefixBuilder.Append('*');
+      lPrefixBuilder.Append(lLineBreak);
+
+      lReviewBuilder.Append('caption=*Teams');
+      lReviewBuilder.Append(lIndex);
+      lReviewBuilder.Append('*');
+      lReviewBuilder.Append(', filename=*msedge');
+      lReviewBuilder.Append(lIndex);
+      lReviewBuilder.Append('.exe');
+      lReviewBuilder.Append(', excludecmdparams=*--mute-');
+      lReviewBuilder.Append(lIndex);
+      lReviewBuilder.Append('*');
+      lReviewBuilder.Append(lLineBreak);
+
+      lShortCutBuilder.Append('shortcut');
+      lShortCutBuilder.Append(lIndex);
+      lShortCutBuilder.Append('=');
+      lShortCutBuilder.Append('"C:\Tools\tool');
+      lShortCutBuilder.Append(lIndex);
+      lShortCutBuilder.Append('.exe" --arg ');
+      lShortCutBuilder.Append(lIndex);
+      lShortCutBuilder.Append(lLineBreak);
+    end;
+
+    TFile.WriteAllText(lPrefixFileName, lPrefixBuilder.ToString, TEncoding.UTF8);
+    TFile.WriteAllText(lReviewFileName, lReviewBuilder.ToString, TEncoding.UTF8);
+    TFile.WriteAllText(lShortCutFileName, lShortCutBuilder.ToString, TEncoding.UTF8);
+
+    lWatch := TStopwatch.StartNew;
+    for lIteration := 1 to cBenchmarkIterations do
+    begin
+      lCache := TConfigCache.Create(TPath.GetTempPath);
+      try
+        lPrefixRules := lCache.GetPrefixRules(lPrefixFileName);
+        lReviewRules := lCache.GetReviewRules(lReviewFileName);
+        lShortCuts := lCache.GetShortCuts(lShortCutFileName);
+      finally
+        lCache.Free;
+      end;
+
+      if Length(lPrefixRules) <> lExpectedCount then
+      begin
+        Writeln(Format(
+          'SELFTEST FAILED: benchmark prefix expected=%d actual=%d',
+          [lExpectedCount, Length(lPrefixRules)]));
+        Exit(1);
+      end;
+      if Length(lReviewRules) <> lExpectedCount then
+      begin
+        Writeln(Format(
+          'SELFTEST FAILED: benchmark review expected=%d actual=%d',
+          [lExpectedCount, Length(lReviewRules)]));
+        Exit(1);
+      end;
+      if Length(lShortCuts) <> lExpectedCount then
+      begin
+        Writeln(Format(
+          'SELFTEST FAILED: benchmark shortcuts expected=%d actual=%d',
+          [lExpectedCount, Length(lShortCuts)]));
+        Exit(1);
+      end;
+    end;
+    lElapsedMs := lWatch.ElapsedMilliseconds;
+    Writeln(Format(
+      'SELFTEST BENCHMARK: config-cache-parse rules=%d iterations=%d elapsedMs=%d',
+      [lExpectedCount, cBenchmarkIterations, lElapsedMs]));
+  finally
+    lPrefixBuilder.Free;
+    lReviewBuilder.Free;
+    lShortCutBuilder.Free;
+    TFile.Delete(lPrefixFileName);
+    TFile.Delete(lReviewFileName);
+    TFile.Delete(lShortCutFileName);
+  end;
+end;
+
 function RunSelfTests: Integer;
 begin
   Result := RunMainFormSelfTests(ParamStr(1));
@@ -149,7 +274,18 @@ begin
     Exit;
 
   Result := -1;
-  if SameText(ParamStr(1), cConfigCacheRuleSpacingSelfTestArg) then
+  if SameText(ParamStr(1), cConfigCacheParseBenchmarkSelfTestArg) then
+  begin
+    try
+      Result := RunConfigCacheParseBenchmarkSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+  end else if SameText(ParamStr(1), cConfigCacheRuleSpacingSelfTestArg) then
   begin
     try
       Result := RunConfigCacheRuleSpacingSelfTest;
