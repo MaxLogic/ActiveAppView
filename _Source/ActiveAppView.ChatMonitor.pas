@@ -142,7 +142,7 @@ begin
     Exit(1);
   end;
 
-  lFailure := CheckUnreadCaptionCase('broken-closing-parenthesis', 'Teams (1(', True);
+  lFailure := CheckUnreadCaptionCase('broken-closing-parenthesis', 'Teams (1(', False);
   if lFailure <> '' then
   begin
     Writeln(lFailure);
@@ -394,7 +394,7 @@ end;
 
 class function TChatMonitor.IsUnreadCounterTerminatorChar(aChar: Char): Boolean;
 begin
-  Result := (aChar = ')') or (aChar = '(') or (aChar = #$FF09);
+  Result := (aChar = ')') or (aChar = #$FF09);
 end;
 
 procedure TChatMonitor.LoadConfiguration(aIni: TMemIniFile);

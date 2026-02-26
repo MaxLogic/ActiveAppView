@@ -14,7 +14,7 @@ All notable changes to this project are documented in this file.
 - Chat monitor worker now processes an immutable copied app snapshot per cycle, preventing range-check crashes caused by concurrent shared-snapshot updates.
 - Chat app selection now comes only from `ChatReviewMask.txt`; legacy `[ChatMonitor.Rules]` matching is no longer used.
 - Unread detection now uses a fixed caption counter pattern `(\d+)`.
-- Unread counter parsing now tolerates Teams caption variants with directional-mark padding and malformed `(\d+(` style delimiters.
+- Unread counter parsing now tolerates directional-mark padding and fullwidth parentheses, but requires a closing parenthesis terminator (malformed `(\d+(` captions are ignored).
 - GUI refresh activation bursts are now deduplicated to avoid back-to-back full redraws.
 - Scripts/Desktop/ShortCuts refresh now runs through background snapshot workers, with only final UI assignment on the main thread.
 - Mask and pattern parsing now uses cache-backed snapshots (`MaxLogic.Cache` + file dependencies) to avoid reparsing unchanged files.
