@@ -9,7 +9,8 @@ implementation
 uses
   System.Classes, System.Diagnostics, System.IniFiles, System.IOUtils, System.SysUtils,
   Winapi.Windows,
-  ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewMainForm;
+  ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore,
+  ActiveAppViewMainForm;
 
 const
   cConfigCacheParseBenchmarkSelfTestArg = '--self-test-config-cache-parse-benchmark';
@@ -265,6 +266,10 @@ end;
 
 function RunSelfTests: Integer;
 begin
+  Result := RunCoreSelfTests(ParamStr(1));
+  if Result <> -1 then
+    Exit;
+
   Result := RunMainFormSelfTests(ParamStr(1));
   if Result <> -1 then
     Exit;
