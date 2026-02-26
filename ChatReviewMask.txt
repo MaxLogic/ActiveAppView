@@ -14,7 +14,7 @@
 ; - This file is the only source of chat monitor app selection.
 ; - If this file is empty (or missing), no app is reviewed.
 ; - If at least one rule exists, an app is reviewed only when it matches at least one rule.
-; - Within a single rule line, all populated include keys must match.
+; - Within a single rule line, all populated include keys must match (logical AND / conjunctive).
 ; - Exclude masks are checked after includes; a match on any exclude mask prevents review.
 ; - Unread detection is automatic and checks caption for a numeric counter pattern: (\d+)
 ;
