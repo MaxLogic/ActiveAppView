@@ -107,6 +107,7 @@ type
 const
   cCommandLineParamsSelfTestArg = '--self-test-chat-monitor-command-line-params';
   cMetadataCacheNamespace = 'activeappview.chat-monitor.metadata';
+  cReviewRuleConjunctionSelfTestArg = '--self-test-chat-monitor-review-rule-conjunction';
   cSoundFallbackSelfTestArg = '--self-test-chat-monitor-sound-fallback';
   cUnreadCaptionSelfTestArg = '--self-test-chat-monitor-unread-caption';
 
@@ -296,6 +297,60 @@ begin
   end;
 end;
 
+function RunReviewRuleConjunctionSelfTest: Integer;
+var
+  lIniFile: TMemIniFile;
+  lMetadata: IChatAppMetadata;
+  lMonitor: TChatMonitor;
+  lRule: TReviewRule;
+  lRules: TReviewRuleArray;
+  lSettingsFileName: string;
+begin
+  Result := 0;
+  lSettingsFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.review-rule.ini');
+  lIniFile := TMemIniFile.Create(lSettingsFileName, TEncoding.UTF8, False);
+  try
+    lIniFile.WriteBool('ChatMonitor', 'Enabled', True);
+    lIniFile.WriteBool('ChatMonitor', 'SoundEnabled', False);
+    lIniFile.UpdateFile;
+
+    lMonitor := TChatMonitor.Create(lIniFile);
+    try
+      SetLength(lRules, 1);
+      lRule := Default(TReviewRule);
+      lRule.FileNameMask := '*msedge.exe';
+      lRule.CmdParamsMask := '*teams*';
+      lRules[0] := lRule;
+
+      lMetadata := TChatAppMetadata.Create(
+        'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
+        '',
+        '--profile-directory=Default');
+      if lMonitor.ShouldReviewApp('Teams', lMetadata, lRules) then
+      begin
+        Writeln('SELFTEST FAILED: review rule should require all include keys to match');
+        Exit(1);
+      end;
+
+      lMetadata := TChatAppMetadata.Create(
+        'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
+        '',
+        '--profile-directory=Default --teams');
+      if not lMonitor.ShouldReviewApp('Teams', lMetadata, lRules) then
+      begin
+        Writeln('SELFTEST FAILED: review rule should match when all include keys match');
+        Exit(1);
+      end;
+    finally
+      lMonitor.Free;
+    end;
+  finally
+    lIniFile.Free;
+    if TFile.Exists(lSettingsFileName) then
+      TFile.Delete(lSettingsFileName);
+  end;
+end;
+
 function RunChatMonitorSelfTests(const aArg: string): Integer;
 begin
   Result := -1;
@@ -314,6 +369,17 @@ begin
   begin
     try
       Result := RunCommandLineParamsSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+  end else if SameText(aArg, cReviewRuleConjunctionSelfTestArg) then
+  begin
+    try
+      Result := RunReviewRuleConjunctionSelfTest;
     except
       on lException: Exception do
       begin
@@ -552,17 +618,41 @@ function TChatMonitor.MatchesReviewRule(
   const aAppCaption: string;
   const aMetadata: IChatAppMetadata;
   const aRule: TReviewRule): Boolean;
+var
+  lHasIncludeMask: Boolean;
 begin
-  Result := ((aRule.CaptionMask <> '') and StringMatches(aAppCaption, aRule.CaptionMask, False));
-  if Result then
-    Exit(True);
+  lHasIncludeMask := False;
+  Result := True;
 
-  if not Assigned(aMetadata) then
-    Exit(False);
+  if aRule.CaptionMask <> '' then
+  begin
+    lHasIncludeMask := True;
+    if not StringMatches(aAppCaption, aRule.CaptionMask, False) then
+      Exit(False);
+  end;
 
-  Result := ((aRule.FileNameMask <> '') and StringMatches(aMetadata.FileName, aRule.FileNameMask, False))
-    or ((aRule.AppUserModelIDMask <> '') and StringMatches(aMetadata.AppUserModelID, aRule.AppUserModelIDMask, False))
-    or ((aRule.CmdParamsMask <> '') and StringMatches(aMetadata.CommandLineParams, aRule.CmdParamsMask, False));
+  if aRule.FileNameMask <> '' then
+  begin
+    lHasIncludeMask := True;
+    if (not Assigned(aMetadata)) or (not StringMatches(aMetadata.FileName, aRule.FileNameMask, False)) then
+      Exit(False);
+  end;
+
+  if aRule.AppUserModelIDMask <> '' then
+  begin
+    lHasIncludeMask := True;
+    if (not Assigned(aMetadata)) or (not StringMatches(aMetadata.AppUserModelID, aRule.AppUserModelIDMask, False)) then
+      Exit(False);
+  end;
+
+  if aRule.CmdParamsMask <> '' then
+  begin
+    lHasIncludeMask := True;
+    if (not Assigned(aMetadata)) or (not StringMatches(aMetadata.CommandLineParams, aRule.CmdParamsMask, False)) then
+      Exit(False);
+  end;
+
+  Result := lHasIncludeMask;
 end;
 
 function TChatMonitor.MatchesReviewExcludeRule(

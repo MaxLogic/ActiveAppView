@@ -33,6 +33,7 @@ Accessibility tool for active application / explorer quick selection
   - This file is the only source for selecting monitored apps.
   - If file is missing or has no active rules, no apps are reviewed.
   - If rules exist, an app is reviewed only when it matches at least one rule.
+  - Within one rule line, all populated include keys (`caption`, `filename`, `AppUserModelID`, `CmdParams`) must match.
   - Exclude rules can remove apps from selection even if another rule matches.
   - Unread state is detected by caption pattern `(\d+)` (number inside parentheses).
 
