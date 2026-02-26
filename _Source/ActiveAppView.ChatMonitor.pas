@@ -106,7 +106,23 @@ type
 
 const
   cMetadataCacheNamespace = 'activeappview.chat-monitor.metadata';
+  cSoundFallbackSelfTestArg = '--self-test-chat-monitor-sound-fallback';
   cUnreadCaptionSelfTestArg = '--self-test-chat-monitor-unread-caption';
+
+type
+  TPlaySoundProc = function(aSoundName: PChar; aModule: HMODULE; aFlags: DWORD): BOOL; stdcall;
+  TMessageBeepProc = function(aType: UINT): BOOL; stdcall;
+
+var
+  gPlaySoundProc: TPlaySoundProc = Winapi.MMSystem.PlaySound;
+  gMessageBeepProc: TMessageBeepProc = Winapi.Windows.MessageBeep;
+  gSelfTestMessageBeepCount: Integer = 0;
+
+function SelfTestMessageBeep(aType: UINT): BOOL; stdcall;
+begin
+  Inc(gSelfTestMessageBeepCount);
+  Result := True;
+end;
 
 function BoolToText(aValue: Boolean): string;
 begin
@@ -180,19 +196,76 @@ begin
   end;
 end;
 
+function RunSoundFallbackSelfTest: Integer;
+var
+  lIniFile: TMemIniFile;
+  lMissingSoundFileName: string;
+  lMonitor: TChatMonitor;
+  lOriginalMessageBeepProc: TMessageBeepProc;
+  lSettingsFileName: string;
+begin
+  Result := 0;
+  lMissingSoundFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.missing.wav');
+  lSettingsFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.sound.ini');
+  if TFile.Exists(lMissingSoundFileName) then
+    TFile.Delete(lMissingSoundFileName);
+
+  lIniFile := TMemIniFile.Create(lSettingsFileName, TEncoding.UTF8, False);
+  try
+    lIniFile.WriteBool('ChatMonitor', 'Enabled', True);
+    lIniFile.WriteBool('ChatMonitor', 'SoundEnabled', True);
+    lIniFile.UpdateFile;
+
+    lMonitor := TChatMonitor.Create(lIniFile);
+    try
+      lOriginalMessageBeepProc := gMessageBeepProc;
+      gSelfTestMessageBeepCount := 0;
+      gMessageBeepProc := SelfTestMessageBeep;
+      try
+        lMonitor.PlaySoundFile(lMissingSoundFileName);
+      finally
+        gMessageBeepProc := lOriginalMessageBeepProc;
+      end;
+    finally
+      lMonitor.Free;
+    end;
+  finally
+    lIniFile.Free;
+    if TFile.Exists(lSettingsFileName) then
+      TFile.Delete(lSettingsFileName);
+  end;
+
+  if gSelfTestMessageBeepCount <> 1 then
+  begin
+    Writeln(Format('SELFTEST FAILED: fallback beep expected=1 actual=%d', [gSelfTestMessageBeepCount]));
+    Result := 1;
+  end;
+end;
+
 function RunChatMonitorSelfTests(const aArg: string): Integer;
 begin
   Result := -1;
-  if not SameText(aArg, cUnreadCaptionSelfTestArg) then
-    Exit;
-
-  try
-    Result := RunUnreadCaptionSelfTest;
-  except
-    on lException: Exception do
-    begin
-      Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
-      Result := 1;
+  if SameText(aArg, cUnreadCaptionSelfTestArg) then
+  begin
+    try
+      Result := RunUnreadCaptionSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+  end else if SameText(aArg, cSoundFallbackSelfTestArg) then
+  begin
+    try
+      Result := RunSoundFallbackSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
     end;
   end;
 end;
@@ -466,9 +539,11 @@ end;
 
 procedure TChatMonitor.PlaySoundFile(const aFileName: string);
 var
+  lHasSoundFile: Boolean;
   lFullPath: string;
   lKey: string;
   lLastPlayedTime: TDateTime;
+  lPlayStarted: BOOL;
 begin
   if not fSoundEnabled then
     Exit;
@@ -480,16 +555,19 @@ begin
   if TPath.IsRelativePath(lFullPath) then
     lFullPath := TPath.Combine(ExtractFilePath(ParamStr(0)), aFileName);
 
-  if not TFile.Exists(lFullPath) then
-    Exit;
-
   lKey := lFullPath.ToLower;
   if fSoundThrottling.TryGetValue(lKey, lLastPlayedTime) then
     if SecondsBetween(Now, lLastPlayedTime) < 5 then
       Exit;
   fSoundThrottling.AddOrSetValue(lKey, Now);
 
-  Winapi.MMSystem.PlaySound(PChar(lFullPath), 0, SND_FILENAME or SND_ASYNC);
+  lHasSoundFile := TFile.Exists(lFullPath);
+  lPlayStarted := False;
+  if lHasSoundFile then
+    lPlayStarted := gPlaySoundProc(PChar(lFullPath), 0, SND_FILENAME or SND_ASYNC);
+
+  if (not lHasSoundFile) or (not lPlayStarted) then
+    gMessageBeepProc(MB_ICONASTERISK);
 end;
 
 function TChatMonitor.PrefetchMetadataInParallel(
