@@ -220,6 +220,7 @@ const
   cSettingsFileName = 'settings.ini';
   cRestoreItemIndexSelfTestArg = '--self-test-restore-item-index';
   cWarmupPrefetchSelfTestArg = '--self-test-startup-warmup-prefetch';
+  cWarmupShutdownCheckSelfTestArg = '--self-test-startup-warmup-shutdown-check';
   cIgnoreF4AfterFocusMs = 200;
   cShutdownTaskWaitTimeoutMs = 25;
 
@@ -257,12 +258,23 @@ begin
     procedure(aIndex: Integer)
     var
       lApp: TAppInfo;
+      lShutdownRequested: Boolean;
     begin
-      if Assigned(aIsShuttingDown) and aIsShuttingDown() then
+      lShutdownRequested := False;
+      if Assigned(aIsShuttingDown) then
+      begin
+        try
+          lShutdownRequested := aIsShuttingDown();
+        except
+          // During shutdown we can hit torn-down state; stop this worker instead of failing the whole batch.
+          lShutdownRequested := True;
+        end;
+      end;
+      if lShutdownRequested then
         Exit;
 
-      lApp := aApps[aIndex];
       try
+        lApp := aApps[aIndex];
         if Assigned(lPrefetchProc) then
         begin
           lPrefetchProc(lApp);
@@ -1524,7 +1536,30 @@ begin
   end;
 
   if not SameText(aArg, cWarmupPrefetchSelfTestArg) then
+    if not SameText(aArg, cWarmupShutdownCheckSelfTestArg) then
+      Exit;
+
+  if SameText(aArg, cWarmupShutdownCheckSelfTestArg) then
+  begin
+    Result := 0;
+    SetLength(lApps, 1);
+    try
+      PrefetchAppFileNamesInParallel(
+        lApps,
+        function: Boolean
+        begin
+          raise Exception.Create('injected shutdown callback failure');
+        end);
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: startup warmup shutdown-check raised %s: %s',
+          [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
     Exit;
+  end;
 
   Result := 0;
   SetLength(lApps, 1);
