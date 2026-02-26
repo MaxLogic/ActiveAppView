@@ -72,10 +72,56 @@ type
     property Item[aIndex: integer]: TAppInfo read getApp; default;
   end;
 
+function RunCoreSelfTests(const aArg: string): Integer;
+
 implementation
 
 uses
   AutoFree, bsUtils, maxLogic.StrUtils, srDesktop, StrUtils;
+
+const
+  cCoreCommandLineParamsSelfTestArg = '--self-test-core-command-line-params';
+
+function RunCoreCommandLineParamsSelfTest: Integer;
+var
+  lActualParams: string;
+  lApp: TAppInfo;
+begin
+  Result := 0;
+  lApp := TAppInfo.Create(0);
+  try
+    lApp.fCommandLineRetrieved := True;
+    lApp.fCommandLine := 'C:\Tools\tool.exe'#9'--profile prod';
+    lApp.fCommandLineParamsRetrieved := False;
+    lActualParams := lApp.CommandLineParams;
+    if lActualParams <> '--profile prod' then
+    begin
+      Writeln(Format(
+        'SELFTEST FAILED: core command-line params expected="%s" actual="%s"',
+        ['--profile prod', lActualParams]));
+      Exit(1);
+    end;
+  finally
+    lApp.Free;
+  end;
+end;
+
+function RunCoreSelfTests(const aArg: string): Integer;
+begin
+  Result := -1;
+  if SameText(aArg, cCoreCommandLineParamsSelfTestArg) then
+  begin
+    try
+      Result := RunCoreCommandLineParamsSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+  end;
+end;
 
 { TAppInfo }
 
@@ -120,6 +166,7 @@ end;
 
 function TAppInfo.GetCommandLineParams: String;
 var
+  lLen: Integer;
   s: String;
   i: Integer;
 begin
@@ -132,14 +179,30 @@ begin
     else
     begin
       if startsStr('"', s) then
-        i := posEx('"', s, 2)
+      begin
+        i := posEx('"', s, 2);
+        if i > 0 then
+          Inc(i);
+      end
       else
-        i := posEx(' ', s, 1);
+      begin
+        i := 1;
+        lLen := Length(s);
+        while (i <= lLen) and (not CharInSet(s[i], [#9, #10, #13, ' '])) do
+          Inc(i);
+        if i > lLen then
+          i := 0;
+      end;
 
       if i <= 0 then
         fCommandLineParams := ''
       else
-        fCommandLineParams := Copy(s, i + 1, Length(s)).Trim;
+      begin
+        lLen := Length(s);
+        while (i <= lLen) and CharInSet(s[i], [#9, #10, #13, ' ']) do
+          Inc(i);
+        fCommandLineParams := Copy(s, i, Length(s)).Trim;
+      end;
     end;
   end;
 
