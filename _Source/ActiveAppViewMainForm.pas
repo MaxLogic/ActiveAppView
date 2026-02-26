@@ -107,6 +107,7 @@ type
     fGuiRefreshQueued: Integer;
     fLastFormFocusTick: UInt64;
     fPendingAuxSnapshot: TObject;
+    fChatMonitorSnapshot: TArray<TChatAppSnapshot>;
     fSharedAppsSnapshot: TArray<TChatAppSnapshot>;
     fSharedAppsSnapshotTick: UInt64;
     fStartupDataLoadBusy: Integer;
@@ -739,9 +740,19 @@ begin
         Exit;
 
       if lNeedAppUserModelID then
-        lApp.AppUserModelID;
+      begin
+        try
+          lApp.AppUserModelID;
+        except
+        end;
+      end;
       if lNeedCmdParams then
-        lApp.CommandLineParams;
+      begin
+        try
+          lApp.CommandLineParams;
+        except
+        end;
+      end;
     end);
   lPrefixPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
 
@@ -1059,6 +1070,7 @@ begin
   tmrChatMonitor.Interval := lIniFile.ReadInteger('ChatMonitor', 'CheckIntervalSeconds', 5) * 1000;
   tmrChatMonitor.Enabled := False;
   SetLength(fSharedAppsSnapshot, 0);
+  SetLength(fChatMonitorSnapshot, 0);
   fSharedAppsSnapshotTick := 0;
   TInterlocked.Exchange(fDeepPrefixLoadBusy, 0);
   TInterlocked.Exchange(fDeepPrefixReady, 0);
@@ -1384,11 +1396,12 @@ begin
     Exit;
 
   if Assigned(fChatMonitor) then
-    fChatMonitor.ProcessSnapshot(fSharedAppsSnapshot);
+    fChatMonitor.ProcessSnapshot(fChatMonitorSnapshot);
 end;
 
 procedure TAppsViewMainFrm.OnChatMonitorDone;
 begin
+  SetLength(fChatMonitorSnapshot, 0);
   TInterlocked.Exchange(fChatMonitorBusy, 0);
   if (TInterlocked.Exchange(fChatMonitorPending, 0) = 1) and (not IsShuttingDown) then
     StartChatMonitorProcessing;
@@ -1409,6 +1422,7 @@ begin
   end;
 
   EnsureSharedAppsSnapshotFresh(900);
+  fChatMonitorSnapshot := Copy(fSharedAppsSnapshot);
   fChatMonitorTask := SimpleAsyncCall(RunChatMonitorSnapshot, 'ActiveAppView.ChatMonitor', OnChatMonitorDone);
 end;
 
