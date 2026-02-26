@@ -3,7 +3,8 @@ unit ActiveAppView.ChatMonitor;
 interface
 
 uses
-  Winapi.Windows, System.Classes, System.Generics.Collections, System.IniFiles, System.SysUtils,
+  Winapi.Windows, System.Character, System.Classes, System.Generics.Collections, System.IniFiles,
+  System.SysUtils,
   MaxLogic.Cache,
   ActiveAppView.ConfigCache;
 
@@ -63,7 +64,7 @@ type
       const aAppCaption: string;
       const aMetadata: IChatAppMetadata;
       const aRule: TReviewRule): Boolean;
-    function PlaySoundFile(const aFileName: string): Boolean;
+    function PlaySoundFile(const aFileName: string; const aThrottleSeconds: Integer = 5): Boolean;
     function PrefetchMetadataInParallel(
       const aApps: TArray<TChatAppSnapshot>): TArray<IChatAppMetadata>;
     procedure SetSoundEnabled(const aValue: Boolean);
@@ -110,6 +111,7 @@ const
   cMetadataCacheNamespace = 'activeappview.chat-monitor.metadata';
   cReviewRuleConjunctionSelfTestArg = '--self-test-chat-monitor-review-rule-conjunction';
   cSoundFallbackSelfTestArg = '--self-test-chat-monitor-sound-fallback';
+  cSoundIntervalRespectedSelfTestArg = '--self-test-chat-monitor-sound-interval-respected';
   cSoundThrottleFailureRetrySelfTestArg = '--self-test-chat-monitor-sound-throttle-failure-retry';
   cSoundToggleThrottleSelfTestArg = '--self-test-chat-monitor-sound-toggle-throttle';
   cUnreadCaptionSelfTestArg = '--self-test-chat-monitor-unread-caption';
@@ -247,6 +249,14 @@ begin
 
   lFailure := CheckUnreadCaptionCase('fullwidth-digits',
     'Teams ' + #$FF08 + #$FF13 + #$FF09, True);
+  if lFailure <> '' then
+  begin
+    Writeln(lFailure);
+    Exit(1);
+  end;
+
+  lFailure := CheckUnreadCaptionCase('devanagari-digits',
+    'Teams (' + #$0969 + ')', True);
   if lFailure <> '' then
   begin
     Writeln(lFailure);
@@ -429,6 +439,67 @@ begin
   end;
 end;
 
+function RunSoundIntervalRespectedSelfTest: Integer;
+var
+  lApps: TArray<TChatAppSnapshot>;
+  lIniFile: TMemIniFile;
+  lMaskFileName: string;
+  lMissingSoundFileName: string;
+  lMonitor: TChatMonitor;
+  lOriginalMessageBeepProc: TMessageBeepProc;
+  lSettingsFileName: string;
+begin
+  Result := 0;
+  lMaskFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.sound-interval-mask.txt');
+  lMissingSoundFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.sound-interval-missing.wav');
+  lSettingsFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.sound-interval.ini');
+  TFile.WriteAllText(lMaskFileName, 'caption=*Teams*', TEncoding.UTF8);
+  if TFile.Exists(lMissingSoundFileName) then
+    TFile.Delete(lMissingSoundFileName);
+
+  lIniFile := TMemIniFile.Create(lSettingsFileName, TEncoding.UTF8, False);
+  try
+    lIniFile.WriteBool('ChatMonitor', 'Enabled', True);
+    lIniFile.WriteBool('ChatMonitor', 'SoundEnabled', True);
+    lIniFile.WriteString('ChatMonitor', 'ReviewMaskFile', lMaskFileName);
+    lIniFile.WriteString('ChatMonitor', 'UnreadMessageSound', lMissingSoundFileName);
+    lIniFile.WriteInteger('ChatMonitor', 'UnreadMessageSoundIntervalSeconds', 1);
+    lIniFile.UpdateFile;
+
+    lMonitor := TChatMonitor.Create(lIniFile);
+    try
+      SetLength(lApps, 1);
+      lApps[0].Wnd := HWND(1);
+      lApps[0].Caption := 'Teams (3)';
+
+      lOriginalMessageBeepProc := gMessageBeepProc;
+      gSelfTestMessageBeepCount := 0;
+      gMessageBeepProc := SelfTestMessageBeep;
+      try
+        lMonitor.ProcessSnapshot(lApps);
+        Sleep(2200);
+        lMonitor.ProcessSnapshot(lApps);
+      finally
+        gMessageBeepProc := lOriginalMessageBeepProc;
+      end;
+    finally
+      lMonitor.Free;
+    end;
+  finally
+    lIniFile.Free;
+    if TFile.Exists(lMaskFileName) then
+      TFile.Delete(lMaskFileName);
+    if TFile.Exists(lSettingsFileName) then
+      TFile.Delete(lSettingsFileName);
+  end;
+
+  if gSelfTestMessageBeepCount <> 2 then
+  begin
+    Writeln(Format('SELFTEST FAILED: sound interval expected=2 actual=%d', [gSelfTestMessageBeepCount]));
+    Result := 1;
+  end;
+end;
+
 function RunReviewRuleConjunctionSelfTest: Integer;
 var
   lIniFile: TMemIniFile;
@@ -545,6 +616,17 @@ begin
   begin
     try
       Result := RunSoundThrottleFailureRetrySelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+  end else if SameText(aArg, cSoundIntervalRespectedSelfTestArg) then
+  begin
+    try
+      Result := RunSoundIntervalRespectedSelfTest;
     except
       on lException: Exception do
       begin
@@ -737,20 +819,17 @@ end;
 
 class function TChatMonitor.IsUnreadCounterDigit(aChar: Char; out aIsNonZeroDigit: Boolean): Boolean;
 var
-  lDigitValue: Integer;
+  lNumericValue: Double;
 begin
-  lDigitValue := -1;
-  if CharInSet(aChar, ['0'..'9']) then
-    lDigitValue := Ord(aChar) - Ord('0')
-  else if (aChar >= #$FF10) and (aChar <= #$FF19) then
-    lDigitValue := Ord(aChar) - $FF10
-  else if (aChar >= #$0660) and (aChar <= #$0669) then
-    lDigitValue := Ord(aChar) - $0660
-  else if (aChar >= #$06F0) and (aChar <= #$06F9) then
-    lDigitValue := Ord(aChar) - $06F0;
+  Result := TCharacter.IsDigit(aChar);
+  if not Result then
+  begin
+    aIsNonZeroDigit := False;
+    Exit;
+  end;
 
-  Result := (lDigitValue >= 0);
-  aIsNonZeroDigit := (lDigitValue > 0);
+  lNumericValue := TCharacter.GetNumericValue(aChar);
+  aIsNonZeroDigit := (lNumericValue > 0);
 end;
 
 class function TChatMonitor.IsUnreadCounterPaddingChar(aChar: Char): Boolean;
@@ -885,7 +964,7 @@ begin
   Result := Copy(lCommandLine, lSplitIndex, MaxInt);
 end;
 
-function TChatMonitor.PlaySoundFile(const aFileName: string): Boolean;
+function TChatMonitor.PlaySoundFile(const aFileName: string; const aThrottleSeconds: Integer): Boolean;
 var
   lHasSoundFile: Boolean;
   lFullPath: string;
@@ -893,6 +972,7 @@ var
   lLastPlayedTime: TDateTime;
   lPlayStarted: BOOL;
   lPlayedAt: TDateTime;
+  lThrottleSeconds: Integer;
 begin
   Result := False;
   if not fSoundEnabled then
@@ -905,9 +985,13 @@ begin
   if TPath.IsRelativePath(lFullPath) then
     lFullPath := TPath.Combine(ExtractFilePath(ParamStr(0)), aFileName);
 
+  lThrottleSeconds := aThrottleSeconds;
+  if lThrottleSeconds < 0 then
+    lThrottleSeconds := 0;
+
   lKey := lFullPath.ToLower;
-  if fSoundThrottling.TryGetValue(lKey, lLastPlayedTime) then
-    if SecondsBetween(Now, lLastPlayedTime) < 5 then
+  if (lThrottleSeconds > 0) and fSoundThrottling.TryGetValue(lKey, lLastPlayedTime) then
+    if SecondsBetween(Now, lLastPlayedTime) < lThrottleSeconds then
       Exit(False);
 
   lHasSoundFile := TFile.Exists(lFullPath);
@@ -1027,7 +1111,7 @@ begin
       begin
         if SecondsBetween(Now, lNewState.LastSoundPlayed) > fUnreadMessageSoundInterval then
         begin
-          if PlaySoundFile(fUnreadMessageSound) then
+          if PlaySoundFile(fUnreadMessageSound, fUnreadMessageSoundInterval) then
           begin
             lNewState.LastSoundPlayed := Now;
             lFoundApps[lWnd] := lNewState;
