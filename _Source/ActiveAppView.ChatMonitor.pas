@@ -621,6 +621,7 @@ function TChatMonitor.MatchesReviewRule(
 var
   lHasIncludeMask: Boolean;
 begin
+  // Include masks are conjunctive: each populated key must match (logical AND).
   lHasIncludeMask := False;
   Result := True;
 
