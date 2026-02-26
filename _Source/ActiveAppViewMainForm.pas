@@ -6,7 +6,7 @@ uses
   System.Classes, System.Generics.Collections, System.SyncObjs, System.SysUtils, System.Variants,
   Winapi.Messages, Winapi.Windows,
   Vcl.Buttons, Vcl.Controls, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.Forms, Vcl.Graphics, Vcl.StdCtrls,
-  maxAsync,
+  CancelToken, maxAsync,
   ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore;
 
 type
@@ -123,6 +123,7 @@ type
     fStartupProfileLogSync: TCriticalSection;
     fStartupProfileStartTick: Int64;
     fStartupProfileWarmupDoneLogged: Integer;
+    fShutdownToken: iCancelToken;
     fShuttingDown: Integer;
     procedure AppOnActivate(Sender: TObject);
     procedure ApplyAuxListsSnapshot(aSnapshotObject: TObject);
@@ -209,7 +210,6 @@ type
   end;
 
   TAppPrefetchProc = reference to procedure(const aApp: TAppInfo);
-  TShutdownCheckProc = reference to function: Boolean;
 
 const
   cShortCutsFileName = 'ShortCuts.txt';
@@ -245,12 +245,19 @@ end;
 
 procedure PrefetchAppFileNamesInParallel(
   const aApps: TArray<TAppInfo>;
-  const aIsShuttingDown: TShutdownCheckProc;
+  const aCancelToken: iCancelToken;
   const aPrefetchProc: TAppPrefetchProc = nil);
 var
+  lIsCanceled: Boolean;
   lPrefetchProc: TAppPrefetchProc;
 begin
   if Length(aApps) = 0 then
+    Exit;
+
+  lIsCanceled := False;
+  if Assigned(aCancelToken) then
+    lIsCanceled := aCancelToken.Canceled;
+  if lIsCanceled then
     Exit;
 
   lPrefetchProc := aPrefetchProc;
@@ -258,19 +265,12 @@ begin
     procedure(aIndex: Integer)
     var
       lApp: TAppInfo;
-      lShutdownRequested: Boolean;
+      lCanceled: Boolean;
     begin
-      lShutdownRequested := False;
-      if Assigned(aIsShuttingDown) then
-      begin
-        try
-          lShutdownRequested := aIsShuttingDown();
-        except
-          // During shutdown we can hit torn-down state; stop this worker instead of failing the whole batch.
-          lShutdownRequested := True;
-        end;
-      end;
-      if lShutdownRequested then
+      lCanceled := False;
+      if Assigned(aCancelToken) then
+        lCanceled := aCancelToken.Canceled;
+      if lCanceled then
         Exit;
 
       try
@@ -695,10 +695,7 @@ begin
   lPhaseWatch := TStopwatch.StartNew;
   PrefetchAppFileNamesInParallel(
     lApps,
-    function: Boolean
-    begin
-      Result := IsShuttingDown;
-    end);
+    fShutdownToken);
   lParallelPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
 
   if not IsShuttingDown then
@@ -1122,6 +1119,7 @@ begin
   TInterlocked.Exchange(fStartupDataReady, 0);
   TInterlocked.Exchange(fStartupSkipSharedRefreshOnce, 0);
   TInterlocked.Exchange(fShuttingDown, 0);
+  fShutdownToken := TCancelToken.Create;
   LogStartupTiming(
     'FormCreate.Done',
     Format('chatMonitorEnabled=%s chatSoundEnabled=%s',
@@ -1132,6 +1130,8 @@ procedure TAppsViewMainFrm.FormDestroy(Sender: TObject);
 begin
   LogStartupTiming('FormDestroy.Start');
   TInterlocked.Exchange(fShuttingDown, 1);
+  if Assigned(fShutdownToken) then
+    fShutdownToken.Cancel;
   tmrChatMonitor.Enabled := False;
   TInterlocked.Exchange(fChatMonitorPending, 0);
   TInterlocked.Exchange(fAuxListRefreshPending, 0);
@@ -1153,6 +1153,7 @@ begin
   fChatMonitorTask := nil;
   fDeepPrefixLoadTask := nil;
   fStartupDataLoadTask := nil;
+  fShutdownToken := nil;
   ClearListBoxItemData(lbDesktop);
   ClearListBoxItemData(lbShortCuts);
   FreeAndNil(fChatMonitor);
@@ -1511,6 +1512,7 @@ end;
 function RunMainFormSelfTests(const aArg: string): Integer;
 var
   lApps: TArray<TAppInfo>;
+  lCancelToken: iCancelToken;
   lItems: TStringList;
   lResultIndex: Integer;
 begin
@@ -1542,13 +1544,16 @@ begin
   if SameText(aArg, cWarmupShutdownCheckSelfTestArg) then
   begin
     Result := 0;
+    lCancelToken := TCancelToken.Create;
+    lCancelToken.Cancel;
     SetLength(lApps, 1);
     try
       PrefetchAppFileNamesInParallel(
         lApps,
-        function: Boolean
+        lCancelToken,
+        procedure(const aApp: TAppInfo)
         begin
-          raise Exception.Create('injected shutdown callback failure');
+          raise Exception.Create('canceled token should skip worker execution');
         end);
     except
       on lException: Exception do
@@ -1558,6 +1563,7 @@ begin
         Result := 1;
       end;
     end;
+    lCancelToken := nil;
     Exit;
   end;
 
@@ -1566,10 +1572,7 @@ begin
   try
     PrefetchAppFileNamesInParallel(
       lApps,
-      function: Boolean
-      begin
-        Result := False;
-      end,
+      nil,
       procedure(const aApp: TAppInfo)
       begin
         raise Exception.Create('injected prefetch failure');
