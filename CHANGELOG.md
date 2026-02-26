@@ -9,6 +9,7 @@ All notable changes to this project are documented in this file.
 - Main form now includes a `Play chat notification sounds` checkbox that toggles chat sounds at runtime and persists to `[ChatMonitor] SoundEnabled`.
 
 ### Changed
+- Chat monitor now preserves unread-notification cooldown when sound is disabled, so re-enabling sound can notify immediately for already-unread apps.
 - Chat monitor review-mask matching now treats multiple include keys on one rule line as conjunctive (all populated include keys must match), reducing false-positive monitoring for broad executable-only matches.
 - Chat notification playback now falls back to a system beep when a configured WAV file is missing or cannot be played, preventing silent watchdog notifications.
 - Default chat sound paths in `settings.ini` now use repo-relative `assets\wav\...` files instead of machine-specific project paths.
