@@ -22,6 +22,10 @@ type
     FileNameMask: string;
     AppUserModelIDMask: string;
     CmdParamsMask: string;
+    ExcludeCaptionMask: string;
+    ExcludeFileNameMask: string;
+    ExcludeAppUserModelIDMask: string;
+    ExcludeCmdParamsMask: string;
   end;
 
   TNamedValue = record
@@ -278,9 +282,15 @@ begin
       lRule.FileNameMask := Trim(lParts.Values['filename']);
       lRule.AppUserModelIDMask := Trim(lParts.Values['AppUserModelID']);
       lRule.CmdParamsMask := Trim(lParts.Values['CmdParams']);
+      lRule.ExcludeCaptionMask := Trim(lParts.Values['excludecaption']);
+      lRule.ExcludeFileNameMask := Trim(lParts.Values['excludefilename']);
+      lRule.ExcludeAppUserModelIDMask := Trim(lParts.Values['excludeappusermodelid']);
+      lRule.ExcludeCmdParamsMask := Trim(lParts.Values['excludecmdparams']);
 
       if (lRule.CaptionMask = '') and (lRule.FileNameMask = '')
-        and (lRule.AppUserModelIDMask = '') and (lRule.CmdParamsMask = '') then
+        and (lRule.AppUserModelIDMask = '') and (lRule.CmdParamsMask = '')
+        and (lRule.ExcludeCaptionMask = '') and (lRule.ExcludeFileNameMask = '')
+        and (lRule.ExcludeAppUserModelIDMask = '') and (lRule.ExcludeCmdParamsMask = '') then
         Continue;
 
       SetLength(Result, Length(Result) + 1);
