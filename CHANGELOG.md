@@ -9,6 +9,9 @@ All notable changes to this project are documented in this file.
 - Main form now includes a `Play chat notification sounds` checkbox that toggles chat sounds at runtime and persists to `[ChatMonitor] SoundEnabled`.
 
 ### Changed
+- Chat notification playback now falls back to a system beep when a configured WAV file is missing or cannot be played, preventing silent watchdog notifications.
+- Default chat sound paths in `settings.ini` now use repo-relative `assets\wav\...` files instead of machine-specific project paths.
+- Chat monitor worker now processes an immutable copied app snapshot per cycle, preventing range-check crashes caused by concurrent shared-snapshot updates.
 - Chat app selection now comes only from `ChatReviewMask.txt`; legacy `[ChatMonitor.Rules]` matching is no longer used.
 - Unread detection now uses a fixed caption counter pattern `(\d+)`.
 - Unread counter parsing now tolerates Teams caption variants with directional-mark padding and malformed `(\d+(` style delimiters.
