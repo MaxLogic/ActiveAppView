@@ -5,7 +5,8 @@ interface
 uses
   System.Classes, System.Generics.Collections, System.SyncObjs, System.SysUtils, System.Variants,
   Winapi.Messages, Winapi.Windows,
-  Vcl.Buttons, Vcl.Controls, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.Forms, Vcl.Graphics, Vcl.StdCtrls,
+  Vcl.Buttons, Vcl.Controls, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.Forms, Vcl.Graphics, Vcl.Menus,
+  Vcl.StdCtrls,
   CancelToken, maxAsync,
   ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore;
 
@@ -123,6 +124,9 @@ type
     fStartupProfileLogSync: TCriticalSection;
     fStartupProfileStartTick: Int64;
     fStartupProfileWarmupDoneLogged: Integer;
+    fWindowActionsPopupMenu: TPopupMenu;
+    fCloseWindowMenuItem: TMenuItem;
+    fTerminateWindowMenuItem: TMenuItem;
     fShutdownToken: iCancelToken;
     fShuttingDown: Integer;
     procedure AppOnActivate(Sender: TObject);
@@ -156,6 +160,20 @@ type
     procedure RequestAsyncStop(const aAsync: iAsync);
     procedure WaitAsyncWithShutdown(const aAsync: iAsync; const aTimeoutMs: Cardinal);
     procedure UpdateGui;
+    procedure CloseSelectedWindow(const aListBox: TListBox);
+    procedure CreateWindowActionsPopupMenu;
+    function GetPopupSourceListBox: TListBox;
+    function IsProcessActive(const aProcessId: Cardinal): Boolean;
+    procedure QuickValidateListBoxProcesses(const aListBox: TListBox);
+    procedure QuickValidateProcessesOnRefocus;
+    procedure RemoveWindowFromListBox(const aListBox: TListBox; const aWnd: hWnd);
+    procedure RemoveWindowFromUiAndCache(const aWnd: hWnd);
+    procedure ScheduleWindowActionCleanup(const aWnd: hWnd; const aProcessId: Cardinal);
+    procedure TerminateSelectedWindow(const aListBox: TListBox);
+    procedure WindowActionsPopupMenuPopup(aSender: TObject);
+    procedure WindowActionCleanupTimerTimer(aSender: TObject);
+    procedure WindowCloseMenuItemClick(aSender: TObject);
+    procedure WindowTerminateMenuItemClick(aSender: TObject);
 
     procedure BringToFrontFocusedApp(lb: TListBox);
     procedure UpdateAppDetail(const aAllowExtendedMetadata: Boolean = True);
@@ -202,6 +220,12 @@ type
     constructor Create(const aValue: string);
   end;
 
+  TWindowActionCleanupTimer = class(TTimer)
+  public
+    ProcessId: Cardinal;
+    Wnd: hWnd;
+  end;
+
   TAuxListsSnapshot = class
   public
     DesktopItems: TNamedValueArray;
@@ -223,8 +247,11 @@ const
   cWarmupShutdownCheckSelfTestArg = '--self-test-startup-warmup-shutdown-check';
   cIgnoreF4AfterFocusMs = 200;
   cShutdownTaskWaitTimeoutMs = 25;
+  cWindowActionVerifyDelayMs = 350;
 
 resourcestring
+  rsWindowActionClose = 'Close';
+  rsWindowActionTerminate = 'Terminate';
   rsShortCutTargetMissing = 'ShortCut target not found: %s';
 
 function FindSortedCaptionIndex(const aItems: TStrings; const aOldItemCaption: string): Integer;
@@ -348,12 +375,214 @@ begin
     Exit;
 
   MarkFormFocused;
+  QuickValidateProcessesOnRefocus;
   if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
     StartStartupDataLoad
   else
     QueueGuiRefresh;
   if assigned(fOrgAppOnActivate) then
     fOrgAppOnActivate(Sender);
+end;
+
+procedure TAppsViewMainFrm.CloseSelectedWindow(const aListBox: TListBox);
+var
+  lProcessId: Cardinal;
+  lWnd: hWnd;
+begin
+  if not Assigned(aListBox) then
+    Exit;
+
+  lWnd := GetWnd(aListBox);
+  if lWnd = 0 then
+    Exit;
+
+  lProcessId := 0;
+  GetWindowThreadProcessId(lWnd, lProcessId);
+  PostMessage(lWnd, WM_CLOSE, 0, 0);
+  ScheduleWindowActionCleanup(lWnd, lProcessId);
+  QueueGuiRefresh;
+end;
+
+procedure TAppsViewMainFrm.CreateWindowActionsPopupMenu;
+begin
+  fWindowActionsPopupMenu := TPopupMenu.Create(Self);
+  fWindowActionsPopupMenu.OnPopup := WindowActionsPopupMenuPopup;
+
+  fCloseWindowMenuItem := TMenuItem.Create(fWindowActionsPopupMenu);
+  fCloseWindowMenuItem.Caption := rsWindowActionClose;
+  fCloseWindowMenuItem.OnClick := WindowCloseMenuItemClick;
+  fWindowActionsPopupMenu.Items.Add(fCloseWindowMenuItem);
+
+  fTerminateWindowMenuItem := TMenuItem.Create(fWindowActionsPopupMenu);
+  fTerminateWindowMenuItem.Caption := rsWindowActionTerminate;
+  fTerminateWindowMenuItem.OnClick := WindowTerminateMenuItemClick;
+  fWindowActionsPopupMenu.Items.Add(fTerminateWindowMenuItem);
+
+  lbApps.PopupMenu := fWindowActionsPopupMenu;
+  lbExplorer.PopupMenu := fWindowActionsPopupMenu;
+end;
+
+function TAppsViewMainFrm.GetPopupSourceListBox: TListBox;
+begin
+  Result := nil;
+  if Assigned(fWindowActionsPopupMenu) and (fWindowActionsPopupMenu.PopupComponent is TListBox) then
+    Result := TListBox(fWindowActionsPopupMenu.PopupComponent);
+
+  if (Result <> lbApps) and (Result <> lbExplorer) then
+    Result := nil;
+end;
+
+function TAppsViewMainFrm.IsProcessActive(const aProcessId: Cardinal): Boolean;
+var
+  lLastError: Cardinal;
+  lProcessHandle: THandle;
+begin
+  if aProcessId = 0 then
+    Exit(False);
+
+  lProcessHandle := OpenProcess(SYNCHRONIZE or PROCESS_QUERY_INFORMATION, False, aProcessId);
+  if lProcessHandle = 0 then
+  begin
+    lLastError := GetLastError;
+    if lLastError = ERROR_ACCESS_DENIED then
+      Exit(True);
+    Exit(False);
+  end;
+  try
+    Result := WaitForSingleObject(lProcessHandle, 0) = WAIT_TIMEOUT;
+  finally
+    CloseHandle(lProcessHandle);
+  end;
+end;
+
+procedure TAppsViewMainFrm.QuickValidateListBoxProcesses(const aListBox: TListBox);
+var
+  lIndex: Integer;
+  lProcessId: Cardinal;
+  lWnd: hWnd;
+begin
+  if not Assigned(aListBox) then
+    Exit;
+
+  aListBox.Items.BeginUpdate;
+  try
+    for lIndex := aListBox.Items.Count - 1 downto 0 do
+    begin
+      lWnd := hWnd(aListBox.Items.Objects[lIndex]);
+      if lWnd = 0 then
+      begin
+        aListBox.Items.Delete(lIndex);
+        Continue;
+      end;
+      if not IsWindow(lWnd) then
+      begin
+        aListBox.Items.Delete(lIndex);
+        Continue;
+      end;
+
+      lProcessId := 0;
+      GetWindowThreadProcessId(lWnd, lProcessId);
+      if (lProcessId = 0) or (not IsProcessActive(lProcessId)) then
+        aListBox.Items.Delete(lIndex);
+    end;
+  finally
+    aListBox.Items.EndUpdate;
+  end;
+
+  if aListBox.Items.Count = 0 then
+    aListBox.ItemIndex := -1
+  else if aListBox.ItemIndex < 0 then
+    aListBox.ItemIndex := 0
+  else if aListBox.ItemIndex >= aListBox.Items.Count then
+    aListBox.ItemIndex := aListBox.Items.Count - 1;
+end;
+
+procedure TAppsViewMainFrm.QuickValidateProcessesOnRefocus;
+begin
+  QuickValidateListBoxProcesses(lbApps);
+  QuickValidateListBoxProcesses(lbExplorer);
+  QuickValidateListBoxProcesses(lbConsole);
+  fSharedAppsSnapshotTick := 0;
+  UpdateAppDetail(False);
+end;
+
+procedure TAppsViewMainFrm.RemoveWindowFromListBox(const aListBox: TListBox; const aWnd: hWnd);
+var
+  lIndex: Integer;
+begin
+  if (not Assigned(aListBox)) or (aWnd = 0) then
+    Exit;
+
+  aListBox.Items.BeginUpdate;
+  try
+    for lIndex := aListBox.Items.Count - 1 downto 0 do
+    begin
+      if hWnd(aListBox.Items.Objects[lIndex]) = aWnd then
+        aListBox.Items.Delete(lIndex);
+    end;
+  finally
+    aListBox.Items.EndUpdate;
+  end;
+
+  if aListBox.Items.Count = 0 then
+    aListBox.ItemIndex := -1
+  else if aListBox.ItemIndex < 0 then
+    aListBox.ItemIndex := 0
+  else if aListBox.ItemIndex >= aListBox.Items.Count then
+    aListBox.ItemIndex := aListBox.Items.Count - 1;
+end;
+
+procedure TAppsViewMainFrm.RemoveWindowFromUiAndCache(const aWnd: hWnd);
+begin
+  if aWnd = 0 then
+    Exit;
+
+  fApps.Update;
+  RebuildSharedAppsSnapshot;
+  RemoveWindowFromListBox(lbApps, aWnd);
+  RemoveWindowFromListBox(lbExplorer, aWnd);
+  RemoveWindowFromListBox(lbConsole, aWnd);
+  UpdateAppDetail(False);
+  QueueGuiRefresh;
+end;
+
+procedure TAppsViewMainFrm.ScheduleWindowActionCleanup(const aWnd: hWnd; const aProcessId: Cardinal);
+var
+  lTimer: TWindowActionCleanupTimer;
+begin
+  if IsShuttingDown then
+    Exit;
+
+  lTimer := TWindowActionCleanupTimer.Create(Self);
+  lTimer.Enabled := False;
+  lTimer.Interval := cWindowActionVerifyDelayMs;
+  lTimer.Wnd := aWnd;
+  lTimer.ProcessId := aProcessId;
+  lTimer.OnTimer := WindowActionCleanupTimerTimer;
+  lTimer.Enabled := True;
+end;
+
+procedure TAppsViewMainFrm.WindowActionCleanupTimerTimer(aSender: TObject);
+var
+  lProcessId: Cardinal;
+  lTimer: TWindowActionCleanupTimer;
+  lWnd: hWnd;
+begin
+  if not (aSender is TWindowActionCleanupTimer) then
+    Exit;
+
+  lTimer := TWindowActionCleanupTimer(aSender);
+  lTimer.Enabled := False;
+  lProcessId := lTimer.ProcessId;
+  lWnd := lTimer.Wnd;
+  lTimer.Free;
+
+  if IsShuttingDown then
+    Exit;
+  if IsProcessActive(lProcessId) then
+    Exit;
+
+  RemoveWindowFromUiAndCache(lWnd);
 end;
 
 procedure TAppsViewMainFrm.BringToFrontFocusedApp(lb: TListBox);
@@ -369,6 +598,61 @@ begin
 
   if fApps.TryGetApp(wnd, app) then
     app.SHOW;
+end;
+
+procedure TAppsViewMainFrm.TerminateSelectedWindow(const aListBox: TListBox);
+var
+  lProcessHandle: THandle;
+  lProcessId: Cardinal;
+  lWnd: hWnd;
+begin
+  if not Assigned(aListBox) then
+    Exit;
+
+  lWnd := GetWnd(aListBox);
+  if lWnd = 0 then
+    Exit;
+
+  lProcessId := 0;
+  GetWindowThreadProcessId(lWnd, lProcessId);
+  if lProcessId = 0 then
+    Exit;
+
+  lProcessHandle := OpenProcess(PROCESS_TERMINATE, False, lProcessId);
+  if lProcessHandle = 0 then
+    Exit;
+  try
+    TerminateProcess(lProcessHandle, 1);
+  finally
+    CloseHandle(lProcessHandle);
+  end;
+
+  ScheduleWindowActionCleanup(lWnd, lProcessId);
+  QueueGuiRefresh;
+end;
+
+procedure TAppsViewMainFrm.WindowActionsPopupMenuPopup(aSender: TObject);
+var
+  lHasWindow: Boolean;
+  lListBox: TListBox;
+begin
+  lListBox := GetPopupSourceListBox;
+  lHasWindow := Assigned(lListBox) and (GetWnd(lListBox) <> 0);
+
+  if Assigned(fCloseWindowMenuItem) then
+    fCloseWindowMenuItem.Enabled := lHasWindow;
+  if Assigned(fTerminateWindowMenuItem) then
+    fTerminateWindowMenuItem.Enabled := lHasWindow;
+end;
+
+procedure TAppsViewMainFrm.WindowCloseMenuItemClick(aSender: TObject);
+begin
+  CloseSelectedWindow(GetPopupSourceListBox);
+end;
+
+procedure TAppsViewMainFrm.WindowTerminateMenuItemClick(aSender: TObject);
+begin
+  TerminateSelectedWindow(GetPopupSourceListBox);
 end;
 
 procedure TAppsViewMainFrm.ClearListBoxItemData(lb: TListBox);
@@ -1090,6 +1374,7 @@ begin
 
   fApps := TAppList.Create;
   fConfigCache := TConfigCache.Create(GetInstallDir);
+  CreateWindowActionsPopupMenu;
   AddToAutoStart;
   Screen.OnActiveControlChange := ActiveControlChanged;
   labAppTitle.Height := labTemplateActiv.Height;
@@ -1225,6 +1510,11 @@ procedure TAppsViewMainFrm.lbAppsKeyUp(Sender: TObject; var Key: Word;
 begin
   if Key = VK_RETURN then
     BringToFrontFocusedApp(Sender as TListBox)
+  else if (Key = Ord('W')) and (ssCtrl in Shift) and ((Sender = lbApps) or (Sender = lbExplorer)) then
+  begin
+    CloseSelectedWindow(Sender as TListBox);
+    Key := 0;
+  end
   else if Sender = lbApps then
     UpdateAppDetail;
 end;
