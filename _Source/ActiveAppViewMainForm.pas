@@ -168,10 +168,11 @@ type
     procedure QuickValidateProcessesOnRefocus;
     procedure RemoveWindowFromListBox(const aListBox: TListBox; const aWnd: hWnd);
     procedure RemoveWindowFromUiAndCache(const aWnd: hWnd);
+    procedure RunWindowActionCleanupCheck(const aWnd: hWnd; const aProcessId: Cardinal;
+      const aElapsedMs: Cardinal; const aDelayMs: Cardinal);
     procedure ScheduleWindowActionCleanup(const aWnd: hWnd; const aProcessId: Cardinal);
     procedure TerminateSelectedWindow(const aListBox: TListBox);
     procedure WindowActionsPopupMenuPopup(aSender: TObject);
-    procedure WindowActionCleanupTimerTimer(aSender: TObject);
     procedure WindowCloseMenuItemClick(aSender: TObject);
     procedure WindowTerminateMenuItemClick(aSender: TObject);
 
@@ -208,7 +209,7 @@ implementation
 uses
   System.Diagnostics, System.IniFiles, System.IOUtils, System.StrUtils, System.Threading,
   Winapi.ActiveX, Winapi.KnownFolders, Winapi.MMSystem, Winapi.ShellAPI, Winapi.ShlObj,
-  AutoFree, bsUtils, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils,
+  AutoFree, bsUtils, maxCallMeLater, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils,
   srDesktop;
 
 {$R *.dfm}
@@ -218,12 +219,6 @@ type
   public
     Value: string;
     constructor Create(const aValue: string);
-  end;
-
-  TWindowActionCleanupTimer = class(TTimer)
-  public
-    ProcessId: Cardinal;
-    Wnd: hWnd;
   end;
 
   TAuxListsSnapshot = class
@@ -248,6 +243,8 @@ const
   cIgnoreF4AfterFocusMs = 200;
   cShutdownTaskWaitTimeoutMs = 25;
   cWindowActionVerifyDelayMs = 350;
+  cWindowActionVerifyDelayStepMs = 150;
+  cWindowActionVerifyMaxDurationMs = 5000;
 
 resourcestring
   rsWindowActionClose = 'Close';
@@ -547,42 +544,54 @@ begin
 end;
 
 procedure TAppsViewMainFrm.ScheduleWindowActionCleanup(const aWnd: hWnd; const aProcessId: Cardinal);
-var
-  lTimer: TWindowActionCleanupTimer;
 begin
   if IsShuttingDown then
     Exit;
 
-  lTimer := TWindowActionCleanupTimer.Create(Self);
-  lTimer.Enabled := False;
-  lTimer.Interval := cWindowActionVerifyDelayMs;
-  lTimer.Wnd := aWnd;
-  lTimer.ProcessId := aProcessId;
-  lTimer.OnTimer := WindowActionCleanupTimerTimer;
-  lTimer.Enabled := True;
+  RunWindowActionCleanupCheck(aWnd, aProcessId, 0, cWindowActionVerifyDelayMs);
 end;
 
-procedure TAppsViewMainFrm.WindowActionCleanupTimerTimer(aSender: TObject);
+procedure TAppsViewMainFrm.RunWindowActionCleanupCheck(const aWnd: hWnd; const aProcessId: Cardinal;
+  const aElapsedMs: Cardinal; const aDelayMs: Cardinal);
 var
-  lProcessId: Cardinal;
-  lTimer: TWindowActionCleanupTimer;
-  lWnd: hWnd;
+  lDelayMs: Cardinal;
 begin
-  if not (aSender is TWindowActionCleanupTimer) then
-    Exit;
-
-  lTimer := TWindowActionCleanupTimer(aSender);
-  lTimer.Enabled := False;
-  lProcessId := lTimer.ProcessId;
-  lWnd := lTimer.Wnd;
-  lTimer.Free;
-
   if IsShuttingDown then
     Exit;
-  if IsProcessActive(lProcessId) then
-    Exit;
 
-  RemoveWindowFromUiAndCache(lWnd);
+  lDelayMs := aDelayMs;
+  if lDelayMs = 0 then
+    lDelayMs := cWindowActionVerifyDelayMs;
+  CallmeLater(
+    procedure
+    var
+      lElapsedMs: Cardinal;
+      lNextDelayMs: Cardinal;
+    begin
+      if IsShuttingDown then
+        Exit;
+      if (aWnd <> 0) and (not IsWindow(aWnd)) then
+      begin
+        RemoveWindowFromUiAndCache(aWnd);
+        Exit;
+      end;
+      if not IsProcessActive(aProcessId) then
+      begin
+        RemoveWindowFromUiAndCache(aWnd);
+        Exit;
+      end;
+
+      lElapsedMs := aElapsedMs + lDelayMs;
+      if lElapsedMs >= cWindowActionVerifyMaxDurationMs then
+        Exit;
+
+      lNextDelayMs := lDelayMs + cWindowActionVerifyDelayStepMs;
+      if (lElapsedMs + lNextDelayMs) > cWindowActionVerifyMaxDurationMs then
+        lNextDelayMs := cWindowActionVerifyMaxDurationMs - lElapsedMs;
+      RunWindowActionCleanupCheck(aWnd, aProcessId, lElapsedMs, lNextDelayMs);
+    end,
+    lDelayMs,
+    Self);
 end;
 
 procedure TAppsViewMainFrm.BringToFrontFocusedApp(lb: TListBox);

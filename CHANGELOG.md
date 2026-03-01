@@ -9,6 +9,8 @@ All notable changes to this project are documented in this file.
 - Main form now includes a `Play chat notification sounds` checkbox that toggles chat sounds at runtime and persists to `[ChatMonitor] SoundEnabled`.
 
 ### Changed
+- Applications and Explorer lists now support window actions via context menu (`Close`, `Terminate`) and `Ctrl+W` on focused list items for normal close.
+- Post-close/post-terminate cleanup now retries process/window validation with increasing delays for up to 5 seconds, removing entries only after the target is actually gone; refocus still performs a quick stale-entry prune before full refresh.
 - Unread caption parsing now accepts all Unicode decimal digits (including fullwidth, Arabic-Indic, and Devanagari digits) inside supported parentheses, preserving unread detection for localized counters.
 - Unread notification playback now uses the configured `[ChatMonitor] UnreadMessageSoundIntervalSeconds` value directly, including intervals below 5 seconds.
 - Chat notification sound throttling now updates only after a playback/beep succeeds, so failed notification attempts do not suppress immediate retry.
