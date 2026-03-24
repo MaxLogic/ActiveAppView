@@ -272,16 +272,12 @@ procedure PrefetchAppFileNamesInParallel(
   const aCancelToken: iCancelToken;
   const aPrefetchProc: TAppPrefetchProc = nil);
 var
-  lIsCanceled: Boolean;
   lPrefetchProc: TAppPrefetchProc;
 begin
   if Length(aApps) = 0 then
     Exit;
 
-  lIsCanceled := False;
-  if Assigned(aCancelToken) then
-    lIsCanceled := aCancelToken.Canceled;
-  if lIsCanceled then
+  if Assigned(aCancelToken) and aCancelToken.Canceled then
     Exit;
 
   lPrefetchProc := aPrefetchProc;
@@ -289,14 +285,7 @@ begin
     procedure(aIndex: Integer)
     var
       lApp: TAppInfo;
-      lCanceled: Boolean;
     begin
-      lCanceled := False;
-      if Assigned(aCancelToken) then
-        lCanceled := aCancelToken.Canceled;
-      if lCanceled then
-        Exit;
-
       try
         lApp := aApps[aIndex];
         if Assigned(lPrefetchProc) then
