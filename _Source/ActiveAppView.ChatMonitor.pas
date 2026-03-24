@@ -1023,7 +1023,11 @@ begin
   TParallel.&For(0, High(aApps),
     procedure(aIndex: Integer)
     begin
-      lMetadata[aIndex] := GetMetadataCached(aApps[aIndex].Wnd);
+      try
+        lMetadata[aIndex] := GetMetadataCached(aApps[aIndex].Wnd);
+      except
+        lMetadata[aIndex] := nil;
+      end;
     end);
   Result := lMetadata;
 end;
