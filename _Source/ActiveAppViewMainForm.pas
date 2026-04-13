@@ -210,7 +210,7 @@ uses
   System.Diagnostics, System.IniFiles, System.IOUtils, System.StrUtils, System.Threading,
   Winapi.ActiveX, Winapi.KnownFolders, Winapi.MMSystem, Winapi.ShellAPI, Winapi.ShlObj,
   AutoFree, bsUtils, maxCallMeLater, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils,
-  srDesktop;
+  ActiveAppView.Launcher, srDesktop;
 
 {$R *.dfm}
 
@@ -247,6 +247,7 @@ const
   cWindowActionVerifyMaxDurationMs = 5000;
 
 resourcestring
+  rsLaunchFailed = 'Failed to launch item: %s';
   rsWindowActionClose = 'Close';
   rsWindowActionTerminate = 'Terminate';
   rsShortCutTargetMissing = 'ShortCut target not found: %s';
@@ -1215,6 +1216,7 @@ end;
 
 procedure TAppsViewMainFrm.ActivateDesktopItem;
 var
+  lExitCode: Cardinal;
   lItem: TListBoxItemData;
   lPath: string;
 begin
@@ -1229,16 +1231,22 @@ begin
   if lPath = '' then
     Exit;
 
-  if DirectoryExists(lPath) or FileExists(lPath) then
-    ShellExecute(Handle, 'open', PChar(lPath), nil, nil, SW_SHOWNORMAL);
+  if not TryLaunchPathIsolated(lPath, '', lExitCode) then
+  begin
+    MessageDlg(Format(rsLaunchFailed, [lPath]), mtWarning, [mbOK], 0);
+    Exit;
+  end;
+
+  if not IsLaunchSuccessExitCode(lExitCode) then
+    MessageDlg(Format(rsLaunchFailed, [lPath]), mtWarning, [mbOK], 0);
 end;
 
 procedure TAppsViewMainFrm.ActivateShortCutItem;
 var
+  lExitCode: Cardinal;
   lItem: TListBoxItemData;
   lTargetPath: string;
   lParams: string;
-  lResult: HINST;
 begin
   if lbShortCuts.ItemIndex < 0 then
     Exit;
@@ -1250,27 +1258,22 @@ begin
   if not TryParseShortCutValue(lItem.Value, lTargetPath, lParams) then
     Exit;
 
-  if StartsText('\\', lTargetPath) then
+  if not TryLaunchPathIsolated(lTargetPath, lParams, lExitCode) then
   begin
-    lResult := ShellExecute(Handle, 'open', PChar(lTargetPath), PChar(lParams), nil, SW_SHOWNORMAL);
-    if lResult <= 32 then
-      MessageDlg(Format(rsShortCutTargetMissing, [lTargetPath]), mtWarning, [mbOK], 0);
+    MessageDlg(Format(rsLaunchFailed, [lTargetPath]), mtWarning, [mbOK], 0);
     Exit;
   end;
 
-  if DirectoryExists(lTargetPath) then
+  if IsLaunchSuccessExitCode(lExitCode) then
+    Exit;
+
+  if IsLaunchMissingTargetExitCode(lExitCode) then
   begin
-    ShellExecute(Handle, 'open', PChar(lTargetPath), nil, nil, SW_SHOWNORMAL);
+    MessageDlg(Format(rsShortCutTargetMissing, [lTargetPath]), mtWarning, [mbOK], 0);
     Exit;
   end;
 
-  if FileExists(lTargetPath) then
-  begin
-    ShellExecute(Handle, 'open', PChar(lTargetPath), PChar(lParams), nil, SW_SHOWNORMAL);
-    Exit;
-  end;
-
-  MessageDlg(Format(rsShortCutTargetMissing, [lTargetPath]), mtWarning, [mbOK], 0);
+  MessageDlg(Format(rsLaunchFailed, [lTargetPath]), mtWarning, [mbOK], 0);
 end;
 
 procedure TAppsViewMainFrm.RestoreSelectedItem(lb: TListBox; const aCaption: string);

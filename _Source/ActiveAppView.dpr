@@ -8,6 +8,7 @@ uses
   madListHardware,
   madListProcesses,
   madListModules,
+  ActiveAppView.Launcher in 'ActiveAppView.Launcher.pas',
   ActiveAppView.ChatMonitor in 'ActiveAppView.ChatMonitor.pas',
   ActiveAppViewCore in 'ActiveAppViewCore.pas',
   ActiveAppViewMainForm in 'ActiveAppViewMainForm.pas' {AppsViewMainFrm},
@@ -70,10 +71,17 @@ begin
 end;
 
 var
+  lLaunchHelperResult: Integer;
   lSelfTestResult: Integer;
   lSingleInstanceMutex: THandle;
 
 begin
+  lLaunchHelperResult := RunLauncherHelperFromCommandLine;
+  if lLaunchHelperResult <> -1 then
+  begin
+    Halt(lLaunchHelperResult);
+  end;
+
   lSelfTestResult := RunSelfTests;
   if lSelfTestResult <> -1 then
   begin
