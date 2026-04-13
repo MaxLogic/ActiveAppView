@@ -6,6 +6,7 @@ uses
   System.SysUtils;
 
 const
+  cLaunchClassificationSelfTestArg = '--self-test-launch-classification';
   cLaunchHelperCrashIsolatedSelfTestArg = '--self-test-launch-helper-crash-isolated';
   cLaunchHelperPathsSelfTestArg = '--self-test-launch-helper-paths';
 
@@ -138,7 +139,7 @@ begin
     Exit(TLaunchMode.lmDirectory);
   end;
 
-  if StartsText('\\', aPath) and (not FileExists(aPath)) then
+  if StartsText('\\', aPath) then
   begin
     aLaunchPath := aPath;
     aLaunchParams := aParams;
@@ -185,7 +186,7 @@ begin
       Exit(TLaunchMode.lmDirectory);
     end;
 
-    if StartsText('\\', lResolvedPath) and (not FileExists(lResolvedPath)) then
+    if StartsText('\\', lResolvedPath) then
     begin
       aLaunchPath := lResolvedPath;
       Exit(TLaunchMode.lmShellFallback);
@@ -460,17 +461,32 @@ begin
   end;
 end;
 
+function GetGuidToken: string;
+var
+  lGuid: TGUID;
+begin
+  OleCheck(CreateGUID(lGuid));
+  Result := GuidToString(lGuid);
+  Result := StringReplace(Result, '{', '', [rfReplaceAll]);
+  Result := StringReplace(Result, '}', '', [rfReplaceAll]);
+  Result := StringReplace(Result, '-', '', [rfReplaceAll]);
+end;
+
 function RunLaunchHelperPathsSelfTest: Integer;
 var
   lDir: string;
   lExeFileName: string;
   lExitCode: Cardinal;
   lProbeFileName: string;
+  lRootDir: string;
 begin
   Result := 0;
-  lDir := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.launch.folder');
-  lExeFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.launch.exe');
-  lProbeFileName := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.launch.txt');
+  lRootDir := TPath.Combine(
+    TPath.GetTempPath,
+    'ActiveAppView.selftest.launch.' + GetGuidToken);
+  lDir := TPath.Combine(lRootDir, 'Folder');
+  lExeFileName := TPath.Combine(lRootDir, 'tool.exe');
+  lProbeFileName := TPath.Combine(lRootDir, 'doc.txt');
 
   ForceDirectories(lDir);
   TFile.WriteAllText(lExeFileName, 'stub', TEncoding.ASCII);
@@ -515,15 +531,191 @@ begin
       Exit(1);
     end;
   finally
-    TFile.Delete(lProbeFileName);
-    TFile.Delete(lExeFileName);
-    TDirectory.Delete(lDir);
+    if TFile.Exists(lProbeFileName) then
+      TFile.Delete(lProbeFileName);
+    if TFile.Exists(lExeFileName) then
+      TFile.Delete(lExeFileName);
+    if TDirectory.Exists(lRootDir) then
+      TDirectory.Delete(lRootDir, True);
+  end;
+end;
+
+function DetermineLaunchModeForSelfTest(const aPath: string; const aParams: string): TLaunchMode;
+var
+  lLaunchPath: string;
+  lLaunchParams: string;
+  lShouldUninitialize: Boolean;
+  lWorkingDirectory: string;
+begin
+  lShouldUninitialize := False;
+  case CoInitializeEx(nil, COINIT_APARTMENTTHREADED or COINIT_DISABLE_OLE1DDE) of
+    S_OK, S_FALSE:
+      lShouldUninitialize := True;
+  else
+    OleCheck(E_UNEXPECTED);
+  end;
+
+  try
+    Result := DetermineLaunchMode(aPath, aParams, lLaunchPath, lLaunchParams, lWorkingDirectory);
+  finally
+    if lShouldUninitialize then
+      CoUninitialize;
+  end;
+end;
+
+procedure CreateShortcutFile(
+  const aShortcutPath: string;
+  const aTargetPath: string;
+  const aArguments: string;
+  const aWorkingDirectory: string);
+var
+  lPersistFile: IPersistFile;
+  lShellLink: IShellLinkW;
+  lShouldUninitialize: Boolean;
+begin
+  lShouldUninitialize := False;
+  case CoInitializeEx(nil, COINIT_APARTMENTTHREADED or COINIT_DISABLE_OLE1DDE) of
+    S_OK, S_FALSE:
+      lShouldUninitialize := True;
+  else
+    OleCheck(E_UNEXPECTED);
+  end;
+
+  try
+    lShellLink := CreateComObject(CLSID_ShellLink) as IShellLinkW;
+    OleCheck(lShellLink.SetPath(PWideChar(WideString(aTargetPath))));
+    if aArguments <> '' then
+      OleCheck(lShellLink.SetArguments(PWideChar(WideString(aArguments))));
+    if aWorkingDirectory <> '' then
+      OleCheck(lShellLink.SetWorkingDirectory(PWideChar(WideString(aWorkingDirectory))));
+    lPersistFile := lShellLink as IPersistFile;
+    OleCheck(lPersistFile.Save(PWideChar(WideString(aShortcutPath)), True));
+  finally
+    if lShouldUninitialize then
+      CoUninitialize;
+  end;
+end;
+
+function RunLaunchClassificationSelfTest: Integer;
+var
+  lComSpec: string;
+  lDir: string;
+  lDocFileName: string;
+  lDocShortcutFileName: string;
+  lExitCode: Cardinal;
+  lExeShortcutFileName: string;
+  lLaunchMode: TLaunchMode;
+  lMissingFileName: string;
+  lRootDir: string;
+begin
+  Result := 0;
+  lComSpec := GetEnvironmentVariable('ComSpec');
+  if lComSpec = '' then
+  begin
+    Writeln('SELFTEST FAILED: ComSpec is empty');
+    Exit(1);
+  end;
+
+  lRootDir := TPath.Combine(
+    TPath.GetTempPath,
+    'ActiveAppView.selftest.launch.classification.' + GetGuidToken);
+  lDir := TPath.Combine(lRootDir, 'Folder');
+  lDocFileName := TPath.Combine(lRootDir, 'doc.txt');
+  lDocShortcutFileName := TPath.Combine(lRootDir, 'doc-shortcut.lnk');
+  lExeShortcutFileName := TPath.Combine(lRootDir, 'exe-shortcut.lnk');
+  lMissingFileName := TPath.Combine(lRootDir, 'missing.exe');
+
+  ForceDirectories(lDir);
+  TFile.WriteAllText(lDocFileName, 'stub', TEncoding.ASCII);
+  CreateShortcutFile(lExeShortcutFileName, lComSpec, '/c exit 0', ExtractFileDir(lComSpec));
+  CreateShortcutFile(lDocShortcutFileName, lDocFileName, '', ExtractFileDir(lDocFileName));
+  try
+    lLaunchMode := DetermineLaunchModeForSelfTest(lDir, '');
+    if lLaunchMode <> TLaunchMode.lmDirectory then
+    begin
+      Writeln(Format('SELFTEST FAILED: folder classification expected=%s actual=%s', ['directory', 'other']));
+      Exit(1);
+    end;
+
+    lLaunchMode := DetermineLaunchModeForSelfTest(lComSpec, '');
+    if lLaunchMode <> TLaunchMode.lmExecutable then
+    begin
+      Writeln(Format('SELFTEST FAILED: executable classification expected=%s actual=%s', ['executable', 'other']));
+      Exit(1);
+    end;
+
+    lLaunchMode := DetermineLaunchModeForSelfTest(lExeShortcutFileName, '');
+    if lLaunchMode <> TLaunchMode.lmExecutable then
+    begin
+      Writeln(Format('SELFTEST FAILED: executable shortcut classification expected=%s actual=%s', ['executable', 'other']));
+      Exit(1);
+    end;
+
+    lLaunchMode := DetermineLaunchModeForSelfTest(lDocShortcutFileName, '');
+    if lLaunchMode <> TLaunchMode.lmShellFallback then
+    begin
+      Writeln(Format('SELFTEST FAILED: document shortcut classification expected=%s actual=%s', ['shell-fallback', 'other']));
+      Exit(1);
+    end;
+
+    lLaunchMode := DetermineLaunchModeForSelfTest('\\server\share\tool.exe', '');
+    if lLaunchMode <> TLaunchMode.lmShellFallback then
+    begin
+      Writeln(Format('SELFTEST FAILED: UNC classification expected=%s actual=%s', ['shell-fallback', 'other']));
+      Exit(1);
+    end;
+
+    lLaunchMode := DetermineLaunchModeForSelfTest(lMissingFileName, '');
+    if lLaunchMode <> TLaunchMode.lmMissing then
+    begin
+      Writeln(Format('SELFTEST FAILED: missing classification expected=%s actual=%s', ['missing', 'other']));
+      Exit(1);
+    end;
+
+    if not TryLaunchPathIsolated(lComSpec, '/c exit 0', lExitCode) then
+    begin
+      Writeln('SELFTEST FAILED: launch classification could not execute helper process route');
+      Exit(1);
+    end;
+    if lExitCode <> ERROR_SUCCESS then
+    begin
+      Writeln(Format('SELFTEST FAILED: helper execute expected=%d actual=%d', [ERROR_SUCCESS, lExitCode]));
+      Exit(1);
+    end;
+
+    if not TryLaunchPathIsolated(lMissingFileName, '', lExitCode) then
+    begin
+      Writeln('SELFTEST FAILED: launch classification could not execute helper missing-target route');
+      Exit(1);
+    end;
+    if lExitCode <> cLaunchExitTargetMissing then
+    begin
+      Writeln(Format('SELFTEST FAILED: helper missing-target expected=%d actual=%d', [cLaunchExitTargetMissing, lExitCode]));
+      Exit(1);
+    end;
+  finally
+    if TDirectory.Exists(lRootDir) then
+      TDirectory.Delete(lRootDir, True);
   end;
 end;
 
 function RunLauncherSelfTests(const aArg: string): Integer;
 begin
   Result := -1;
+  if SameText(aArg, cLaunchClassificationSelfTestArg) then
+  begin
+    try
+      Result := RunLaunchClassificationSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+    Exit;
+  end;
+
   if SameText(aArg, cLaunchHelperCrashIsolatedSelfTestArg) then
   begin
     try

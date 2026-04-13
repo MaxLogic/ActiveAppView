@@ -2,12 +2,20 @@
 Next task ID: T-020
 
 ## Summary
-Open tasks: 1 (In Progress: 0, Next Today: 1, Next This Week: 0, Next Later: 0, Blocked: 0)
-Done tasks: 18
+Open tasks: 0 (In Progress: 0, Next Today: 0, Next This Week: 0, Next Later: 0, Blocked: 0)
+Done tasks: 19
 
 ## In Progress
 
 ## Next – Today
+
+## Next – This Week
+
+## Next – Later
+
+## Blocked
+
+## Done
 
 ### T-019 [TEST] Add regression coverage for launcher classification and crash containment
 Outcome:
@@ -17,20 +25,12 @@ Outcome:
 Proof:
 - Run: `_build_verify/test-out-remediate/ActiveAppView.exe --self-test-launch-classification`
   Expect: exit code `0` with no `SELFTEST FAILED` output.
-- Run: `rg -n -- "--self-test-launch-|ShellExecute|CreateProcess|IShellLink" _Source/ActiveAppView.SelfTests.pas _Source/ActiveAppViewMainForm.pas`
+- Run: `rg -n -- "--self-test-launch-|ShellExecute|CreateProcess|IShellLink" _Source/ActiveAppView.SelfTests.pas _Source/ActiveAppViewMainForm.pas _Source/ActiveAppView.Launcher.pas`
   Expect: launcher self-tests exist and the happy-path implementation is direct-launch oriented.
-Touches: _Source/ActiveAppView.SelfTests.pas, _Source/ActiveAppViewMainForm.pas
+Touches: _Source/ActiveAppView.Launcher.pas, _Source/ActiveAppView.SelfTests.pas, _Source/ActiveAppViewMainForm.pas
 Deps: T-018
 Verify: unit-test, cli-proof
 Notes: Keeps the shell-extension crash mitigation locked in after implementation.
-
-## Next – This Week
-
-## Next – Later
-
-## Blocked
-
-## Done
 
 ### T-018 [CORE] Isolate desktop and shortcut activation from in-process shell handlers
 Outcome:
