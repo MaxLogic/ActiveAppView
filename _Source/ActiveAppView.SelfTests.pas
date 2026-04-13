@@ -9,7 +9,7 @@ implementation
 uses
   System.Classes, System.Diagnostics, System.IniFiles, System.IOUtils, System.SysUtils,
   Winapi.Windows,
-  ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore,
+  ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore, ActiveAppView.Launcher,
   ActiveAppViewMainForm;
 
 const
@@ -267,6 +267,10 @@ end;
 function RunSelfTests: Integer;
 begin
   Result := RunCoreSelfTests(ParamStr(1));
+  if Result <> -1 then
+    Exit;
+
+  Result := RunLauncherSelfTests(ParamStr(1));
   if Result <> -1 then
     Exit;
 
