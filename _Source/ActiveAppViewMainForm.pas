@@ -89,6 +89,7 @@ type
       Shift: TShiftState);
     procedure tmrChatMonitorTimer(Sender: TObject);
     procedure chkChatNotificationSoundClick(aSender: TObject);
+    procedure FormResize(Sender: TObject);
   private
 
     fApps: TAppList;
@@ -160,6 +161,9 @@ type
     procedure RequestAsyncStop(const aAsync: iAsync);
     procedure WaitAsyncWithShutdown(const aAsync: iAsync; const aTimeoutMs: Cardinal);
     procedure UpdateGui;
+    procedure ApplyProportionalColumnWidths;
+    function ColumnLayoutAvailableWidth: Integer;
+    function ControlLayoutWidth(const aControl: TControl): Integer;
     procedure CloseSelectedWindow(const aListBox: TListBox);
     procedure CreateWindowActionsPopupMenu;
     function GetPopupSourceListBox: TListBox;
@@ -238,8 +242,17 @@ const
   cPrefixMaskFileName = 'PrefixMask.txt';
   cSettingsFileName = 'settings.ini';
   cRestoreItemIndexSelfTestArg = '--self-test-restore-item-index';
+  cResizeColumnWidthsSelfTestArg = '--self-test-resize-column-widths';
   cWarmupPrefetchSelfTestArg = '--self-test-startup-warmup-prefetch';
   cWarmupShutdownCheckSelfTestArg = '--self-test-startup-warmup-shutdown-check';
+  cAppsColumnDesignWidth = 506;
+  cExplorerColumnDesignWidth = 500;
+  cScriptsColumnDesignWidth = 403;
+  cConsoleColumnDesignWidth = 350;
+  cDesktopColumnDesignWidth = 350;
+  cShortCutsColumnDesignWidth = 350;
+  cTotalDesignColumnWidth = cAppsColumnDesignWidth + cExplorerColumnDesignWidth + cScriptsColumnDesignWidth +
+    cConsoleColumnDesignWidth + cDesktopColumnDesignWidth + cShortCutsColumnDesignWidth;
   cIgnoreF4AfterFocusMs = 200;
   cShutdownTaskWaitTimeoutMs = 25;
   cWindowActionVerifyDelayMs = 350;
@@ -251,6 +264,59 @@ resourcestring
   rsWindowActionClose = 'Close';
   rsWindowActionTerminate = 'Terminate';
   rsShortCutTargetMissing = 'ShortCut target not found: %s';
+
+function ScaleProportionalColumnWidth(const aTotalWidth: Integer; const aDesignWidth: Integer): Integer;
+begin
+  Result := Integer((Int64(aTotalWidth) * aDesignWidth) div cTotalDesignColumnWidth);
+end;
+
+procedure CalculateProportionalColumnWidths(const aTotalWidth: Integer; out aAppsWidth: Integer;
+  out aExplorerWidth: Integer; out aScriptsWidth: Integer; out aConsoleWidth: Integer;
+  out aDesktopWidth: Integer; out aShortCutsWidth: Integer);
+var
+  lConsumedDesignWidth: Integer;
+  lConsumedWidth: Integer;
+  lNextWidth: Integer;
+begin
+  if aTotalWidth <= 0 then
+  begin
+    aAppsWidth := 0;
+    aExplorerWidth := 0;
+    aScriptsWidth := 0;
+    aConsoleWidth := 0;
+    aDesktopWidth := 0;
+    aShortCutsWidth := 0;
+    Exit;
+  end;
+
+  lConsumedWidth := 0;
+  lConsumedDesignWidth := cAppsColumnDesignWidth;
+  lNextWidth := ScaleProportionalColumnWidth(aTotalWidth, lConsumedDesignWidth);
+  aAppsWidth := lNextWidth - lConsumedWidth;
+  lConsumedWidth := lNextWidth;
+
+  Inc(lConsumedDesignWidth, cExplorerColumnDesignWidth);
+  lNextWidth := ScaleProportionalColumnWidth(aTotalWidth, lConsumedDesignWidth);
+  aExplorerWidth := lNextWidth - lConsumedWidth;
+  lConsumedWidth := lNextWidth;
+
+  Inc(lConsumedDesignWidth, cScriptsColumnDesignWidth);
+  lNextWidth := ScaleProportionalColumnWidth(aTotalWidth, lConsumedDesignWidth);
+  aScriptsWidth := lNextWidth - lConsumedWidth;
+  lConsumedWidth := lNextWidth;
+
+  Inc(lConsumedDesignWidth, cConsoleColumnDesignWidth);
+  lNextWidth := ScaleProportionalColumnWidth(aTotalWidth, lConsumedDesignWidth);
+  aConsoleWidth := lNextWidth - lConsumedWidth;
+  lConsumedWidth := lNextWidth;
+
+  Inc(lConsumedDesignWidth, cDesktopColumnDesignWidth);
+  lNextWidth := ScaleProportionalColumnWidth(aTotalWidth, lConsumedDesignWidth);
+  aDesktopWidth := lNextWidth - lConsumedWidth;
+  lConsumedWidth := lNextWidth;
+
+  aShortCutsWidth := aTotalWidth - lConsumedWidth;
+end;
 
 function FindSortedCaptionIndex(const aItems: TStrings; const aOldItemCaption: string): Integer;
 var
@@ -1356,6 +1422,40 @@ begin
     QueueGuiRefresh;
 end;
 
+procedure TAppsViewMainFrm.ApplyProportionalColumnWidths;
+var
+  lAppsWidth: Integer;
+  lConsoleWidth: Integer;
+  lDesktopWidth: Integer;
+  lExplorerWidth: Integer;
+  lScriptsWidth: Integer;
+  lShortCutsWidth: Integer;
+begin
+  CalculateProportionalColumnWidths(ColumnLayoutAvailableWidth, lAppsWidth, lExplorerWidth, lScriptsWidth,
+    lConsoleWidth, lDesktopWidth, lShortCutsWidth);
+  pnlApps.Width := lAppsWidth;
+  pnlExplorer.Width := lExplorerWidth;
+  pnlScripts.Width := lScriptsWidth;
+  pnlConsole.Width := lConsoleWidth;
+  pnlDesktop.Width := lDesktopWidth;
+  pnlShortCuts.Width := lShortCutsWidth;
+end;
+
+function TAppsViewMainFrm.ColumnLayoutAvailableWidth: Integer;
+begin
+  Result := ClientWidth - ControlLayoutWidth(Splitter1) - ControlLayoutWidth(Splitter3) -
+    ControlLayoutWidth(Splitter4) - ControlLayoutWidth(Splitter5) - ControlLayoutWidth(Splitter6);
+  if Result < 0 then
+    Result := 0;
+end;
+
+function TAppsViewMainFrm.ControlLayoutWidth(const aControl: TControl): Integer;
+begin
+  Result := aControl.Width;
+  if aControl.AlignWithMargins then
+    Inc(Result, aControl.Margins.Left + aControl.Margins.Right);
+end;
+
 procedure TAppsViewMainFrm.FormCreate(Sender: TObject);
 var
   lIniFile: TMemIniFile;
@@ -1385,6 +1485,7 @@ begin
   labDesktopTitle.Height := labTemplateActiv.Height;
   labShortCutsTitle.Height := labTemplateActiv.Height;
   ActiveControlChanged(nil);
+  ApplyProportionalColumnWidths;
   fOrgAppOnActivate := application.OnActivate;
   application.OnActivate := AppOnActivate;
 
@@ -1476,12 +1577,18 @@ begin
     lbShortCuts.SetFocus
 end;
 
+procedure TAppsViewMainFrm.FormResize(Sender: TObject);
+begin
+  ApplyProportionalColumnWidths;
+end;
+
 procedure TAppsViewMainFrm.FormShow(Sender: TObject);
 begin
   if IsShuttingDown then
     Exit;
 
   LogStartupTiming('FormShow');
+  ApplyProportionalColumnWidths;
   StartAuxListsRefresh;
   StartStartupDataLoad;
   QueueGuiRefresh;
@@ -1803,11 +1910,32 @@ end;
 function RunMainFormSelfTests(const aArg: string): Integer;
 var
   lApps: TArray<TAppInfo>;
+  lAppsWidth: Integer;
   lCancelToken: iCancelToken;
+  lConsoleWidth: Integer;
+  lDesktopWidth: Integer;
+  lExplorerWidth: Integer;
   lItems: TStringList;
   lResultIndex: Integer;
+  lScriptsWidth: Integer;
+  lShortCutsWidth: Integer;
 begin
   Result := -1;
+  if SameText(aArg, cResizeColumnWidthsSelfTestArg) then
+  begin
+    Result := 0;
+    CalculateProportionalColumnWidths(1230, lAppsWidth, lExplorerWidth, lScriptsWidth, lConsoleWidth,
+      lDesktopWidth, lShortCutsWidth);
+    if (lAppsWidth <> 253) or (lExplorerWidth <> 250) or (lScriptsWidth <> 201) or
+      (lConsoleWidth <> 175) or (lDesktopWidth <> 175) or (lShortCutsWidth <> 176) then
+    begin
+      Writeln(Format('SELFTEST FAILED: resize column widths expected=253,250,201,175,175,176 actual=%d,%d,%d,%d,%d,%d',
+        [lAppsWidth, lExplorerWidth, lScriptsWidth, lConsoleWidth, lDesktopWidth, lShortCutsWidth]));
+      Result := 1;
+    end;
+    Exit;
+  end;
+
   if SameText(aArg, cRestoreItemIndexSelfTestArg) then
   begin
     Result := 0;

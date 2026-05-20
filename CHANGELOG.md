@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Main form columns now resize proportionally to the form width, preserving the design-time column ratios on smaller screens.
 - Desktop and shortcut activation now runs through an isolated helper process, so third-party shell extension crashes during item launch no longer terminate `ActiveAppView.exe`.
 
 ### Added

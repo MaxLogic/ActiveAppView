@@ -17,6 +17,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
   OnCreate = FormCreate
   OnDestroy = FormDestroy
   OnKeyUp = FormKeyUp
+  OnResize = FormResize
   OnShow = FormShow
   TextHeight = 21
   object Splitter1: TSplitter
