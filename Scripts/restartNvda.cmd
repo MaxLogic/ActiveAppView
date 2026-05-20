@@ -1,9 +1,10 @@
 @echo off
 
+set "NVDA_EXE=C:\Program Files\NVDA\nvda.exe"
 
 :: Reload NVDA (To clear its internal event queue)
 :: We use -r to tell NVDA to restart itself gracefully if running
-start "" "C:\Program Files (x86)\NVDA\nvda.exe" -r
+if exist "%NVDA_EXE%" start "" "%NVDA_EXE%" -r
 
 taskkill /IM DelphiLSP.exe /F
 taskkill /IM xMouse.exe /F

@@ -1,11 +1,14 @@
 @echo off
 setlocal ENABLEDELAYEDEXPANSION
 
+set "NVDA_EXE=C:\Program Files\NVDA\nvda.exe"
+set "LOGI_OPTIONS_PLUS_EXE=C:\Program Files\LogiOptionsPlus\logioptionsplus.exe"
+
 :: --- Fast quiet kill helper
 for %%P in (
   xMouse.exe
-  nvda_slave.exe nvda.exe
-  LogiOverlay.exe LogiOptionsMgr.exe LogiOptions.exe
+  nvda.exe nvda_slave.exe nvda_synthDriverHost.exe nvdaHelperRemoteLoader.exe
+  logioptionsplus.exe logioptionsplus_agent.exe logioptionsplus_appbroker.exe logioptionsplus_updater.exe
   magnify.exe
   SearchHost.exe SearchUI.exe
   StartMenuExperienceHost.exe
@@ -15,7 +18,7 @@ for %%P in (
   taskkill /f /im %%P >nul 2>&1
 )
 
-:: --- Restart shell quickly 
+:: --- Restart shell quickly
 taskkill /f /im explorer.exe >nul 2>&1
 timeout /t 1 /nobreak >nul
 start "" "%SystemRoot%\explorer.exe"
@@ -32,16 +35,12 @@ net start TabletInputService >nul
 :: /fullscreen  OR  /lens  OR  /docked
 start "" "%SystemRoot%\System32\magnify.exe" /fullscreen
 
-:: --- Restart Logitech Options (classic) if installed
-if exist "C:\Program Files\Logitech\LogiOptions\LogiOptions.exe" (
-  REM start "" "C:\Program Files\Logitech\LogiOptions\LogiOptions.exe"
-)
-:: --- Logitech Options+ (not classic) ---
-for %%P in (logioptionsplus_appbroker.exe logioptionsplus_agent.exe logioptionsplus_updater.exe LogiOverlay.exe logioptionsplus.exe) do (
+:: --- Logitech Options+ ---
+for %%P in (logioptionsplus_appbroker.exe logioptionsplus_agent.exe logioptionsplus_updater.exe logioptionsplus.exe) do (
   taskkill /f /im %%P >nul 2>&1
 )
 :: Relaunch Options+ GUI (agent spawns the rest)
-start "" "C:\Program Files\LogiOptionsPlus\logioptionsplus.exe"
+if exist "%LOGI_OPTIONS_PLUS_EXE%" start "" "%LOGI_OPTIONS_PLUS_EXE%"
 
 :: --- ASUS Armoury Crate user-session bits (leave the service unless needed) ---
 for %%P in (ArmouryCrate.UserSessionHelper.exe ArmourySocketServer.exe) do (
@@ -61,9 +60,9 @@ REM net start NahimicService  >nul 2>&1
 start "" "D:\Projects\MouseBeam\xMouse.exe"
 
 :: --- Restart NVDA last (single clean re-launch)
-start "" "C:\Program Files (x86)\NVDA\nvda.exe" -r
+if exist "%NVDA_EXE%" start "" "%NVDA_EXE%" -r
 
-:: --- Optional: Audio service refresh 
+:: --- Optional: Audio service refresh
 net stop audiosrv /y >nul
 net start audiosrv     >nul
 

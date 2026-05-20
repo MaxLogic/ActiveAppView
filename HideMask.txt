@@ -13,7 +13,7 @@ Menedżer zadań
 Lupa
 ShadowForm
 C:\Program Files\ShurePlus MOTIV\ShurePlus MOTIV.exe
-C:\ProgramData\Logishrd\LogiOptions\Software\Current\LogiOverlay.exe
+C:\Program Files\LogiOptionsPlus\logioptionsplus.exe
 Host środowiska powłoki systemu Windows
 C:\Windows\SystemApps\*\ShellExperienceHost.exe
 IpPbxContactCard
