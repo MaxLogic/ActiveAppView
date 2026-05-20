@@ -39,6 +39,20 @@ const
 type
   TLaunchMode = (lmMissing, lmDirectory, lmExecutable, lmShellFallback);
 
+function ShellFallbackLaunchMode(
+  const aPath: string;
+  const aParams: string;
+  const aWorkingDirectory: string;
+  out aLaunchPath: string;
+  out aLaunchParams: string;
+  out aLaunchWorkingDirectory: string): TLaunchMode;
+begin
+  aLaunchPath := aPath;
+  aLaunchParams := aParams;
+  aLaunchWorkingDirectory := aWorkingDirectory;
+  Result := TLaunchMode.lmShellFallback;
+end;
+
 function QuoteCommandLineArgument(const aValue: string): string;
 var
   lBuilder: TStringBuilder;
@@ -141,9 +155,7 @@ begin
 
   if StartsText('\\', aPath) then
   begin
-    aLaunchPath := aPath;
-    aLaunchParams := aParams;
-    Exit(TLaunchMode.lmShellFallback);
+    Exit(ShellFallbackLaunchMode(aPath, aParams, '', aLaunchPath, aLaunchParams, aWorkingDirectory));
   end;
 
   if not FileExists(aPath) then
@@ -152,27 +164,27 @@ begin
   lExtension := TPath.GetExtension(aPath);
   if SameText(lExtension, '.lnk') then
   begin
-    lShellLink := CreateComObject(CLSID_ShellLink) as IShellLinkW;
-    lPersistFile := lShellLink as IPersistFile;
-    OleCheck(lPersistFile.Load(PWideChar(WideString(aPath)), STGM_READ));
+    try
+      lShellLink := CreateComObject(CLSID_ShellLink) as IShellLinkW;
+      lPersistFile := lShellLink as IPersistFile;
+      OleCheck(lPersistFile.Load(PWideChar(WideString(aPath)), STGM_READ));
 
-    FillChar(lPathBuffer, SizeOf(lPathBuffer), 0);
-    FillChar(lArgumentsBuffer, SizeOf(lArgumentsBuffer), 0);
-    FillChar(lWorkingDirectoryBuffer, SizeOf(lWorkingDirectoryBuffer), 0);
-    lFindData := Default(TWin32FindDataW);
-    lShellLink.GetPath(@lPathBuffer[0], Length(lPathBuffer), lFindData, SLGP_UNCPRIORITY);
-    lShellLink.GetArguments(@lArgumentsBuffer[0], Length(lArgumentsBuffer));
-    lShellLink.GetWorkingDirectory(@lWorkingDirectoryBuffer[0], Length(lWorkingDirectoryBuffer));
+      FillChar(lPathBuffer, SizeOf(lPathBuffer), 0);
+      FillChar(lArgumentsBuffer, SizeOf(lArgumentsBuffer), 0);
+      FillChar(lWorkingDirectoryBuffer, SizeOf(lWorkingDirectoryBuffer), 0);
+      lFindData := Default(TWin32FindDataW);
+      OleCheck(lShellLink.GetPath(@lPathBuffer[0], Length(lPathBuffer), lFindData, SLGP_UNCPRIORITY));
+      OleCheck(lShellLink.GetArguments(@lArgumentsBuffer[0], Length(lArgumentsBuffer)));
+      OleCheck(lShellLink.GetWorkingDirectory(@lWorkingDirectoryBuffer[0], Length(lWorkingDirectoryBuffer)));
+    except
+      Exit(ShellFallbackLaunchMode(aPath, aParams, ExtractFileDir(aPath), aLaunchPath, aLaunchParams, aWorkingDirectory));
+    end;
 
     lResolvedPath := PChar(@lPathBuffer[0]);
     lResolvedArguments := PChar(@lArgumentsBuffer[0]);
     aWorkingDirectory := PChar(@lWorkingDirectoryBuffer[0]);
     if lResolvedPath = '' then
-    begin
-      aLaunchPath := aPath;
-      aLaunchParams := aParams;
-      Exit(TLaunchMode.lmShellFallback);
-    end;
+      Exit(ShellFallbackLaunchMode(aPath, aParams, ExtractFileDir(aPath), aLaunchPath, aLaunchParams, aWorkingDirectory));
 
     if aParams <> '' then
       aLaunchParams := aParams
@@ -193,7 +205,7 @@ begin
     end;
 
     if not FileExists(lResolvedPath) then
-      Exit(TLaunchMode.lmMissing);
+      Exit(ShellFallbackLaunchMode(aPath, aParams, ExtractFileDir(aPath), aLaunchPath, aLaunchParams, aWorkingDirectory));
 
     aLaunchPath := lResolvedPath;
     if aWorkingDirectory = '' then
@@ -606,6 +618,7 @@ var
   lExeShortcutFileName: string;
   lLaunchMode: TLaunchMode;
   lMissingFileName: string;
+  lMissingShortcutFileName: string;
   lRootDir: string;
 begin
   Result := 0;
@@ -624,11 +637,13 @@ begin
   lDocShortcutFileName := TPath.Combine(lRootDir, 'doc-shortcut.lnk');
   lExeShortcutFileName := TPath.Combine(lRootDir, 'exe-shortcut.lnk');
   lMissingFileName := TPath.Combine(lRootDir, 'missing.exe');
+  lMissingShortcutFileName := TPath.Combine(lRootDir, 'missing-shortcut.lnk');
 
   ForceDirectories(lDir);
   TFile.WriteAllText(lDocFileName, 'stub', TEncoding.ASCII);
   CreateShortcutFile(lExeShortcutFileName, lComSpec, '/c exit 0', ExtractFileDir(lComSpec));
   CreateShortcutFile(lDocShortcutFileName, lDocFileName, '', ExtractFileDir(lDocFileName));
+  CreateShortcutFile(lMissingShortcutFileName, lMissingFileName, '', ExtractFileDir(lMissingFileName));
   try
     lLaunchMode := DetermineLaunchModeForSelfTest(lDir, '');
     if lLaunchMode <> TLaunchMode.lmDirectory then
@@ -669,6 +684,13 @@ begin
     if lLaunchMode <> TLaunchMode.lmMissing then
     begin
       Writeln(Format('SELFTEST FAILED: missing classification expected=%s actual=%s', ['missing', 'other']));
+      Exit(1);
+    end;
+
+    lLaunchMode := DetermineLaunchModeForSelfTest(lMissingShortcutFileName, '');
+    if lLaunchMode <> TLaunchMode.lmShellFallback then
+    begin
+      Writeln(Format('SELFTEST FAILED: missing shortcut classification expected=%s actual=%s', ['shell-fallback', 'other']));
       Exit(1);
     end;
 
