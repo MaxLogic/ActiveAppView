@@ -821,14 +821,14 @@ class function TChatMonitor.IsUnreadCounterDigit(aChar: Char; out aIsNonZeroDigi
 var
   lNumericValue: Double;
 begin
-  Result := TCharacter.IsDigit(aChar);
+  Result := aChar.IsDigit;
   if not Result then
   begin
     aIsNonZeroDigit := False;
     Exit;
   end;
 
-  lNumericValue := TCharacter.GetNumericValue(aChar);
+  lNumericValue := aChar.GetNumericValue;
   aIsNonZeroDigit := (lNumericValue > 0);
 end;
 

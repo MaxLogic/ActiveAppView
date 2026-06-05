@@ -11,6 +11,7 @@ All notable changes to this project are documented in this file.
 ### Added
 - Chat monitor now supports a PrefixMask-style review filter file (`ChatReviewMask.txt`), configured by `[ChatMonitor] ReviewMaskFile` in `settings.ini`.
 - Main form now includes a `Play chat notification sounds` checkbox that toggles chat sounds at runtime and persists to `[ChatMonitor] SoundEnabled`.
+- Applications and Console instances now support temporary per-window caption overrides via context-menu Rename, with dialog Reset restoring the live window title while preserving the normal filename/path display and preventing Enter-confirm from activating the selected window.
 
 ### Changed
 - Applications and Explorer lists now support window actions via context menu (`Close`, `Terminate`) and `Ctrl+W` on focused list items for normal close.
