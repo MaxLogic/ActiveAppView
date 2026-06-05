@@ -127,7 +127,11 @@ type
     fStartupProfileWarmupDoneLogged: Integer;
     fWindowActionsPopupMenu: TPopupMenu;
     fCloseWindowMenuItem: TMenuItem;
+    fRenameWindowMenuItem: TMenuItem;
     fTerminateWindowMenuItem: TMenuItem;
+    fWindowCaptionOverrides: TDictionary<string, string>;
+    fSuppressNextReturnListBox: TListBox;
+    fSuppressNextReturnUntilTick: UInt64;
     fShutdownToken: iCancelToken;
     fShuttingDown: Integer;
     procedure AppOnActivate(Sender: TObject);
@@ -167,7 +171,13 @@ type
     procedure CloseSelectedWindow(const aListBox: TListBox);
     procedure CreateWindowActionsPopupMenu;
     function GetPopupSourceListBox: TListBox;
+    function GetSelectedWindowInfo(const aListBox: TListBox; out aWnd: hWnd;
+      out aProcessId: Cardinal): Boolean;
+    function IsCaptionOverrideListBox(const aListBox: TListBox): Boolean;
     function IsProcessActive(const aProcessId: Cardinal): Boolean;
+    procedure RestoreFocusAfterWindowCaptionDialog(const aListBox: TListBox);
+    function ShouldConsumeSuppressedReturnKey(const aSender: TObject; const aKey: Word): Boolean;
+    procedure SuppressNextReturnKey(const aListBox: TListBox);
     procedure QuickValidateListBoxProcesses(const aListBox: TListBox);
     procedure QuickValidateProcessesOnRefocus;
     procedure RemoveWindowFromListBox(const aListBox: TListBox; const aWnd: hWnd);
@@ -178,6 +188,7 @@ type
     procedure TerminateSelectedWindow(const aListBox: TListBox);
     procedure WindowActionsPopupMenuPopup(aSender: TObject);
     procedure WindowCloseMenuItemClick(aSender: TObject);
+    procedure WindowRenameMenuItemClick(aSender: TObject);
     procedure WindowTerminateMenuItemClick(aSender: TObject);
 
     procedure BringToFrontFocusedApp(lb: TListBox);
@@ -243,6 +254,7 @@ const
   cSettingsFileName = 'settings.ini';
   cRestoreItemIndexSelfTestArg = '--self-test-restore-item-index';
   cResizeColumnWidthsSelfTestArg = '--self-test-resize-column-widths';
+  cWindowCaptionOverridesSelfTestArg = '--self-test-window-caption-overrides';
   cWarmupPrefetchSelfTestArg = '--self-test-startup-warmup-prefetch';
   cWarmupShutdownCheckSelfTestArg = '--self-test-startup-warmup-shutdown-check';
   cAppsColumnDesignWidth = 506;
@@ -258,12 +270,134 @@ const
   cWindowActionVerifyDelayMs = 350;
   cWindowActionVerifyDelayStepMs = 150;
   cWindowActionVerifyMaxDurationMs = 5000;
+  cSuppressReturnKeyAfterDialogMs = 1000;
 
 resourcestring
+  rsDialogCancel = 'Cancel';
+  rsDialogOk = 'OK';
   rsLaunchFailed = 'Failed to launch item: %s';
   rsWindowActionClose = 'Close';
+  rsWindowActionRename = 'Rename';
+  rsWindowActionReset = 'Reset';
   rsWindowActionTerminate = 'Terminate';
+  rsWindowRenamePrompt = 'New caption';
   rsShortCutTargetMissing = 'ShortCut target not found: %s';
+
+type
+  TCaptionOverrideDialogResult = (codCancel, codRename, codReset);
+
+function BuildWindowCaptionOverrideKey(const aWnd: hWnd; const aProcessId: Cardinal): string;
+begin
+  Result := UIntToStr(aProcessId) + ':' + UIntToStr(NativeUInt(aWnd));
+end;
+
+function HasWindowCaptionOverride(const aOverrides: TDictionary<string, string>;
+  const aWnd: hWnd; const aProcessId: Cardinal): Boolean;
+var
+  lCaption: string;
+begin
+  Result := Assigned(aOverrides)
+    and aOverrides.TryGetValue(BuildWindowCaptionOverrideKey(aWnd, aProcessId), lCaption);
+end;
+
+function ApplyWindowCaptionOverride(const aOverrides: TDictionary<string, string>;
+  const aWnd: hWnd; const aProcessId: Cardinal; const aCaption: string): string;
+var
+  lCaption: string;
+begin
+  Result := aCaption;
+  if Assigned(aOverrides) then
+    if aOverrides.TryGetValue(BuildWindowCaptionOverrideKey(aWnd, aProcessId), lCaption) then
+      Result := lCaption;
+end;
+
+function BuildWindowDisplayCaption(const aCaption: string; const aFileName: string): string;
+begin
+  if (aCaption <> '') and (aFileName <> '') then
+    Result := aCaption + ' | ' + ExtractFileName(aFileName) + ' (' + aFileName + ')'
+  else
+    Result := aCaption;
+end;
+
+function ExecuteCaptionOverrideDialog(aOwner: TComponent; const aCaption: string;
+  out aNewCaption: string): TCaptionOverrideDialogResult;
+var
+  lButtonTop: Integer;
+  lCancelButton: TButton;
+  lDialog: TForm;
+  lEdit: TEdit;
+  lLabel: TLabel;
+  lOkButton: TButton;
+  lResetButton: TButton;
+begin
+  Result := codCancel;
+  aNewCaption := aCaption;
+
+  lDialog := TForm.CreateNew(aOwner);
+  try
+    lDialog.BorderStyle := bsDialog;
+    lDialog.Caption := rsWindowActionRename;
+    lDialog.ClientHeight := 118;
+    lDialog.ClientWidth := 420;
+    lDialog.Position := poOwnerFormCenter;
+
+    lLabel := TLabel.Create(lDialog);
+    lLabel.Parent := lDialog;
+    lLabel.Left := 12;
+    lLabel.Top := 12;
+    lLabel.Caption := rsWindowRenamePrompt;
+
+    lEdit := TEdit.Create(lDialog);
+    lEdit.Parent := lDialog;
+    lEdit.Left := 12;
+    lEdit.Top := 32;
+    lEdit.Width := lDialog.ClientWidth - 24;
+    lEdit.Text := aCaption;
+    lEdit.SelectAll;
+
+    lButtonTop := 78;
+
+    lOkButton := TButton.Create(lDialog);
+    lOkButton.Parent := lDialog;
+    lOkButton.Left := lDialog.ClientWidth - 252;
+    lOkButton.Top := lButtonTop;
+    lOkButton.Width := 75;
+    lOkButton.Caption := rsDialogOk;
+    lOkButton.Default := True;
+    lOkButton.ModalResult := mrOk;
+
+    lResetButton := TButton.Create(lDialog);
+    lResetButton.Parent := lDialog;
+    lResetButton.Left := lDialog.ClientWidth - 171;
+    lResetButton.Top := lButtonTop;
+    lResetButton.Width := 75;
+    lResetButton.Caption := rsWindowActionReset;
+    lResetButton.ModalResult := mrRetry;
+
+    lCancelButton := TButton.Create(lDialog);
+    lCancelButton.Parent := lDialog;
+    lCancelButton.Left := lDialog.ClientWidth - 90;
+    lCancelButton.Top := lButtonTop;
+    lCancelButton.Width := 75;
+    lCancelButton.Cancel := True;
+    lCancelButton.Caption := rsDialogCancel;
+    lCancelButton.ModalResult := mrCancel;
+
+    lDialog.ActiveControl := lEdit;
+    case lDialog.ShowModal of
+      mrOk:
+      begin
+        aNewCaption := Trim(lEdit.Text);
+        if aNewCaption <> '' then
+          Result := codRename;
+      end;
+      mrRetry:
+        Result := codReset;
+    end;
+  finally
+    lDialog.Free;
+  end;
+end;
 
 function ScaleProportionalColumnWidth(const aTotalWidth: Integer; const aDesignWidth: Integer): Integer;
 begin
@@ -461,6 +595,11 @@ begin
   fWindowActionsPopupMenu := TPopupMenu.Create(Self);
   fWindowActionsPopupMenu.OnPopup := WindowActionsPopupMenuPopup;
 
+  fRenameWindowMenuItem := TMenuItem.Create(fWindowActionsPopupMenu);
+  fRenameWindowMenuItem.Caption := rsWindowActionRename;
+  fRenameWindowMenuItem.OnClick := WindowRenameMenuItemClick;
+  fWindowActionsPopupMenu.Items.Add(fRenameWindowMenuItem);
+
   fCloseWindowMenuItem := TMenuItem.Create(fWindowActionsPopupMenu);
   fCloseWindowMenuItem.Caption := rsWindowActionClose;
   fCloseWindowMenuItem.OnClick := WindowCloseMenuItemClick;
@@ -473,6 +612,7 @@ begin
 
   lbApps.PopupMenu := fWindowActionsPopupMenu;
   lbExplorer.PopupMenu := fWindowActionsPopupMenu;
+  lbConsole.PopupMenu := fWindowActionsPopupMenu;
 end;
 
 function TAppsViewMainFrm.GetPopupSourceListBox: TListBox;
@@ -481,8 +621,67 @@ begin
   if Assigned(fWindowActionsPopupMenu) and (fWindowActionsPopupMenu.PopupComponent is TListBox) then
     Result := TListBox(fWindowActionsPopupMenu.PopupComponent);
 
-  if (Result <> lbApps) and (Result <> lbExplorer) then
+  if (Result <> lbApps) and (Result <> lbExplorer) and (Result <> lbConsole) then
     Result := nil;
+end;
+
+function TAppsViewMainFrm.GetSelectedWindowInfo(const aListBox: TListBox; out aWnd: hWnd;
+  out aProcessId: Cardinal): Boolean;
+begin
+  aWnd := 0;
+  aProcessId := 0;
+  Result := False;
+  if not Assigned(aListBox) then
+    Exit;
+
+  aWnd := GetWnd(aListBox);
+  if aWnd = 0 then
+    Exit;
+
+  GetWindowThreadProcessId(aWnd, aProcessId);
+  Result := aProcessId <> 0;
+end;
+
+function TAppsViewMainFrm.IsCaptionOverrideListBox(const aListBox: TListBox): Boolean;
+begin
+  Result := (aListBox = lbApps) or (aListBox = lbConsole);
+end;
+
+procedure TAppsViewMainFrm.RestoreFocusAfterWindowCaptionDialog(const aListBox: TListBox);
+begin
+  if IsShuttingDown then
+    Exit;
+
+  ShowWindow(Handle, SW_SHOWNORMAL);
+  BringToFront;
+  SetForegroundWindow(Handle);
+  if Assigned(aListBox) and aListBox.CanFocus then
+    aListBox.SetFocus;
+end;
+
+function TAppsViewMainFrm.ShouldConsumeSuppressedReturnKey(const aSender: TObject; const aKey: Word): Boolean;
+begin
+  Result := False;
+  if aKey <> VK_RETURN then
+    Exit;
+
+  if (aSender <> fSuppressNextReturnListBox)
+    or (GetTickCount64 > fSuppressNextReturnUntilTick) then
+  begin
+    fSuppressNextReturnListBox := nil;
+    fSuppressNextReturnUntilTick := 0;
+    Exit;
+  end;
+
+  fSuppressNextReturnListBox := nil;
+  fSuppressNextReturnUntilTick := 0;
+  Result := True;
+end;
+
+procedure TAppsViewMainFrm.SuppressNextReturnKey(const aListBox: TListBox);
+begin
+  fSuppressNextReturnListBox := aListBox;
+  fSuppressNextReturnUntilTick := GetTickCount64 + cSuppressReturnKeyAfterDialogMs;
 end;
 
 function TAppsViewMainFrm.IsProcessActive(const aProcessId: Cardinal): Boolean;
@@ -698,21 +897,73 @@ end;
 
 procedure TAppsViewMainFrm.WindowActionsPopupMenuPopup(aSender: TObject);
 var
+  lCanCaptionOverride: Boolean;
+  lCanWindowAction: Boolean;
   lHasWindow: Boolean;
   lListBox: TListBox;
+  lProcessId: Cardinal;
+  lWnd: hWnd;
 begin
   lListBox := GetPopupSourceListBox;
   lHasWindow := Assigned(lListBox) and (GetWnd(lListBox) <> 0);
+  lWnd := 0;
+  lProcessId := 0;
+  lCanCaptionOverride := False;
+  if lHasWindow and IsCaptionOverrideListBox(lListBox) then
+    lCanCaptionOverride := GetSelectedWindowInfo(lListBox, lWnd, lProcessId);
+  lCanWindowAction := lHasWindow and ((lListBox = lbApps) or (lListBox = lbExplorer));
 
   if Assigned(fCloseWindowMenuItem) then
-    fCloseWindowMenuItem.Enabled := lHasWindow;
+    fCloseWindowMenuItem.Enabled := lCanWindowAction;
+  if Assigned(fRenameWindowMenuItem) then
+    fRenameWindowMenuItem.Enabled := lCanCaptionOverride;
   if Assigned(fTerminateWindowMenuItem) then
-    fTerminateWindowMenuItem.Enabled := lHasWindow;
+    fTerminateWindowMenuItem.Enabled := lCanWindowAction;
 end;
 
 procedure TAppsViewMainFrm.WindowCloseMenuItemClick(aSender: TObject);
 begin
   CloseSelectedWindow(GetPopupSourceListBox);
+end;
+
+procedure TAppsViewMainFrm.WindowRenameMenuItemClick(aSender: TObject);
+var
+  lCaption: string;
+  lDialogResult: TCaptionOverrideDialogResult;
+  lKey: string;
+  lListBox: TListBox;
+  lProcessId: Cardinal;
+  lWnd: hWnd;
+begin
+  lListBox := GetPopupSourceListBox;
+  if not IsCaptionOverrideListBox(lListBox) then
+    Exit;
+  if not GetSelectedWindowInfo(lListBox, lWnd, lProcessId) then
+    Exit;
+
+  lCaption := srDesktop.GetWinCaption(lWnd);
+  lCaption := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lWnd, lProcessId, lCaption);
+  lDialogResult := codCancel;
+  try
+    lDialogResult := ExecuteCaptionOverrideDialog(Self, lCaption, lCaption);
+    lKey := BuildWindowCaptionOverrideKey(lWnd, lProcessId);
+    case lDialogResult of
+      codRename:
+      begin
+        fWindowCaptionOverrides.AddOrSetValue(lKey, lCaption);
+        QueueGuiRefresh;
+      end;
+      codReset:
+      begin
+        fWindowCaptionOverrides.Remove(lKey);
+        QueueGuiRefresh;
+      end;
+    end;
+  finally
+    if lDialogResult <> codCancel then
+      SuppressNextReturnKey(lListBox);
+    RestoreFocusAfterWindowCaptionDialog(lListBox);
+  end;
 end;
 
 procedure TAppsViewMainFrm.WindowTerminateMenuItemClick(aSender: TObject);
@@ -1475,6 +1726,9 @@ begin
 
   fApps := TAppList.Create;
   fConfigCache := TConfigCache.Create(GetInstallDir);
+  fWindowCaptionOverrides := TDictionary<string, string>.Create;
+  fSuppressNextReturnListBox := nil;
+  fSuppressNextReturnUntilTick := 0;
   CreateWindowActionsPopupMenu;
   AddToAutoStart;
   Screen.OnActiveControlChange := ActiveControlChanged;
@@ -1545,6 +1799,7 @@ begin
   ClearListBoxItemData(lbShortCuts);
   FreeAndNil(fChatMonitor);
   FreeAndNil(fConfigCache);
+  FreeAndNil(fWindowCaptionOverrides);
   fApps.Free;
   LogStartupTiming('FormDestroy.Flush');
   FlushStartupProfileLog;
@@ -1616,6 +1871,12 @@ end;
 procedure TAppsViewMainFrm.lbAppsKeyUp(Sender: TObject; var Key: Word;
   Shift: TShiftState);
 begin
+  if ShouldConsumeSuppressedReturnKey(Sender, Key) then
+  begin
+    Key := 0;
+    Exit;
+  end;
+
   if Key = VK_RETURN then
     BringToFrontFocusedApp(Sender as TListBox)
   else if (Key = Ord('W')) and (ssCtrl in Shift) and ((Sender = lbApps) or (Sender = lbExplorer)) then
@@ -1916,6 +2177,8 @@ var
   lDesktopWidth: Integer;
   lExplorerWidth: Integer;
   lItems: TStringList;
+  lOverrideKey: string;
+  lOverrides: TDictionary<string, string>;
   lResultIndex: Integer;
   lScriptsWidth: Integer;
   lShortCutsWidth: Integer;
@@ -1952,6 +2215,47 @@ begin
       end;
     finally
       lItems.Free;
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cWindowCaptionOverridesSelfTestArg) then
+  begin
+    Result := 0;
+    lOverrides := TDictionary<string, string>.Create;
+    try
+      lOverrideKey := BuildWindowCaptionOverrideKey(hWnd(100), 200);
+      lOverrides.Add(lOverrideKey, 'Custom caption');
+      if BuildWindowDisplayCaption(
+        ApplyWindowCaptionOverride(lOverrides, hWnd(100), 200, 'Normal caption'),
+        'C:\Tools\cmd.exe') <> 'Custom caption | cmd.exe (C:\Tools\cmd.exe)' then
+      begin
+        Writeln('SELFTEST FAILED: window caption override did not preserve display suffix');
+        Result := 1;
+      end;
+      if ApplyWindowCaptionOverride(lOverrides, hWnd(101), 200, 'Normal caption') <> 'Normal caption' then
+      begin
+        Writeln('SELFTEST FAILED: window caption override ignored HWND boundary');
+        Result := 1;
+      end;
+      if ApplyWindowCaptionOverride(lOverrides, hWnd(100), 201, 'Normal caption') <> 'Normal caption' then
+      begin
+        Writeln('SELFTEST FAILED: window caption override ignored PID boundary');
+        Result := 1;
+      end;
+      if not HasWindowCaptionOverride(lOverrides, hWnd(100), 200) then
+      begin
+        Writeln('SELFTEST FAILED: window caption override was not reported');
+        Result := 1;
+      end;
+      lOverrides.Remove(lOverrideKey);
+      if HasWindowCaptionOverride(lOverrides, hWnd(100), 200) then
+      begin
+        Writeln('SELFTEST FAILED: window caption override reset did not remove override');
+        Result := 1;
+      end;
+    finally
+      lOverrides.Free;
     end;
     Exit;
   end;
@@ -2023,7 +2327,7 @@ begin
   else
   begin
     pnlAppDetails.Visible := True;
-    edAppCaption.Text := app.caption;
+    edAppCaption.Text := ApplyWindowCaptionOverride(fWindowCaptionOverrides, app.wnd, app.PID, app.caption);
     edPid.Text := app.PID.ToString;
     if aAllowExtendedMetadata then
     begin
@@ -2049,6 +2353,7 @@ var
   lApp: TAppInfo;
   lAppsFocusedCaption: string;
   lAppsWnd: hWnd;
+  lCaption: string;
   lConsoleFocusedCaption: string;
   lConsoleWnd: hWnd;
   lExcludeMasks: TStringArray;
@@ -2066,6 +2371,7 @@ var
   lTitle: string;
   lIsExplorer: Boolean;
   lIsTerminal: Boolean;
+  lWindowProcessId: Cardinal;
   lIndex: Integer;
 begin
   if IsShuttingDown then
@@ -2136,10 +2442,12 @@ begin
         Continue;
       end;
 
+      lWindowProcessId := lApp.PID;
+      lCaption := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lApp.wnd, lWindowProcessId, lApp.Caption);
       if lStartupDataReady then
-        lTitle := Trim(lApp.DisplayCaption)
+        lTitle := Trim(BuildWindowDisplayCaption(lCaption, lApp.FileName))
       else
-        lTitle := Trim(lApp.Caption);
+        lTitle := Trim(lCaption);
 
       if lIsTerminal then
       begin

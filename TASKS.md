@@ -1,9 +1,9 @@
 # Tasks
-Next task ID: T-020
+Next task ID: T-021
 
 ## Summary
 Open tasks: 0 (In Progress: 0, Next Today: 0, Next This Week: 0, Next Later: 0, Blocked: 0)
-Done tasks: 19
+Done tasks: 20
 
 ## In Progress
 
@@ -16,6 +16,19 @@ Done tasks: 19
 ## Blocked
 
 ## Done
+
+### T-020 [UI] Add temporary window caption overrides for app and console lists
+Outcome:
+- Applications (F1) and Console instances (F4) expose context-menu Rename for the selected window.
+- Rename stores an in-memory caption override keyed by PID and HWND, applied only to the list display until the app exits.
+- Dialog Reset removes the override and shows the normal live window title again.
+- Enter-confirming the rename dialog does not forward Return activation to the source listbox.
+Proof:
+- Run: `_build_verify/test-out/ActiveAppView.exe --self-test-window-caption-overrides`
+  Expect: exit code `0` with no `SELFTEST FAILED` output.
+- Manual UI proof: right-click an Applications or Console item, choose `Rename`, enter a caption, confirm with Return, and confirm the selected window is not activated; reopen `Rename`, choose `Reset`, and confirm the normal title returns.
+Touches: _Source/ActiveAppViewMainForm.pas, CHANGELOG.md
+Verify: self-test, manual-ui-proof
 
 ### T-019 [TEST] Add regression coverage for launcher classification and crash containment
 Outcome:
