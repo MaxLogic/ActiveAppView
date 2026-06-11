@@ -1,35 +1,54 @@
 @echo off
+setlocal EnableExtensions
 
 set "NVDA_EXE=C:\Program Files\NVDA\nvda.exe"
+set "MOUSEBEAM_EXE=D:\Projects\MouseBeam\xMouse.exe"
 
-:: Reload NVDA (To clear its internal event queue)
-:: We use -r to tell NVDA to restart itself gracefully if running
-if exist "%NVDA_EXE%" start "" "%NVDA_EXE%" -r
+if not exist "%NVDA_EXE%" (
+  echo NVDA not found: "%NVDA_EXE%"
+  exit /b 1
+)
 
-taskkill /IM DelphiLSP.exe /F
-taskkill /IM xMouse.exe /F
+call :RestartTextInput
 
-:: xMouse.exe
-cd /d "D:\Projects\MouseBeam\"
-start xMouse.exe
+:: A hard NVDA restart is more reliable when the old instance is frozen.
+for %%P in (
+  nvda.exe
+  nvda_slave.exe
+  nvda_synthDriverHost.exe
+  nvdaHelperRemoteLoader.exe
+) do call :KillProcess %%P
 
-:: --- 4) Input stack resets ---
-:: 4a) CTF / Text Services Framework
-taskkill /f /im ctfmon.exe >nul 2>&1
-start "" %SystemRoot%\System32\ctfmon.exe
+timeout /t 1 /nobreak >nul
+start "" "%NVDA_EXE%"
 
-:: 4b) Windows Search front-end (auto-respawns)
-for %%Q in (SearchHost.exe SearchUI.exe) do taskkill /f /im %%Q >nul 2>&1
+call :RestartMouseBeam
 
-:: 4c) Start menu host (optional)
-taskkill /f /im StartMenuExperienceHost.exe >nul 2>&1
+endlocal
+exit /b 0
 
-:: 4d) Touch Keyboard & Handwriting Panel Service (optional)
-sc query TabletInputService | find /i "RUNNING" >nul && (net stop TabletInputService /y >nul)
+:RestartTextInput
+call :KillProcess ctfmon.exe
+call :KillProcess TextInputHost.exe
+start "" "%SystemRoot%\System32\ctfmon.exe"
 
-:: ---------- 5. Restart Windows-Audio (fixes crackling) ----------------------------
-net stop  audiosrv  /y   >nul
-net start audiosrv       >nul
+call :RestartServiceIfPresent TextInputManagementService
+call :RestartServiceIfPresent TabletInputService
+exit /b 0
 
+:RestartMouseBeam
+if exist "%MOUSEBEAM_EXE%" (
+  call :KillProcess xMouse.exe
+  start "" "%MOUSEBEAM_EXE%"
+)
+exit /b 0
 
-exit
+:RestartServiceIfPresent
+sc query "%~1" >nul 2>&1 || exit /b 0
+sc query "%~1" | find /i "RUNNING" >nul 2>&1 && net stop "%~1" /y >nul 2>&1
+net start "%~1" >nul 2>&1
+exit /b 0
+
+:KillProcess
+taskkill /f /im "%~1" >nul 2>&1
+exit /b 0
