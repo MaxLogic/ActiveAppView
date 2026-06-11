@@ -19,7 +19,10 @@ Accessibility tool for active application / explorer quick selection
 - One mapping per line: `KEY=VALUE` (KEY may include spaces).
 - VALUE is everything after the first `=`.
 - Lines starting with `#` or `;`, or empty lines, are ignored.
-- Double-quoted VALUE is supported for paths with spaces; arguments are allowed, e.g.:
+- Unquoted file/folder paths with spaces are supported. If the unquoted value also has arguments,
+  the parser uses the longest existing file/folder prefix as the target.
+- Command aliases without path separators keep the traditional `command args` split.
+- Double-quoted VALUE is supported for paths with spaces and explicit arguments, e.g.:
   - `putty="C:\Program Files\PuTTY\putty.exe" --start prod`
 
 ## ChatReviewMask.txt (next to ActiveAppView.exe)
