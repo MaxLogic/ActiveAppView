@@ -17,3 +17,4 @@ C:\Program Files\LogiOptionsPlus\logioptionsplus.exe
 Host środowiska powłoki systemu Windows
 C:\Windows\SystemApps\*\ShellExperienceHost.exe
 IpPbxContactCard
+*\xMouse.exe
