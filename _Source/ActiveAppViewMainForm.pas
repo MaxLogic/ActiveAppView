@@ -205,8 +205,6 @@ type
     function IsTerminalApp(const aFileName: string; const aPatterns: TStringArray): boolean;
     function TryGetKnownFolderPath(const aFolderId: TGUID; out aPath: string): boolean;
     procedure AddDesktopItemsFromFolder(const aFolder: string; var aItems: TNamedValueArray);
-    function TryParseShortCutValue(const aValue: string; out aTargetPath: string;
-      out aParams: string): boolean;
     procedure ActivateDesktopItem;
     procedure ActivateShortCutItem;
     procedure RestoreSelectedItem(lb: TListBox; const aCaption: string);
@@ -254,6 +252,7 @@ const
   cSettingsFileName = 'settings.ini';
   cRestoreItemIndexSelfTestArg = '--self-test-restore-item-index';
   cResizeColumnWidthsSelfTestArg = '--self-test-resize-column-widths';
+  cShortCutValueParsingSelfTestArg = '--self-test-shortcut-value-parsing';
   cWindowCaptionOverridesSelfTestArg = '--self-test-window-caption-overrides';
   cWarmupPrefetchSelfTestArg = '--self-test-startup-warmup-prefetch';
   cWarmupShutdownCheckSelfTestArg = '--self-test-startup-warmup-shutdown-check';
@@ -1493,10 +1492,56 @@ begin
     end);
 end;
 
-function TAppsViewMainFrm.TryParseShortCutValue(const aValue: string; out aTargetPath: string;
-  out aParams: string): boolean;
+function ShortCutPathExists(const aPath: string): Boolean;
+begin
+  Result := FileExists(aPath) or DirectoryExists(aPath);
+end;
+
+function FindExistingUnquotedShortCutPathEnd(const aText: string): Integer;
 var
+  i: Integer;
+  lCandidate: string;
+begin
+  if ShortCutPathExists(aText) then
+    Exit(Length(aText));
+
+  for i := Length(aText) downto 1 do
+  begin
+    if CharInSet(aText[i], [' ', #9]) then
+    begin
+      lCandidate := Trim(Copy(aText, 1, i - 1));
+      if (lCandidate <> '') and ShortCutPathExists(lCandidate) then
+        Exit(Length(lCandidate));
+    end;
+  end;
+
+  Result := 0;
+end;
+
+function FindFirstShortCutWhitespace(const aText: string): Integer;
+var
+  i: Integer;
+begin
+  for i := 1 to Length(aText) do
+  begin
+    if CharInSet(aText[i], [' ', #9]) then
+      Exit(i);
+  end;
+
+  Result := 0;
+end;
+
+function LooksLikeFileSystemPath(const aText: string): Boolean;
+begin
+  Result := (Pos(':', aText) > 0) or (Pos('\', aText) > 0) or (Pos('/', aText) > 0)
+    or StartsText('.', aText);
+end;
+
+function TryParseShortCutValue(const aValue: string; out aTargetPath: string; out aParams: string): boolean;
+var
+  lFirstToken: string;
   lValue: string;
+  lPathEnd: integer;
   lPos: integer;
 begin
   aTargetPath := '';
@@ -1518,14 +1563,29 @@ begin
   end
   else
   begin
-    lPos := PosEx(' ', lValue, 1);
-    if lPos > 0 then
+    lPathEnd := FindExistingUnquotedShortCutPathEnd(lValue);
+    if lPathEnd > 0 then
     begin
-      aTargetPath := Copy(lValue, 1, lPos - 1);
-      aParams := Trim(Copy(lValue, lPos + 1, MaxInt));
+      aTargetPath := Copy(lValue, 1, lPathEnd);
+      aParams := Trim(Copy(lValue, lPathEnd + 1, MaxInt));
     end
     else
-      aTargetPath := lValue;
+    begin
+      lPos := FindFirstShortCutWhitespace(lValue);
+      if lPos > 0 then
+      begin
+        lFirstToken := Copy(lValue, 1, lPos - 1);
+        if not LooksLikeFileSystemPath(lFirstToken) then
+        begin
+          aTargetPath := lFirstToken;
+          aParams := Trim(Copy(lValue, lPos + 1, MaxInt));
+        end
+        else
+          aTargetPath := lValue;
+      end else begin
+        aTargetPath := lValue;
+      end;
+    end;
   end;
 
   Result := aTargetPath <> '';
@@ -2179,9 +2239,11 @@ var
   lItems: TStringList;
   lOverrideKey: string;
   lOverrides: TDictionary<string, string>;
+  lParams: string;
   lResultIndex: Integer;
   lScriptsWidth: Integer;
   lShortCutsWidth: Integer;
+  lTargetPath: string;
 begin
   Result := -1;
   if SameText(aArg, cResizeColumnWidthsSelfTestArg) then
@@ -2215,6 +2277,77 @@ begin
       end;
     finally
       lItems.Free;
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cShortCutValueParsingSelfTestArg) then
+  begin
+    Result := 0;
+    if not TryParseShortCutValue(
+      'C:\some  folder with spaces\some exe with spaces.exe',
+      lTargetPath,
+      lParams) then
+    begin
+      Writeln('SELFTEST FAILED: shortcut parser rejected unquoted path with spaces');
+      Exit(1);
+    end;
+    if (lTargetPath <> 'C:\some  folder with spaces\some exe with spaces.exe') or (lParams <> '') then
+    begin
+      Writeln(Format(
+        'SELFTEST FAILED: unquoted path expected target="%s" params="" actual target="%s" params="%s"',
+        ['C:\some  folder with spaces\some exe with spaces.exe', lTargetPath, lParams]));
+      Exit(1);
+    end;
+
+    if not TryParseShortCutValue(
+      '"C:\some path with spaces\some exe with spaces.exe" -param1 -param2 -param3-with-value "some value for param3"',
+      lTargetPath,
+      lParams) then
+    begin
+      Writeln('SELFTEST FAILED: shortcut parser rejected quoted path with params');
+      Exit(1);
+    end;
+    if (lTargetPath <> 'C:\some path with spaces\some exe with spaces.exe')
+      or (lParams <> '-param1 -param2 -param3-with-value "some value for param3"') then
+    begin
+      Writeln(Format(
+        'SELFTEST FAILED: quoted path expected target="%s" params="%s" actual target="%s" params="%s"',
+        ['C:\some path with spaces\some exe with spaces.exe',
+         '-param1 -param2 -param3-with-value "some value for param3"', lTargetPath, lParams]));
+      Exit(1);
+    end;
+
+    if not TryParseShortCutValue(
+      'C:\some path with spaces\',
+      lTargetPath,
+      lParams) then
+    begin
+      Writeln('SELFTEST FAILED: shortcut parser rejected unquoted folder with trailing slash');
+      Exit(1);
+    end;
+    if (lTargetPath <> 'C:\some path with spaces\') or (lParams <> '') then
+    begin
+      Writeln(Format(
+        'SELFTEST FAILED: unquoted folder expected target="%s" params="" actual target="%s" params="%s"',
+        ['C:\some path with spaces\', lTargetPath, lParams]));
+      Exit(1);
+    end;
+
+    if not TryParseShortCutValue(
+      'wt -w new --title "PC-Maintenance"',
+      lTargetPath,
+      lParams) then
+    begin
+      Writeln('SELFTEST FAILED: shortcut parser rejected command alias with params');
+      Exit(1);
+    end;
+    if (lTargetPath <> 'wt') or (lParams <> '-w new --title "PC-Maintenance"') then
+    begin
+      Writeln(Format(
+        'SELFTEST FAILED: command alias expected target="%s" params="%s" actual target="%s" params="%s"',
+        ['wt', '-w new --title "PC-Maintenance"', lTargetPath, lParams]));
+      Exit(1);
     end;
     Exit;
   end;
