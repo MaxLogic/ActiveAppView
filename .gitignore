@@ -38,3 +38,4 @@ _analysis/
 .agents/
 /_build_verify
 /assets/
+.dak/
