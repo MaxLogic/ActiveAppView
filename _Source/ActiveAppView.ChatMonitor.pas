@@ -65,6 +65,7 @@ type
       const aMetadata: IChatAppMetadata;
       const aRule: TReviewRule): Boolean;
     function PlaySoundFile(const aFileName: string; const aThrottleSeconds: Integer = 5): Boolean;
+    class function ShouldPrefetchMetadataInParallel: Boolean; static;
     function PrefetchMetadataInParallel(
       const aApps: TArray<TChatAppSnapshot>): TArray<IChatAppMetadata>;
     procedure SetSoundEnabled(const aValue: Boolean);
@@ -85,7 +86,7 @@ type
 implementation
 
 uses
-  System.DateUtils, System.IOUtils, System.StrUtils, System.Threading,
+  System.DateUtils, System.IOUtils, System.StrUtils,
   Winapi.MMSystem,
   maxLogic.StrUtils, maxLogic.Windows.Desktop,
   ActiveAppViewCore;
@@ -114,6 +115,7 @@ const
   cSoundIntervalRespectedSelfTestArg = '--self-test-chat-monitor-sound-interval-respected';
   cSoundThrottleFailureRetrySelfTestArg = '--self-test-chat-monitor-sound-throttle-failure-retry';
   cSoundToggleThrottleSelfTestArg = '--self-test-chat-monitor-sound-toggle-throttle';
+  cMetadataPrefetchPolicySelfTestArg = '--self-test-chat-monitor-metadata-prefetch-policy';
   cUnreadCaptionSelfTestArg = '--self-test-chat-monitor-unread-caption';
 
 type
@@ -634,6 +636,15 @@ begin
         Result := 1;
       end;
     end;
+  end else if SameText(aArg, cMetadataPrefetchPolicySelfTestArg) then
+  begin
+    if TChatMonitor.ShouldPrefetchMetadataInParallel then
+    begin
+      Writeln('SELFTEST FAILED: chat metadata prefetch must avoid parallel COM metadata retrieval');
+      Result := 1;
+    end else begin
+      Result := 0;
+    end;
   end;
 end;
 
@@ -1011,24 +1022,29 @@ begin
   end;
 end;
 
+class function TChatMonitor.ShouldPrefetchMetadataInParallel: Boolean;
+begin
+  Result := False;
+end;
+
 function TChatMonitor.PrefetchMetadataInParallel(
   const aApps: TArray<TChatAppSnapshot>): TArray<IChatAppMetadata>;
 var
+  lIndex: Integer;
   lMetadata: TArray<IChatAppMetadata>;
 begin
   SetLength(lMetadata, Length(aApps));
   if Length(aApps) = 0 then
     Exit(lMetadata);
 
-  TParallel.&For(0, High(aApps),
-    procedure(aIndex: Integer)
-    begin
-      try
-        lMetadata[aIndex] := GetMetadataCached(aApps[aIndex].Wnd);
-      except
-        lMetadata[aIndex] := nil;
-      end;
-    end);
+  for lIndex := 0 to High(aApps) do
+  begin
+    try
+      lMetadata[lIndex] := GetMetadataCached(aApps[lIndex].Wnd);
+    except
+      lMetadata[lIndex] := nil;
+    end;
+  end;
   Result := lMetadata;
 end;
 

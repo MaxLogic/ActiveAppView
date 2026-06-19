@@ -250,6 +250,8 @@ type
   end;
 
   TAppPrefetchProc = reference to procedure(const aApp: TAppInfo);
+  TDeepPrefixPrefetchProc = reference to procedure(const aApp: TAppInfo;
+    const aNeedAppUserModelID: Boolean; const aNeedCmdParams: Boolean);
 
 const
   cShortCutsFileName = 'ShortCuts.txt';
@@ -284,7 +286,7 @@ const
   cTotalDesignColumnWidth = cAppsColumnDesignWidth + cExplorerColumnDesignWidth + cScriptsColumnDesignWidth +
     cConsoleColumnDesignWidth + cDesktopColumnDesignWidth + cShortCutsColumnDesignWidth;
   cIgnoreF4AfterFocusMs = 200;
-  cShutdownTaskWaitTimeoutMs = 25;
+  cShutdownTaskWaitTimeoutMs = 10000;
   cWindowActionProbeIntervalMs = 300;
   cWindowActionProbeMaxDurationMs = 15000;
   cSuppressReturnKeyAfterDialogMs = 1000;
@@ -525,6 +527,36 @@ begin
   Result := TrimLeft(Copy(aCaption, lIndex, MaxInt));
 end;
 
+function CompareNativeUInt(const aLeft: NativeUInt; const aRight: NativeUInt): Integer;
+begin
+  if aLeft < aRight then
+    Exit(-1);
+  if aLeft > aRight then
+    Exit(1);
+  Result := 0;
+end;
+
+function GetConsoleSortProcessId(aList: TStringList; const aIndex: Integer): NativeUInt;
+var
+  lProcessId: Cardinal;
+  lWnd: hWnd;
+begin
+  Result := 0;
+  if (not Assigned(aList)) or (aIndex < 0) or (aIndex >= aList.Count) then
+    Exit;
+
+  lWnd := hWnd(aList.Objects[aIndex]);
+  if lWnd <> 0 then
+  begin
+    lProcessId := 0;
+    GetWindowThreadProcessId(lWnd, lProcessId);
+    if lProcessId <> 0 then
+      Exit(lProcessId);
+  end;
+
+  Result := NativeUInt(aList.Objects[aIndex]);
+end;
+
 function WindowArrayContains(const aWindows: TArray<hWnd>; const aWnd: hWnd): Boolean;
 var
   lWnd: hWnd;
@@ -707,7 +739,7 @@ begin
     try
       aApp.AppUserModelID;
     except
-      // Window metadata can disappear while we prefetch in parallel; skip transient failures.
+      // Window metadata can disappear while we prefetch in the background; skip transient failures.
     end;
   end;
   if aNeedCmdParams then
@@ -720,16 +752,48 @@ begin
   end;
 end;
 
+procedure PrefetchDeepPrefixMetadataForApps(const aApps: TArray<TAppInfo>; const aNeedAppUserModelID: Boolean;
+  const aNeedCmdParams: Boolean; const aCancelToken: iCancelToken; const aPrefetchProc: TDeepPrefixPrefetchProc = nil);
+var
+  lIndex: Integer;
+  lPrefetchProc: TDeepPrefixPrefetchProc;
+begin
+  lPrefetchProc := aPrefetchProc;
+  for lIndex := 0 to High(aApps) do
+  begin
+    if Assigned(aCancelToken) and aCancelToken.Canceled then
+      Exit;
+
+    if Assigned(lPrefetchProc) then
+      lPrefetchProc(aApps[lIndex], aNeedAppUserModelID, aNeedCmdParams)
+    else
+      PrefetchDeepPrefixMetadataForApp(aApps[lIndex], aNeedAppUserModelID, aNeedCmdParams);
+  end;
+end;
+
+function ShouldForceTerminateAsyncOnShutdown: Boolean;
+begin
+  Result := False;
+end;
+
 function CompareConsoleSortItems(aList: TStringList; aIndex1: Integer; aIndex2: Integer): Integer;
 var
   lLeft: string;
+  lLeftProcessId: NativeUInt;
   lRight: string;
+  lRightProcessId: NativeUInt;
 begin
   lLeft := NormalizeConsoleSortCaption(aList[aIndex1]);
   lRight := NormalizeConsoleSortCaption(aList[aIndex2]);
   Result := CompareText(lLeft, lRight);
   if Result = 0 then
-    Result := CompareText(aList[aIndex1], aList[aIndex2]);
+  begin
+    lLeftProcessId := GetConsoleSortProcessId(aList, aIndex1);
+    lRightProcessId := GetConsoleSortProcessId(aList, aIndex2);
+    Result := CompareNativeUInt(lLeftProcessId, lRightProcessId);
+  end;
+  if Result = 0 then
+    Result := CompareNativeUInt(NativeUInt(aList.Objects[aIndex1]), NativeUInt(aList.Objects[aIndex2]));
 end;
 
 procedure SortConsoleItems(const aItems: TStrings);
@@ -1778,14 +1842,7 @@ begin
   if Length(lEdgeApps) <> 0 then
   begin
     lPhaseWatch := TStopwatch.StartNew;
-    TParallel.&For(0, High(lEdgeApps),
-      procedure(aIndex: Integer)
-      begin
-        if IsShuttingDown then
-          Exit;
-
-        PrefetchDeepPrefixMetadataForApp(lEdgeApps[aIndex], lNeedAppUserModelID, lNeedCmdParams);
-      end);
+    PrefetchDeepPrefixMetadataForApps(lEdgeApps, lNeedAppUserModelID, lNeedCmdParams, fShutdownToken);
     lEdgePrefixPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
 
     if not IsShuttingDown then
@@ -1802,14 +1859,7 @@ begin
   end;
 
   lPhaseWatch := TStopwatch.StartNew;
-  TParallel.&For(0, High(lApps),
-    procedure(aIndex: Integer)
-    begin
-      if IsShuttingDown then
-        Exit;
-
-      PrefetchDeepPrefixMetadataForApp(lApps[aIndex], lNeedAppUserModelID, lNeedCmdParams);
-    end);
+  PrefetchDeepPrefixMetadataForApps(lApps, lNeedAppUserModelID, lNeedCmdParams, fShutdownToken);
   lPrefixPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
 
   if not IsShuttingDown then
@@ -2577,9 +2627,8 @@ begin
   if WaitForSingleObject(lThread.Handle, 0) = WAIT_OBJECT_0 then
     Exit;
 
-  LogStartupTiming('Shutdown.TerminateThread', Format('threadId=%d', [lThread.ThreadID]));
-  // Last-resort shutdown path: avoid zombie instances when a worker is stuck in blocking OS calls.
-  TerminateThread(lThread.Handle, 1);
+  LogStartupTiming('Shutdown.WaitForAsync', Format('threadId=%d', [lThread.ThreadID]));
+  TWaiter.WaitFor([aAsync], INFINITE, True);
 end;
 
 procedure TAppsViewMainFrm.EnsureSharedAppsSnapshotFresh(const aMaxAgeMs: UInt64);
@@ -2657,6 +2706,7 @@ function RunMainFormSelfTests(const aArg: string): Integer;
 var
   lApps: TArray<TAppInfo>;
   lAppsWidth: Integer;
+  lCallCount: Integer;
   lCancelToken: iCancelToken;
   lConsoleWidth: Integer;
   lDesktopWidth: Integer;
@@ -2749,6 +2799,16 @@ begin
       if NormalizeConsoleSortCaption(Char($280F) + Char($2839) + '  ActiveAppView') <> 'ActiveAppView' then
       begin
         Writeln('SELFTEST FAILED: console sort normalizer did not strip Codex working prefix');
+        Result := 1;
+      end;
+
+      lItems.Clear;
+      lItems.AddObject(Char($28FF) + ' Terminal', TObject(100));
+      lItems.AddObject(Char($2801) + ' Terminal', TObject(200));
+      SortConsoleItems(lItems);
+      if lItems.Objects[0] <> TObject(100) then
+      begin
+        Writeln('SELFTEST FAILED: console sort tie-breaker should use process id');
         Result := 1;
       end;
     finally
@@ -3133,6 +3193,32 @@ begin
           [lException.ClassName, lException.Message]));
         Result := 1;
       end;
+    end;
+    lCancelToken := nil;
+    if ShouldForceTerminateAsyncOnShutdown then
+    begin
+      Writeln('SELFTEST FAILED: startup shutdown policy must not force-terminate async worker threads');
+      Result := 1;
+    end;
+
+    lCancelToken := TCancelToken.Create;
+    lCallCount := 0;
+    SetLength(lApps, 2);
+    PrefetchDeepPrefixMetadataForApps(
+      lApps,
+      True,
+      True,
+      lCancelToken,
+      procedure(const aApp: TAppInfo; const aNeedAppUserModelID: Boolean; const aNeedCmdParams: Boolean)
+      begin
+        Inc(lCallCount);
+        lCancelToken.Cancel;
+      end);
+    if lCallCount <> 1 then
+    begin
+      Writeln(Format('SELFTEST FAILED: deep-prefix prefetch should stop after cancellation actual=%d',
+        [lCallCount]));
+      Result := 1;
     end;
     lCancelToken := nil;
     Exit;
