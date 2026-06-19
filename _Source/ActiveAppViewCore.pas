@@ -77,7 +77,7 @@ function RunCoreSelfTests(const aArg: string): Integer;
 implementation
 
 uses
-  AutoFree, bsUtils, maxLogic.StrUtils, srDesktop, StrUtils;
+  AutoFree, maxLogic.StrUtils, maxLogic.Windows.Desktop, StrUtils;
 
 const
   cCoreCommandLineParamsSelfTestArg = '--self-test-core-command-line-params';
@@ -146,7 +146,7 @@ begin
   if not fAppUserModelIDRetrieved then
   begin
     fAppUserModelIDRetrieved := True;
-    fAppUserModelID := RetrieveAppUserModelID(fWnd);
+    fAppUserModelID := maxLogic.Windows.Desktop.RetrieveAppUserModelID(fWnd);
   end;
   Result := fAppUserModelID;
 end;
@@ -158,8 +158,8 @@ begin
   if not fCommandLineRetrieved then
   begin
     fCommandLineRetrieved:= True;
-    lPid:= RetrievePID(fWnd);
-    fCommandLine:= RetrieveCommandLine(lPid);
+    lPid:= maxLogic.Windows.Desktop.RetrievePID(fWnd);
+    fCommandLine:= maxLogic.Windows.Desktop.RetrieveCommandLine(lPid);
   end;
   Result:= fCommandLine;
 end;
@@ -225,9 +225,9 @@ function TAppInfo.GetFileName: string;
 begin
   if not fFileNameRetrived then
   begin
-    if srDesktop.isWndValid(Wnd) then
+    if maxLogic.Windows.Desktop.IsWndValid(Wnd) then
     begin
-      fFileName := srDesktop.GetFileName(Wnd);
+      fFileName := maxLogic.Windows.Desktop.GetFileName(Wnd);
       fFileNameRetrived := True;
     end;
   end;
@@ -239,14 +239,14 @@ begin
   if not assigned(fIcon) then
   begin
     fIcon := TIcon.Create;
-    srDesktop.CopyIconFromWindowHandle(fWnd, fIcon);
+    maxLogic.Windows.Desktop.CopyIconFromWindowHandle(fWnd, fIcon);
   end;
   Result := fIcon;
 end;
 
 function TAppInfo.GetPID: Cardinal;
 begin
-  Result:= RetrievePID(fWnd);
+  Result:= maxLogic.Windows.Desktop.RetrievePID(fWnd);
 end;
 
 function TAppInfo.GetRelaunchCommand: String;
@@ -254,14 +254,14 @@ begin
   if not fRelaunchCommandRetrieved then
   begin
     fRelaunchCommandRetrieved := True;
-    fRelaunchCommand := RetrieveRelaunchCommand(fWnd);
+    fRelaunchCommand := maxLogic.Windows.Desktop.RetrieveRelaunchCommand(fWnd);
   end;
   Result := fRelaunchCommand;
 end;
 
 procedure TAppInfo.ScreenShoot(aBitMap: TBitmap);
 begin
-  srDesktop.PrintWindow(Wnd, aBitMap);
+  maxLogic.Windows.Desktop.PrintWindow(Wnd, aBitMap);
 end;
 
 procedure TAppInfo.SetAlife(const Value: boolean);
@@ -281,14 +281,14 @@ begin
     TThread.CreateAnonymousThread(
       procedure
       begin
-        srDesktop.ForceForegroundWindow(lWnd);
+        maxLogic.Windows.Desktop.ForceForegroundWindow(lWnd);
       end).start;
   end;
 end;
 
 procedure TAppInfo.Update;
 begin
-  fCaption := srDesktop.GetWinCaption(Wnd);
+  fCaption := maxLogic.Windows.Desktop.GetWinCaption(Wnd);
 end;
 
 { TAppList }
@@ -346,7 +346,7 @@ var
   i, X: integer;
 begin
   gc(l, TWndList.Create);
-  srDesktop.GetWndList(l);
+  maxLogic.Windows.Desktop.GetWndList(l);
 
   // mark all as dead for now...
   for X := 0 to fApps.Count - 1 do
