@@ -98,9 +98,11 @@ type
     fAuxListRefreshPending: Integer;
     fChatMonitorConfiguredEnabled: Boolean;
     fChatMonitorBusy: Integer;
+    fChatMonitorIntervalMs: Cardinal;
     fChatMonitorPending: Integer;
     fChatMonitorTask: iAsync;
     fConfigCache: TConfigCache;
+    fDeepPrefixEdgeReady: Integer;
     fDeepPrefixLoadBusy: Integer;
     fDeepPrefixLoadTask: iAsync;
     fDeepPrefixReady: Integer;
@@ -108,6 +110,8 @@ type
     fChatMonitor: TChatMonitor;
     fGuiRefreshQueued: Integer;
     fLastFormFocusTick: UInt64;
+    fLastChatMonitorTick: UInt64;
+    fLastWindowTitlePollingTick: UInt64;
     fPendingAuxSnapshot: TObject;
     fChatMonitorSnapshot: TArray<TChatAppSnapshot>;
     fSharedAppsSnapshot: TArray<TChatAppSnapshot>;
@@ -125,6 +129,7 @@ type
     fStartupProfileLogSync: TCriticalSection;
     fStartupProfileStartTick: Int64;
     fStartupProfileWarmupDoneLogged: Integer;
+    fWindowTitlePollingIntervalMs: Cardinal;
     fWindowActionsPopupMenu: TPopupMenu;
     fCloseWindowMenuItem: TMenuItem;
     fRenameWindowMenuItem: TMenuItem;
@@ -147,6 +152,7 @@ type
     procedure OnStartupDataLoadDone;
     procedure QueueGuiRefresh;
     procedure RebuildSharedAppsSnapshot;
+    procedure RefreshConsoleList;
     procedure RunAuxListsRefresh;
     procedure RunChatMonitorSnapshot;
     procedure RunDeepPrefixLoad;
@@ -158,7 +164,9 @@ type
     procedure EnsureSharedAppsSnapshotFresh(const aMaxAgeMs: UInt64);
     procedure FlushStartupProfileLog;
     function GetStartupElapsedMs: Int64;
+    function IsDeepPrefixAllowedForApp(const aApp: TAppInfo): Boolean;
     function IsDeepPrefixReady: Boolean;
+    function IsEdgePrefixReady: Boolean;
     function IsStartupDataReady: Boolean;
     function IsShuttingDown: Boolean;
     procedure LogStartupTiming(const aPhase: string; const aDetails: string = '');
@@ -180,10 +188,10 @@ type
     procedure SuppressNextReturnKey(const aListBox: TListBox);
     procedure QuickValidateListBoxProcesses(const aListBox: TListBox);
     procedure QuickValidateProcessesOnRefocus;
+    procedure RemoveWindowFromSnapshots(const aWnd: hWnd);
     procedure RemoveWindowFromListBox(const aListBox: TListBox; const aWnd: hWnd);
     procedure RemoveWindowFromUiAndCache(const aWnd: hWnd);
-    procedure RunWindowActionCleanupCheck(const aWnd: hWnd; const aProcessId: Cardinal;
-      const aElapsedMs: Cardinal; const aDelayMs: Cardinal);
+    procedure SelectListBoxItemIndex(const aListBox: TListBox; const aItemIndex: Integer);
     procedure ScheduleWindowActionCleanup(const aWnd: hWnd; const aProcessId: Cardinal);
     procedure TerminateSelectedWindow(const aListBox: TListBox);
     procedure WindowActionsPopupMenuPopup(aSender: TObject);
@@ -251,10 +259,19 @@ const
   cHideMaskFileName = 'HideMask.txt';
   cPrefixMaskFileName = 'PrefixMask.txt';
   cSettingsFileName = 'settings.ini';
+  cChatMonitorSectionName = 'ChatMonitor';
+  cCheckIntervalSecondsKey = 'CheckIntervalSeconds';
+  cWindowTitlePollingSectionName = 'WindowTitlePolling';
+  cWindowTitlePollingIntervalSecondsKey = 'RefreshIntervalSeconds';
+  cDefaultIntervalSeconds = 5;
   cRestoreItemIndexSelfTestArg = '--self-test-restore-item-index';
   cResizeColumnWidthsSelfTestArg = '--self-test-resize-column-widths';
   cShortCutValueParsingSelfTestArg = '--self-test-shortcut-value-parsing';
   cWindowCaptionOverridesSelfTestArg = '--self-test-window-caption-overrides';
+  cConsoleTitleSortSelfTestArg = '--self-test-console-title-sort';
+  cConsolePollAppPurgeSelfTestArg = '--self-test-console-poll-app-purge';
+  cWindowActionProbeSelfTestArg = '--self-test-window-action-probe';
+  cWindowTitlePollingSelfTestArg = '--self-test-window-title-polling';
   cScriptsIgnoreSelfTestArg = '--self-test-scripts-ignore';
   cWarmupPrefetchSelfTestArg = '--self-test-startup-warmup-prefetch';
   cWarmupShutdownCheckSelfTestArg = '--self-test-startup-warmup-shutdown-check';
@@ -268,9 +285,8 @@ const
     cConsoleColumnDesignWidth + cDesktopColumnDesignWidth + cShortCutsColumnDesignWidth;
   cIgnoreF4AfterFocusMs = 200;
   cShutdownTaskWaitTimeoutMs = 25;
-  cWindowActionVerifyDelayMs = 350;
-  cWindowActionVerifyDelayStepMs = 150;
-  cWindowActionVerifyMaxDurationMs = 5000;
+  cWindowActionProbeIntervalMs = 300;
+  cWindowActionProbeMaxDurationMs = 15000;
   cSuppressReturnKeyAfterDialogMs = 1000;
 
 resourcestring
@@ -469,6 +485,285 @@ begin
     Result := lIndex;
 end;
 
+function IsCodexWorkingPrefixChar(const aChar: Char): Boolean;
+begin
+  Result := (Ord(aChar) >= $2800) and (Ord(aChar) <= $28FF);
+end;
+
+function NormalizeConsoleSortCaption(const aCaption: string): string;
+var
+  lIndex: Integer;
+begin
+  lIndex := 1;
+  while (lIndex <= Length(aCaption)) and IsCodexWorkingPrefixChar(aCaption[lIndex]) do
+    Inc(lIndex);
+
+  Result := TrimLeft(Copy(aCaption, lIndex, MaxInt));
+end;
+
+function WindowArrayContains(const aWindows: TArray<hWnd>; const aWnd: hWnd): Boolean;
+var
+  lWnd: hWnd;
+begin
+  Result := False;
+  for lWnd in aWindows do
+  begin
+    if lWnd = aWnd then
+      Exit(True);
+  end;
+end;
+
+function RemoveWindowsFromItems(const aItems: TStrings; const aWindows: TArray<hWnd>): Boolean;
+var
+  lIndex: Integer;
+  lWnd: hWnd;
+begin
+  Result := False;
+  if (not Assigned(aItems)) or (Length(aWindows) = 0) then
+    Exit;
+
+  aItems.BeginUpdate;
+  try
+    for lIndex := aItems.Count - 1 downto 0 do
+    begin
+      lWnd := hWnd(aItems.Objects[lIndex]);
+      if WindowArrayContains(aWindows, lWnd) then
+      begin
+        aItems.Delete(lIndex);
+        Result := True;
+      end;
+    end;
+  finally
+    aItems.EndUpdate;
+  end;
+end;
+
+function RemoveWindowsFromListBox(const aListBox: TListBox; const aWindows: TArray<hWnd>): Boolean;
+begin
+  Result := False;
+  if not Assigned(aListBox) then
+    Exit;
+
+  Result := RemoveWindowsFromItems(aListBox.Items, aWindows);
+
+  if aListBox.Items.Count = 0 then
+    aListBox.ItemIndex := -1
+  else if aListBox.ItemIndex < 0 then
+    aListBox.ItemIndex := 0
+  else if aListBox.ItemIndex >= aListBox.Items.Count then
+    aListBox.ItemIndex := aListBox.Items.Count - 1;
+end;
+
+function FindWindowItemIndex(const aItems: TStrings; const aWnd: hWnd): Integer;
+var
+  lIndex: Integer;
+begin
+  Result := -1;
+  if (not Assigned(aItems)) or (aWnd = 0) then
+    Exit;
+
+  for lIndex := 0 to aItems.Count - 1 do
+  begin
+    if hWnd(aItems.Objects[lIndex]) = aWnd then
+      Exit(lIndex);
+  end;
+end;
+
+function CalculateWindowItemIndexAfterRemoval(const aItems: TStrings; const aOldItemIndex: Integer;
+  const aOldWnd: hWnd; const aRemovedWnd: hWnd): Integer;
+begin
+  Result := -1;
+  if (not Assigned(aItems)) or (aItems.Count = 0) then
+    Exit;
+  if aOldItemIndex < 0 then
+    Exit;
+
+  if (aOldWnd <> 0) and (aOldWnd <> aRemovedWnd) then
+  begin
+    Result := FindWindowItemIndex(aItems, aOldWnd);
+    if Result <> -1 then
+      Exit;
+  end;
+
+  Result := aOldItemIndex;
+  if Result >= aItems.Count then
+    Result := aItems.Count - 1;
+end;
+
+function CalculateItemIndexAfterDeletingIndex(const aItemCount: Integer; const aDeletedItemIndex: Integer): Integer;
+begin
+  Result := -1;
+  if aItemCount <= 0 then
+    Exit;
+
+  Result := aDeletedItemIndex;
+  if Result >= aItemCount then
+    Result := aItemCount - 1;
+end;
+
+function CalculateWindowItemIndexAfterValidation(const aItems: TStrings; const aOldItemIndex: Integer;
+  const aOldWnd: hWnd): Integer;
+begin
+  Result := CalculateWindowItemIndexAfterRemoval(aItems, aOldItemIndex, aOldWnd, 0);
+end;
+
+function CalculateRestoredItemIndex(const aItems: TStrings; const aWnd: hWnd; const aOldItemIndex: Integer;
+  const aOldItemCaption: string; const aSorted: Boolean): Integer;
+var
+  lIndex: Integer;
+begin
+  Result := -1;
+  if (not Assigned(aItems)) or (aItems.Count = 0) then
+    Exit;
+
+  for lIndex := 0 to aItems.Count - 1 do
+  begin
+    if aWnd = hWnd(aItems.Objects[lIndex]) then
+      Exit(lIndex);
+  end;
+
+  if (aOldItemCaption <> '') and aSorted then
+  begin
+    lIndex := FindSortedCaptionIndex(aItems, aOldItemCaption);
+    if lIndex <> -1 then
+      Exit(lIndex);
+  end;
+
+  if (aOldItemIndex >= 0) and (aOldItemIndex < aItems.Count) then
+    Exit(aOldItemIndex);
+  if aOldItemIndex >= aItems.Count then
+    Exit(aItems.Count - 1);
+end;
+
+function IsWindowActionListBox(const aListBox: TObject; const aAppsListBox: TObject; const aExplorerListBox: TObject;
+  const aConsoleListBox: TObject): Boolean;
+begin
+  Result := (aListBox = aAppsListBox) or (aListBox = aExplorerListBox) or (aListBox = aConsoleListBox);
+end;
+
+function RemoveWindowFromSnapshots(var aSnapshots: TArray<TChatAppSnapshot>; const aWnd: hWnd): Boolean;
+var
+  lIndex: Integer;
+  lWriteIndex: Integer;
+begin
+  Result := False;
+  if (aWnd = 0) or (Length(aSnapshots) = 0) then
+    Exit;
+
+  lWriteIndex := 0;
+  for lIndex := 0 to High(aSnapshots) do
+  begin
+    if aSnapshots[lIndex].Wnd = aWnd then
+    begin
+      Result := True;
+      Continue;
+    end;
+    if lWriteIndex <> lIndex then
+      aSnapshots[lWriteIndex] := aSnapshots[lIndex];
+    Inc(lWriteIndex);
+  end;
+
+  if Result then
+    SetLength(aSnapshots, lWriteIndex);
+end;
+
+function IsEdgeBasedAppFileName(const aFileName: string): Boolean;
+begin
+  Result := SameText('msedge.exe', ExtractFileName(aFileName));
+end;
+
+procedure PrefetchDeepPrefixMetadataForApp(const aApp: TAppInfo; const aNeedAppUserModelID: Boolean;
+  const aNeedCmdParams: Boolean);
+begin
+  if (aApp = nil) or (aApp.Caption = '') then
+    Exit;
+
+  if aNeedAppUserModelID then
+  begin
+    try
+      aApp.AppUserModelID;
+    except
+      // Window metadata can disappear while we prefetch in parallel; skip transient failures.
+    end;
+  end;
+  if aNeedCmdParams then
+  begin
+    try
+      aApp.CommandLineParams;
+    except
+      // Command-line metadata can be denied for some processes; prefix matching will just not use it.
+    end;
+  end;
+end;
+
+function CompareConsoleSortItems(aList: TStringList; aIndex1: Integer; aIndex2: Integer): Integer;
+var
+  lLeft: string;
+  lRight: string;
+begin
+  lLeft := NormalizeConsoleSortCaption(aList[aIndex1]);
+  lRight := NormalizeConsoleSortCaption(aList[aIndex2]);
+  Result := CompareText(lLeft, lRight);
+  if Result = 0 then
+    Result := CompareText(aList[aIndex1], aList[aIndex2]);
+end;
+
+procedure SortConsoleItems(const aItems: TStrings);
+var
+  lIndex: Integer;
+  lItems: TStringList;
+begin
+  if aItems.Count <= 1 then
+    Exit;
+
+  gc(lItems, TStringList.Create);
+  for lIndex := 0 to aItems.Count - 1 do
+    lItems.AddObject(aItems[lIndex], aItems.Objects[lIndex]);
+
+  lItems.CustomSort(CompareConsoleSortItems);
+  aItems.Assign(lItems);
+end;
+
+function SecondsToIntervalMs(const aSeconds: Integer): Cardinal;
+var
+  lIntervalMs: Int64;
+begin
+  if aSeconds <= 0 then
+    Exit(0);
+
+  lIntervalMs := Int64(aSeconds) * 1000;
+  if lIntervalMs > High(Cardinal) then
+    Result := High(Cardinal)
+  else
+    Result := Cardinal(lIntervalMs);
+end;
+
+function CalculateSharedTimerIntervalMs(const aWindowTitlePollingIntervalMs: Cardinal;
+  const aChatMonitorEnabled: Boolean; const aChatMonitorIntervalMs: Cardinal): Cardinal;
+begin
+  Result := aWindowTitlePollingIntervalMs;
+  if not aChatMonitorEnabled then
+    Exit;
+
+  if aChatMonitorIntervalMs = 0 then
+    Exit;
+
+  if (Result = 0) or (aChatMonitorIntervalMs < Result) then
+    Result := aChatMonitorIntervalMs;
+end;
+
+function IsTimedActionDue(const aNowTick: UInt64; const aLastTick: UInt64;
+  const aIntervalMs: Cardinal): Boolean;
+begin
+  Result := (aIntervalMs <> 0) and ((aLastTick = 0) or ((aNowTick - aLastTick) >= aIntervalMs));
+end;
+
+function ShouldEnablePeriodicWindowPolling(const aStartupDataReady: Boolean;
+  const aIntervalMs: Cardinal): Boolean;
+begin
+  Result := aStartupDataReady and (aIntervalMs <> 0);
+end;
+
 function LoadScriptIgnoreList(const aScriptsDir: string): TStringList;
 var
   lFileName: string;
@@ -652,7 +947,6 @@ begin
   GetWindowThreadProcessId(lWnd, lProcessId);
   PostMessage(lWnd, WM_CLOSE, 0, 0);
   ScheduleWindowActionCleanup(lWnd, lProcessId);
-  QueueGuiRefresh;
 end;
 
 procedure TAppsViewMainFrm.CreateWindowActionsPopupMenu;
@@ -775,11 +1069,20 @@ end;
 procedure TAppsViewMainFrm.QuickValidateListBoxProcesses(const aListBox: TListBox);
 var
   lIndex: Integer;
+  lOldItemIndex: Integer;
+  lOldWnd: hWnd;
   lProcessId: Cardinal;
+  lRemoved: Boolean;
   lWnd: hWnd;
 begin
   if not Assigned(aListBox) then
     Exit;
+
+  lOldItemIndex := aListBox.ItemIndex;
+  lOldWnd := 0;
+  if (lOldItemIndex >= 0) and (lOldItemIndex < aListBox.Items.Count) then
+    lOldWnd := hWnd(aListBox.Items.Objects[lOldItemIndex]);
+  lRemoved := False;
 
   aListBox.Items.BeginUpdate;
   try
@@ -789,29 +1092,30 @@ begin
       if lWnd = 0 then
       begin
         aListBox.Items.Delete(lIndex);
+        lRemoved := True;
         Continue;
       end;
       if not IsWindow(lWnd) then
       begin
         aListBox.Items.Delete(lIndex);
+        lRemoved := True;
         Continue;
       end;
 
       lProcessId := 0;
       GetWindowThreadProcessId(lWnd, lProcessId);
       if (lProcessId = 0) or (not IsProcessActive(lProcessId)) then
+      begin
         aListBox.Items.Delete(lIndex);
+        lRemoved := True;
+      end;
     end;
   finally
     aListBox.Items.EndUpdate;
   end;
 
-  if aListBox.Items.Count = 0 then
-    aListBox.ItemIndex := -1
-  else if aListBox.ItemIndex < 0 then
-    aListBox.ItemIndex := 0
-  else if aListBox.ItemIndex >= aListBox.Items.Count then
-    aListBox.ItemIndex := aListBox.Items.Count - 1;
+  if lRemoved then
+    aListBox.ItemIndex := CalculateWindowItemIndexAfterValidation(aListBox.Items, lOldItemIndex, lOldWnd);
 end;
 
 procedure TAppsViewMainFrm.QuickValidateProcessesOnRefocus;
@@ -826,27 +1130,39 @@ end;
 procedure TAppsViewMainFrm.RemoveWindowFromListBox(const aListBox: TListBox; const aWnd: hWnd);
 var
   lIndex: Integer;
+  lItemIndex: Integer;
+  lRemovedIndex: Integer;
 begin
   if (not Assigned(aListBox)) or (aWnd = 0) then
     Exit;
+
+  lRemovedIndex := -1;
 
   aListBox.Items.BeginUpdate;
   try
     for lIndex := aListBox.Items.Count - 1 downto 0 do
     begin
       if hWnd(aListBox.Items.Objects[lIndex]) = aWnd then
+      begin
         aListBox.Items.Delete(lIndex);
+        lRemovedIndex := lIndex;
+      end;
     end;
   finally
     aListBox.Items.EndUpdate;
   end;
 
-  if aListBox.Items.Count = 0 then
-    aListBox.ItemIndex := -1
-  else if aListBox.ItemIndex < 0 then
-    aListBox.ItemIndex := 0
-  else if aListBox.ItemIndex >= aListBox.Items.Count then
-    aListBox.ItemIndex := aListBox.Items.Count - 1;
+  if lRemovedIndex <> -1 then
+  begin
+    lItemIndex := CalculateItemIndexAfterDeletingIndex(aListBox.Items.Count, lRemovedIndex);
+    SelectListBoxItemIndex(aListBox, lItemIndex);
+    TThread.Queue(nil,
+      procedure
+      begin
+        if not IsShuttingDown then
+          SelectListBoxItemIndex(aListBox, lItemIndex);
+      end);
+  end;
 end;
 
 procedure TAppsViewMainFrm.RemoveWindowFromUiAndCache(const aWnd: hWnd);
@@ -854,64 +1170,71 @@ begin
   if aWnd = 0 then
     Exit;
 
-  fApps.Update;
-  RebuildSharedAppsSnapshot;
+  RemoveWindowFromSnapshots(aWnd);
   RemoveWindowFromListBox(lbApps, aWnd);
   RemoveWindowFromListBox(lbExplorer, aWnd);
   RemoveWindowFromListBox(lbConsole, aWnd);
   UpdateAppDetail(False);
-  QueueGuiRefresh;
+end;
+
+procedure TAppsViewMainFrm.SelectListBoxItemIndex(const aListBox: TListBox; const aItemIndex: Integer);
+var
+  lItemIndex: Integer;
+begin
+  if not Assigned(aListBox) then
+    Exit;
+
+  lItemIndex := aItemIndex;
+  if aListBox.Items.Count = 0 then
+    lItemIndex := -1
+  else if lItemIndex >= aListBox.Items.Count then
+    lItemIndex := aListBox.Items.Count - 1;
+
+  aListBox.ItemIndex := lItemIndex;
+  if lItemIndex >= 0 then
+    aListBox.TopIndex := lItemIndex;
+end;
+
+procedure TAppsViewMainFrm.RemoveWindowFromSnapshots(const aWnd: hWnd);
+begin
+  if aWnd = 0 then
+    Exit;
+
+  ActiveAppViewMainForm.RemoveWindowFromSnapshots(fSharedAppsSnapshot, aWnd);
+  ActiveAppViewMainForm.RemoveWindowFromSnapshots(fChatMonitorSnapshot, aWnd);
 end;
 
 procedure TAppsViewMainFrm.ScheduleWindowActionCleanup(const aWnd: hWnd; const aProcessId: Cardinal);
-begin
-  if IsShuttingDown then
-    Exit;
-
-  RunWindowActionCleanupCheck(aWnd, aProcessId, 0, cWindowActionVerifyDelayMs);
-end;
-
-procedure TAppsViewMainFrm.RunWindowActionCleanupCheck(const aWnd: hWnd; const aProcessId: Cardinal;
-  const aElapsedMs: Cardinal; const aDelayMs: Cardinal);
 var
-  lDelayMs: Cardinal;
+  lThread: TThread;
 begin
-  if IsShuttingDown then
+  if IsShuttingDown or (aWnd = 0) then
     Exit;
 
-  lDelayMs := aDelayMs;
-  if lDelayMs = 0 then
-    lDelayMs := cWindowActionVerifyDelayMs;
-  CallmeLater(
+  lThread := TThread.CreateAnonymousThread(
     procedure
     var
       lElapsedMs: Cardinal;
-      lNextDelayMs: Cardinal;
     begin
-      if IsShuttingDown then
-        Exit;
-      if (aWnd <> 0) and (not IsWindow(aWnd)) then
+      lElapsedMs := 0;
+      while (not IsShuttingDown) and (lElapsedMs < cWindowActionProbeMaxDurationMs) do
       begin
-        RemoveWindowFromUiAndCache(aWnd);
-        Exit;
+        TThread.Sleep(cWindowActionProbeIntervalMs);
+        Inc(lElapsedMs, cWindowActionProbeIntervalMs);
+        if (not IsWindow(aWnd)) or ((aProcessId <> 0) and (not IsProcessActive(aProcessId))) then
+        begin
+          TThread.Synchronize(nil,
+            procedure
+            begin
+              if not IsShuttingDown then
+                RemoveWindowFromUiAndCache(aWnd);
+            end);
+          Exit;
+        end;
       end;
-      if not IsProcessActive(aProcessId) then
-      begin
-        RemoveWindowFromUiAndCache(aWnd);
-        Exit;
-      end;
-
-      lElapsedMs := aElapsedMs + lDelayMs;
-      if lElapsedMs >= cWindowActionVerifyMaxDurationMs then
-        Exit;
-
-      lNextDelayMs := lDelayMs + cWindowActionVerifyDelayStepMs;
-      if (lElapsedMs + lNextDelayMs) > cWindowActionVerifyMaxDurationMs then
-        lNextDelayMs := cWindowActionVerifyMaxDurationMs - lElapsedMs;
-      RunWindowActionCleanupCheck(aWnd, aProcessId, lElapsedMs, lNextDelayMs);
-    end,
-    lDelayMs,
-    Self);
+    end);
+  lThread.FreeOnTerminate := True;
+  lThread.Start;
 end;
 
 procedure TAppsViewMainFrm.BringToFrontFocusedApp(lb: TListBox);
@@ -957,7 +1280,6 @@ begin
   end;
 
   ScheduleWindowActionCleanup(lWnd, lProcessId);
-  QueueGuiRefresh;
 end;
 
 procedure TAppsViewMainFrm.WindowActionsPopupMenuPopup(aSender: TObject);
@@ -976,7 +1298,7 @@ begin
   lCanCaptionOverride := False;
   if lHasWindow and IsCaptionOverrideListBox(lListBox) then
     lCanCaptionOverride := GetSelectedWindowInfo(lListBox, lWnd, lProcessId);
-  lCanWindowAction := lHasWindow and ((lListBox = lbApps) or (lListBox = lbExplorer));
+  lCanWindowAction := lHasWindow and IsWindowActionListBox(lListBox, lbApps, lbExplorer, lbConsole);
 
   if Assigned(fCloseWindowMenuItem) then
     fCloseWindowMenuItem.Enabled := lCanWindowAction;
@@ -1360,7 +1682,10 @@ begin
           LogStartupTiming('Warmup.SynchronizeUi');
           if TInterlocked.CompareExchange(fStartupProfileWarmupDoneLogged, 1, 0) = 0 then
             LogStartupTiming('Warmup.Done');
-          tmrChatMonitor.Enabled := fChatMonitorConfiguredEnabled;
+          tmrChatMonitor.Enabled := CalculateSharedTimerIntervalMs(
+            fWindowTitlePollingIntervalMs,
+            fChatMonitorConfiguredEnabled,
+            fChatMonitorIntervalMs) <> 0;
           StartDeepPrefixLoad;
           UpdateGui;
         end);
@@ -1371,6 +1696,9 @@ end;
 procedure TAppsViewMainFrm.RunDeepPrefixLoad;
 var
   lApps: TArray<TAppInfo>;
+  lEdgeApps: TArray<TAppInfo>;
+  lEdgeCount: Integer;
+  lEdgePrefixPrefetchMs: Int64;
   lIndex: Integer;
   lNeedAppUserModelID: Boolean;
   lNeedCmdParams: Boolean;
@@ -1411,33 +1739,52 @@ begin
     Exit;
   end;
 
+  SetLength(lEdgeApps, Length(lApps));
+  lEdgeCount := 0;
+  for lIndex := 0 to High(lApps) do
+  begin
+    if (lApps[lIndex] <> nil) and IsEdgeBasedAppFileName(lApps[lIndex].FileName) then
+    begin
+      lEdgeApps[lEdgeCount] := lApps[lIndex];
+      Inc(lEdgeCount);
+    end;
+  end;
+  SetLength(lEdgeApps, lEdgeCount);
+
+  if Length(lEdgeApps) <> 0 then
+  begin
+    lPhaseWatch := TStopwatch.StartNew;
+    TParallel.&For(0, High(lEdgeApps),
+      procedure(aIndex: Integer)
+      begin
+        if IsShuttingDown then
+          Exit;
+
+        PrefetchDeepPrefixMetadataForApp(lEdgeApps[aIndex], lNeedAppUserModelID, lNeedCmdParams);
+      end);
+    lEdgePrefixPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
+
+    if not IsShuttingDown then
+    begin
+      TInterlocked.Exchange(fDeepPrefixEdgeReady, 1);
+      LogStartupTiming(
+        'DeepPrefix.EdgeReady',
+        Format(
+          'apps=%d appUserModelId=%s cmdParams=%s prefetch=%dms',
+          [Length(lEdgeApps), BoolToStr(lNeedAppUserModelID, True), BoolToStr(lNeedCmdParams, True),
+           lEdgePrefixPrefetchMs]));
+      QueueGuiRefresh;
+    end;
+  end;
+
   lPhaseWatch := TStopwatch.StartNew;
   TParallel.&For(0, High(lApps),
     procedure(aIndex: Integer)
-    var
-      lApp: TAppInfo;
     begin
-      lApp := lApps[aIndex];
       if IsShuttingDown then
         Exit;
 
-      if (lApp = nil) or (lApp.Caption = '') then
-        Exit;
-
-      if lNeedAppUserModelID then
-      begin
-        try
-          lApp.AppUserModelID;
-        except
-        end;
-      end;
-      if lNeedCmdParams then
-      begin
-        try
-          lApp.CommandLineParams;
-        except
-        end;
-      end;
+      PrefetchDeepPrefixMetadataForApp(lApps[aIndex], lNeedAppUserModelID, lNeedCmdParams);
     end);
   lPrefixPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
 
@@ -1453,6 +1800,7 @@ end;
 procedure TAppsViewMainFrm.OnDeepPrefixLoadDone;
 begin
   TInterlocked.Exchange(fDeepPrefixLoadBusy, 0);
+  TInterlocked.Exchange(fDeepPrefixEdgeReady, 1);
   TInterlocked.Exchange(fDeepPrefixReady, 1);
 
   if IsShuttingDown then
@@ -1493,7 +1841,10 @@ begin
   if TInterlocked.CompareExchange(fStartupProfileWarmupDoneLogged, 1, 0) = 0 then
     LogStartupTiming('Warmup.Done');
 
-  tmrChatMonitor.Enabled := fChatMonitorConfiguredEnabled;
+  tmrChatMonitor.Enabled := CalculateSharedTimerIntervalMs(
+    fWindowTitlePollingIntervalMs,
+    fChatMonitorConfiguredEnabled,
+    fChatMonitorIntervalMs) <> 0;
   StartDeepPrefixLoad;
   QueueGuiRefresh;
 end;
@@ -1813,7 +2164,10 @@ end;
 
 procedure TAppsViewMainFrm.FormCreate(Sender: TObject);
 var
+  lChatMonitorCheckSeconds: Integer;
   lIniFile: TMemIniFile;
+  lTimerIntervalMs: Cardinal;
+  lWindowTitlePollingSeconds: Integer;
 begin
   fStartupProfileLog := TStringList.Create;
   fStartupProfileLogSync := TCriticalSection.Create;
@@ -1844,6 +2198,7 @@ begin
   labShortCutsTitle.Height := labTemplateActiv.Height;
   ActiveControlChanged(nil);
   ApplyProportionalColumnWidths;
+  lbConsole.Sorted := False;
   fOrgAppOnActivate := application.OnActivate;
   application.OnActivate := AppOnActivate;
 
@@ -1854,11 +2209,29 @@ begin
   fChatMonitorConfiguredEnabled := lIniFile.ReadBool('ChatMonitor', 'Enabled', False);
   chkChatNotificationSound.Enabled := fChatMonitorConfiguredEnabled;
   fChatMonitor.SoundEnabled := chkChatNotificationSound.Checked;
-  tmrChatMonitor.Interval := lIniFile.ReadInteger('ChatMonitor', 'CheckIntervalSeconds', 5) * 1000;
+  lChatMonitorCheckSeconds := lIniFile.ReadInteger(
+    cChatMonitorSectionName,
+    cCheckIntervalSecondsKey,
+    cDefaultIntervalSeconds);
+  fChatMonitorIntervalMs := SecondsToIntervalMs(lChatMonitorCheckSeconds);
+  lWindowTitlePollingSeconds := lIniFile.ReadInteger(
+    cWindowTitlePollingSectionName,
+    cWindowTitlePollingIntervalSecondsKey,
+    cDefaultIntervalSeconds);
+  fWindowTitlePollingIntervalMs := SecondsToIntervalMs(lWindowTitlePollingSeconds);
+  lTimerIntervalMs := CalculateSharedTimerIntervalMs(
+    fWindowTitlePollingIntervalMs,
+    fChatMonitorConfiguredEnabled,
+    fChatMonitorIntervalMs);
+  if lTimerIntervalMs <> 0 then
+    tmrChatMonitor.Interval := lTimerIntervalMs;
   tmrChatMonitor.Enabled := False;
+  fLastChatMonitorTick := 0;
+  fLastWindowTitlePollingTick := 0;
   SetLength(fSharedAppsSnapshot, 0);
   SetLength(fChatMonitorSnapshot, 0);
   fSharedAppsSnapshotTick := 0;
+  TInterlocked.Exchange(fDeepPrefixEdgeReady, 0);
   TInterlocked.Exchange(fDeepPrefixLoadBusy, 0);
   TInterlocked.Exchange(fDeepPrefixReady, 0);
   TInterlocked.Exchange(fStartupDataReady, 0);
@@ -1983,7 +2356,8 @@ begin
 
   if Key = VK_RETURN then
     BringToFrontFocusedApp(Sender as TListBox)
-  else if (Key = Ord('W')) and (ssCtrl in Shift) and ((Sender = lbApps) or (Sender = lbExplorer)) then
+  else if (Key = Ord('W')) and (ssCtrl in Shift)
+    and IsWindowActionListBox(Sender, lbApps, lbExplorer, lbConsole) then
   begin
     CloseSelectedWindow(Sender as TListBox);
     Key := 0;
@@ -2117,6 +2491,20 @@ begin
   Result := (TInterlocked.CompareExchange(fDeepPrefixReady, 0, 0) <> 0);
 end;
 
+function TAppsViewMainFrm.IsEdgePrefixReady: Boolean;
+begin
+  Result := (TInterlocked.CompareExchange(fDeepPrefixEdgeReady, 0, 0) <> 0);
+end;
+
+function TAppsViewMainFrm.IsDeepPrefixAllowedForApp(const aApp: TAppInfo): Boolean;
+begin
+  Result := IsDeepPrefixReady;
+  if Result or (aApp = nil) then
+    Exit;
+
+  Result := IsEdgePrefixReady and IsEdgeBasedAppFileName(aApp.FileName);
+end;
+
 procedure TAppsViewMainFrm.RequestAsyncStop(const aAsync: iAsync);
 var
   lAsyncIntern: iAsyncIntern;
@@ -2237,39 +2625,8 @@ end;
 
 procedure TAppsViewMainFrm.RestoreItemIndex(lb: TListBox; wnd: hwnd;
   oldItemIndex: integer; const aOldItemCaption: string);
-var
-  lIndex: integer;
-  X: integer;
 begin
-  if lb.Items.Count = 0 then
-  begin
-    lb.ItemIndex := -1;
-    exit;
-  end;
-  for X := 0 to lb.Items.Count - 1 do
-    if wnd = hwnd(lb.Items.Objects[X]) then
-    begin
-      lb.ItemIndex := X;
-      exit;
-    end;
-
-  if (aOldItemCaption <> '') and lb.Sorted then
-  begin
-    lIndex := FindSortedCaptionIndex(lb.Items, aOldItemCaption);
-    if lIndex <> -1 then
-    begin
-      lb.ItemIndex := lIndex;
-      exit;
-    end;
-  end;
-
-  if (oldItemIndex >= 0) and (oldItemIndex < lb.Items.Count) then
-    lb.ItemIndex := oldItemIndex
-  else if oldItemIndex >= lb.Items.Count then
-    lb.ItemIndex := lb.Items.Count - 1
-  else if oldItemIndex < 0 then
-    lb.ItemIndex := 0;
-
+  lb.ItemIndex := CalculateRestoredItemIndex(lb.Items, wnd, oldItemIndex, aOldItemCaption, lb.Sorted);
 end;
 
 function RunMainFormSelfTests(const aArg: string): Integer;
@@ -2290,6 +2647,8 @@ var
   lScriptNames: TStringList;
   lScriptsWidth: Integer;
   lShortCutsWidth: Integer;
+  lSnapshots: TArray<TChatAppSnapshot>;
+  lTitle: string;
   lTargetPath: string;
 begin
   Result := -1;
@@ -2322,8 +2681,224 @@ begin
         Writeln(Format('SELFTEST FAILED: expected missing caption index=-1, got %d', [lResultIndex]));
         Result := 1;
       end;
+      lItems.Sorted := False;
+      lItems.Clear;
+      lItems.AddObject('A', TObject(hWnd(10)));
+      lItems.AddObject('B', TObject(hWnd(20)));
+      lResultIndex := CalculateRestoredItemIndex(lItems, 0, -1, '', False);
+      if lResultIndex <> -1 then
+      begin
+        Writeln(Format('SELFTEST FAILED: restore item index should preserve no selection actual=%d',
+          [lResultIndex]));
+        Result := 1;
+      end;
     finally
       lItems.Free;
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cConsoleTitleSortSelfTestArg) then
+  begin
+    Result := 0;
+    lItems := TStringList.Create;
+    try
+      lTitle := Char($280F) + ' ActiveAppView';
+      lItems.AddObject('monitor-msgsend', TObject(3));
+      lItems.AddObject(Char($2839) + ' te5', TObject(4));
+      lItems.AddObject(lTitle, TObject(1));
+      lItems.AddObject('Flexdoc-Group', TObject(2));
+
+      SortConsoleItems(lItems);
+
+      if lItems[0] <> lTitle then
+      begin
+        Writeln(Format('SELFTEST FAILED: console sort expected first="%s" actual="%s"', [lTitle, lItems[0]]));
+        Result := 1;
+      end;
+      if lItems.Objects[0] <> TObject(1) then
+      begin
+        Writeln('SELFTEST FAILED: console sort did not preserve window object');
+        Result := 1;
+      end;
+      if NormalizeConsoleSortCaption(Char($280F) + Char($2839) + '  ActiveAppView') <> 'ActiveAppView' then
+      begin
+        Writeln('SELFTEST FAILED: console sort normalizer did not strip Codex working prefix');
+        Result := 1;
+      end;
+    finally
+      lItems.Free;
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cConsolePollAppPurgeSelfTestArg) then
+  begin
+    Result := 0;
+    lItems := TStringList.Create;
+    try
+      lItems.AddObject('App', TObject(hWnd(10)));
+      lItems.AddObject('Terminal', TObject(hWnd(20)));
+      if not RemoveWindowsFromItems(lItems, [hWnd(20)]) then
+      begin
+        Writeln('SELFTEST FAILED: console poll app purge reported no removal');
+        Result := 1;
+      end;
+      if lItems.Count <> 1 then
+      begin
+        Writeln(Format('SELFTEST FAILED: console poll app purge expected count=1 actual=%d',
+          [lItems.Count]));
+        Result := 1;
+      end;
+      if (lItems.Count > 0) and (hWnd(lItems.Objects[0]) <> hWnd(10)) then
+      begin
+        Writeln('SELFTEST FAILED: console poll app purge removed the wrong window');
+        Result := 1;
+      end;
+    finally
+      lItems.Free;
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cWindowActionProbeSelfTestArg) then
+  begin
+    Result := 0;
+    if not IsWindowActionListBox(TObject(3), TObject(1), TObject(2), TObject(3)) then
+    begin
+      Writeln('SELFTEST FAILED: console listbox should support window actions');
+      Result := 1;
+    end;
+    SetLength(lSnapshots, 2);
+    lSnapshots[0].Wnd := hWnd(10);
+    lSnapshots[0].Caption := 'App';
+    lSnapshots[1].Wnd := hWnd(20);
+    lSnapshots[1].Caption := 'Terminal';
+    if not RemoveWindowFromSnapshots(lSnapshots, hWnd(20)) then
+    begin
+      Writeln('SELFTEST FAILED: window-action probe should remove a closed window from snapshots');
+      Result := 1;
+    end;
+    if Length(lSnapshots) <> 1 then
+    begin
+      Writeln(Format('SELFTEST FAILED: window-action probe expected snapshot count=1 actual=%d',
+        [Length(lSnapshots)]));
+      Result := 1;
+    end;
+    if (Length(lSnapshots) > 0) and (lSnapshots[0].Wnd <> hWnd(10)) then
+    begin
+      Writeln('SELFTEST FAILED: window-action probe removed the wrong snapshot');
+      Result := 1;
+    end;
+    lItems := TStringList.Create;
+    try
+      lItems.AddObject('first', TObject(hWnd(10)));
+      lItems.AddObject('selected', TObject(hWnd(20)));
+      lItems.AddObject('third', TObject(hWnd(30)));
+      lItems.Delete(0);
+      lResultIndex := CalculateWindowItemIndexAfterRemoval(lItems, 1, hWnd(20), hWnd(10));
+      if lResultIndex <> 0 then
+      begin
+        Writeln(Format('SELFTEST FAILED: window-action probe should preserve selected hwnd at index 0 actual=%d',
+          [lResultIndex]));
+        Result := 1;
+      end;
+      lResultIndex := CalculateWindowItemIndexAfterRemoval(lItems, 0, hWnd(20), hWnd(20));
+      if lResultIndex <> 0 then
+      begin
+        Writeln(Format('SELFTEST FAILED: window-action probe should select nearest surviving item actual=%d',
+          [lResultIndex]));
+        Result := 1;
+      end;
+      lResultIndex := CalculateItemIndexAfterDeletingIndex(9, 6);
+      if lResultIndex <> 6 then
+      begin
+        Writeln(Format('SELFTEST FAILED: deleting 7th listbox item should keep index 6 actual=%d',
+          [lResultIndex]));
+        Result := 1;
+      end;
+      lResultIndex := CalculateItemIndexAfterDeletingIndex(6, 6);
+      if lResultIndex <> 5 then
+      begin
+        Writeln(Format('SELFTEST FAILED: deleting last listbox item should clamp to previous actual=%d',
+          [lResultIndex]));
+        Result := 1;
+      end;
+      lResultIndex := CalculateWindowItemIndexAfterRemoval(lItems, -1, 0, hWnd(10));
+      if lResultIndex <> -1 then
+      begin
+        Writeln(Format('SELFTEST FAILED: window-action probe should preserve no selection actual=%d',
+          [lResultIndex]));
+        Result := 1;
+      end;
+      lItems.Clear;
+      lItems.AddObject('first', TObject(hWnd(10)));
+      lItems.AddObject('selected', TObject(hWnd(20)));
+      lItems.AddObject('third', TObject(hWnd(30)));
+      lItems.Delete(0);
+      lResultIndex := CalculateWindowItemIndexAfterValidation(lItems, 1, hWnd(20));
+      if lResultIndex <> 0 then
+      begin
+        Writeln(Format('SELFTEST FAILED: refocus validation should preserve selected hwnd at index 0 actual=%d',
+          [lResultIndex]));
+        Result := 1;
+      end;
+      lItems.Delete(0);
+      lResultIndex := CalculateWindowItemIndexAfterValidation(lItems, 0, hWnd(20));
+      if lResultIndex <> 0 then
+      begin
+        Writeln(Format('SELFTEST FAILED: refocus validation should select nearest surviving item actual=%d',
+          [lResultIndex]));
+        Result := 1;
+      end;
+    finally
+      lItems.Free;
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cWindowTitlePollingSelfTestArg) then
+  begin
+    Result := 0;
+    if ShouldEnablePeriodicWindowPolling(False, 5000) then
+    begin
+      Writeln('SELFTEST FAILED: window title polling should stay disabled before startup data is ready');
+      Result := 1;
+    end;
+    if ShouldEnablePeriodicWindowPolling(True, 0) then
+    begin
+      Writeln('SELFTEST FAILED: window title polling should stay disabled when interval is 0');
+      Result := 1;
+    end;
+    if not ShouldEnablePeriodicWindowPolling(True, 5000) then
+    begin
+      Writeln('SELFTEST FAILED: window title polling should be enabled after startup data is ready');
+      Result := 1;
+    end;
+    if CalculateSharedTimerIntervalMs(5000, True, 30000) <> 5000 then
+    begin
+      Writeln('SELFTEST FAILED: shared timer should use the shorter window-title interval');
+      Result := 1;
+    end;
+    if CalculateSharedTimerIntervalMs(0, True, 30000) <> 30000 then
+    begin
+      Writeln('SELFTEST FAILED: shared timer should use chat interval when title polling is disabled');
+      Result := 1;
+    end;
+    if CalculateSharedTimerIntervalMs(0, False, 30000) <> 0 then
+    begin
+      Writeln('SELFTEST FAILED: shared timer should be disabled when no timed feature is active');
+      Result := 1;
+    end;
+    if not IsTimedActionDue(10000, 4000, 5000) then
+    begin
+      Writeln('SELFTEST FAILED: timed action should be due after elapsed interval');
+      Result := 1;
+    end;
+    if IsTimedActionDue(10000, 6000, 5000) then
+    begin
+      Writeln('SELFTEST FAILED: timed action should not be due before elapsed interval');
+      Result := 1;
     end;
     Exit;
   end;
@@ -2383,6 +2958,7 @@ begin
     end;
     Exit;
   end;
+
   if SameText(aArg, cShortCutValueParsingSelfTestArg) then
   begin
     Result := 0;
@@ -2546,11 +3122,102 @@ begin
 end;
 
 procedure TAppsViewMainFrm.tmrChatMonitorTimer(Sender: TObject);
+var
+  lNowTick: UInt64;
 begin
   if IsShuttingDown then
     Exit;
 
-  StartChatMonitorProcessing;
+  lNowTick := GetTickCount64;
+  if IsTimedActionDue(lNowTick, fLastWindowTitlePollingTick, fWindowTitlePollingIntervalMs) then
+  begin
+    fLastWindowTitlePollingTick := lNowTick;
+    RefreshConsoleList;
+  end;
+
+  if fChatMonitorConfiguredEnabled and IsTimedActionDue(lNowTick, fLastChatMonitorTick, fChatMonitorIntervalMs) then
+  begin
+    fLastChatMonitorTick := lNowTick;
+    StartChatMonitorProcessing;
+  end;
+end;
+
+procedure TAppsViewMainFrm.RefreshConsoleList;
+var
+  lApp: TAppInfo;
+  lCaption: string;
+  lConsoleFocusedCaption: string;
+  lConsoleWnd: hWnd;
+  lExcludeMasks: TStringArray;
+  lIndex: Integer;
+  lOldConsoleIndex: Integer;
+  lPrefixRules: TPrefixRuleArray;
+  lStartupDataReady: Boolean;
+  lTerminalCount: Integer;
+  lTerminalPatterns: TStringArray;
+  lTerminalWindows: TArray<hWnd>;
+  lTitle: string;
+  lWindowProcessId: Cardinal;
+begin
+  if IsShuttingDown then
+    Exit;
+
+  lStartupDataReady := IsStartupDataReady;
+  if not lStartupDataReady then
+  begin
+    StartStartupDataLoad;
+    Exit;
+  end;
+
+  EnsureSharedAppsSnapshotFresh(0);
+
+  lExcludeMasks := fConfigCache.GetHideMasks(cHideMaskFileName);
+  lPrefixRules := fConfigCache.GetPrefixRules(cPrefixMaskFileName);
+  lTerminalPatterns := fConfigCache.GetTerminalPatterns(cTerminalPatternsFileName);
+
+  lOldConsoleIndex := lbConsole.ItemIndex;
+  lConsoleFocusedCaption := '';
+  if lOldConsoleIndex <> -1 then
+    lConsoleFocusedCaption := lbConsole.Items[lOldConsoleIndex];
+  lConsoleWnd := GetWnd(lbConsole);
+  SetLength(lTerminalWindows, fApps.Count);
+  lTerminalCount := 0;
+
+  lbConsole.Items.BeginUpdate;
+  try
+    lbConsole.Items.Clear;
+    for lIndex := 0 to fApps.Count - 1 do
+    begin
+      lApp := fApps[lIndex];
+      if (lApp.wnd = application.Handle)
+        or (lApp.wnd = self.Handle) then
+        Continue;
+
+      if lApp.caption = '' then
+        Continue;
+      if ExcludeByMask(lApp, lExcludeMasks, True) then
+        Continue;
+      if not IsTerminalApp(lApp.FileName, lTerminalPatterns) then
+        Continue;
+
+      lWindowProcessId := lApp.PID;
+      lCaption := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lApp.wnd, lWindowProcessId, lApp.Caption);
+      lTitle := Trim(BuildWindowDisplayCaption(lCaption, lApp.FileName));
+      CheckPrefixRule(lTitle, lApp, lPrefixRules, True, False);
+      lbConsole.Items.AddObject(lTitle, TObject(lApp.wnd));
+      lTerminalWindows[lTerminalCount] := lApp.wnd;
+      Inc(lTerminalCount);
+    end;
+    SortConsoleItems(lbConsole.Items);
+  finally
+    lbConsole.Items.EndUpdate;
+  end;
+
+  SetLength(lTerminalWindows, lTerminalCount);
+  if RemoveWindowsFromListBox(lbApps, lTerminalWindows) then
+    UpdateAppDetail(False);
+
+  RestoreItemIndex(lbConsole, lConsoleWnd, lOldConsoleIndex, lConsoleFocusedCaption);
 end;
 
 procedure TAppsViewMainFrm.UpdateAppDetail(const aAllowExtendedMetadata: Boolean);
@@ -2691,10 +3358,11 @@ begin
       end
       else
       begin
-        CheckPrefixRule(lTitle, lApp, lPrefixRules, lStartupDataReady, lDeepPrefixReady);
+        CheckPrefixRule(lTitle, lApp, lPrefixRules, lStartupDataReady, IsDeepPrefixAllowedForApp(lApp));
         lbApps.Items.AddObject(lTitle, TObject(lApp.wnd));
       end;
     end;
+    SortConsoleItems(lbConsole.Items);
   finally
     lbConsole.Items.EndUpdate;
     lbApps.Items.EndUpdate;
