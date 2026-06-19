@@ -247,6 +247,7 @@ const
   cShortCutsFileName = 'ShortCuts.txt';
   cTerminalPatternsFileName = 'TerminalPatterns.txt';
   cScriptsFolderName = 'Scripts';
+  cScriptsIgnoreFileName = '.ignore';
   cHideMaskFileName = 'HideMask.txt';
   cPrefixMaskFileName = 'PrefixMask.txt';
   cSettingsFileName = 'settings.ini';
@@ -254,6 +255,7 @@ const
   cResizeColumnWidthsSelfTestArg = '--self-test-resize-column-widths';
   cShortCutValueParsingSelfTestArg = '--self-test-shortcut-value-parsing';
   cWindowCaptionOverridesSelfTestArg = '--self-test-window-caption-overrides';
+  cScriptsIgnoreSelfTestArg = '--self-test-scripts-ignore';
   cWarmupPrefetchSelfTestArg = '--self-test-startup-warmup-prefetch';
   cWarmupShutdownCheckSelfTestArg = '--self-test-startup-warmup-shutdown-check';
   cAppsColumnDesignWidth = 506;
@@ -465,6 +467,70 @@ begin
   lItems.Sorted := True;
   if lItems.Find(aOldItemCaption, lIndex) then
     Result := lIndex;
+end;
+
+function LoadScriptIgnoreList(const aScriptsDir: string): TStringList;
+var
+  lFileName: string;
+  lIgnoreFileName: string;
+  lLine: string;
+  lLines: TStringList;
+begin
+  Result := TStringList.Create;
+  Result.CaseSensitive := False;
+  Result.Sorted := True;
+  Result.Duplicates := dupIgnore;
+
+  lIgnoreFileName := CombinePath([aScriptsDir, cScriptsIgnoreFileName]);
+  if not TFile.Exists(lIgnoreFileName) then
+    Exit;
+
+  lLines := TStringList.Create;
+  try
+    lLines.LoadFromFile(lIgnoreFileName, TEncoding.UTF8);
+    for lLine in lLines do
+    begin
+      lFileName := Trim(lLine);
+      if (lFileName = '') or StartsText('#', lFileName) then
+        Continue;
+
+      Result.Add(ExtractFileName(lFileName));
+    end;
+  finally
+    lLines.Free;
+  end;
+end;
+
+function IsIgnoredScriptFile(const aScriptFileName: string; const aIgnoredScripts: TStrings): Boolean;
+begin
+  Result := Assigned(aIgnoredScripts) and (aIgnoredScripts.IndexOf(ExtractFileName(aScriptFileName)) <> -1);
+end;
+
+function BuildScriptsSnapshotForFolder(const aScriptsDir: string): TStringArray;
+var
+  lExt: string;
+  lIgnoredScripts: TStringList;
+  lScriptFile: string;
+begin
+  SetLength(Result, 0);
+  if not TDirectory.Exists(aScriptsDir) then
+    Exit;
+
+  lIgnoredScripts := LoadScriptIgnoreList(aScriptsDir);
+  try
+    for lScriptFile in TDirectory.GetFiles(aScriptsDir, '*.*') do
+    begin
+      lExt := ExtractFileExt(lScriptFile);
+      if System.StrUtils.MatchText(lExt, ['.cmd', '.bat', '.ps1', '.exe', '.py'])
+        and not IsIgnoredScriptFile(lScriptFile, lIgnoredScripts) then
+      begin
+        SetLength(Result, Length(Result) + 1);
+        Result[High(Result)] := ExtractFileName(lScriptFile);
+      end;
+    end;
+  finally
+    lIgnoredScripts.Free;
+  end;
 end;
 
 procedure PrefetchAppFileNamesInParallel(
@@ -1060,9 +1126,6 @@ end;
 
 function TAppsViewMainFrm.BuildAuxListsSnapshot: TObject;
 var
-  lExt: string;
-  lItem: TNamedValue;
-  lScriptFile: string;
   lScriptsDir: string;
   lPublicDesktop: string;
   lSnapshot: TAuxListsSnapshot;
@@ -1096,26 +1159,7 @@ begin
 
     SetLength(lSnapshot.Scripts, 0);
     lScriptsDir := CombinePath([GetInstallDir, cScriptsFolderName]);
-    if TDirectory.Exists(lScriptsDir) then
-    begin
-      for lScriptFile in TDirectory.GetFiles(lScriptsDir, '*.*') do
-      begin
-        if IsShuttingDown then
-        begin
-          lSnapshot.Free;
-          Exit(nil);
-        end;
-
-        lExt := ExtractFileExt(lScriptFile);
-        if System.StrUtils.MatchText(lExt, ['.cmd', '.bat', '.ps1', '.exe', '.py']) then
-        begin
-          lItem.Name := ExtractFileName(lScriptFile);
-          lItem.Value := '';
-          SetLength(lSnapshot.Scripts, Length(lSnapshot.Scripts) + 1);
-          lSnapshot.Scripts[High(lSnapshot.Scripts)] := lItem.Name;
-        end;
-      end;
-    end;
+    lSnapshot.Scripts := BuildScriptsSnapshotForFolder(lScriptsDir);
 
     Result := lSnapshot;
   except
@@ -2241,6 +2285,9 @@ var
   lOverrides: TDictionary<string, string>;
   lParams: string;
   lResultIndex: Integer;
+  lScripts: TStringArray;
+  lScriptsDir: string;
+  lScriptNames: TStringList;
   lScriptsWidth: Integer;
   lShortCutsWidth: Integer;
   lTargetPath: string;
@@ -2281,6 +2328,61 @@ begin
     Exit;
   end;
 
+  if SameText(aArg, cScriptsIgnoreSelfTestArg) then
+  begin
+    Result := 0;
+    lScriptsDir := TPath.Combine(TPath.GetTempPath, 'ActiveAppView.selftest.scripts-ignore');
+    if TDirectory.Exists(lScriptsDir) then
+      TDirectory.Delete(lScriptsDir, True);
+    TDirectory.CreateDirectory(lScriptsDir);
+    lScriptNames := TStringList.Create;
+    try
+      lScriptNames.CaseSensitive := False;
+      lScriptNames.Sorted := True;
+      TFile.WriteAllText(CombinePath([lScriptsDir, 'visible.cmd']), '', TEncoding.UTF8);
+      TFile.WriteAllText(CombinePath([lScriptsDir, 'VisibleTool.PS1']), '', TEncoding.UTF8);
+      TFile.WriteAllText(CombinePath([lScriptsDir, 'helper.ps1']), '', TEncoding.UTF8);
+      TFile.WriteAllText(CombinePath([lScriptsDir, 'ignored.py']), '', TEncoding.UTF8);
+      TFile.WriteAllText(CombinePath([lScriptsDir, 'notes.txt']), '', TEncoding.UTF8);
+      TFile.WriteAllText(
+        CombinePath([lScriptsDir, cScriptsIgnoreFileName]),
+        '# helper scripts' + sLineBreak + 'HELPER.PS1' + sLineBreak + '.\ignored.py' + sLineBreak,
+        TEncoding.UTF8);
+
+      lScripts := BuildScriptsSnapshotForFolder(lScriptsDir);
+      lScriptNames.AddStrings(lScripts);
+      if lScriptNames.IndexOf('helper.ps1') <> -1 then
+      begin
+        Writeln('SELFTEST FAILED: scripts ignore should hide helper.ps1');
+        Result := 1;
+      end;
+      if lScriptNames.IndexOf('ignored.py') <> -1 then
+      begin
+        Writeln('SELFTEST FAILED: scripts ignore should hide ignored.py from relative path entry');
+        Result := 1;
+      end;
+      if lScriptNames.IndexOf('visible.cmd') = -1 then
+      begin
+        Writeln('SELFTEST FAILED: scripts ignore should keep visible.cmd');
+        Result := 1;
+      end;
+      if lScriptNames.IndexOf('VisibleTool.PS1') = -1 then
+      begin
+        Writeln('SELFTEST FAILED: scripts ignore should keep VisibleTool.PS1');
+        Result := 1;
+      end;
+      if lScriptNames.IndexOf('notes.txt') <> -1 then
+      begin
+        Writeln('SELFTEST FAILED: scripts snapshot should not include non-script files');
+        Result := 1;
+      end;
+    finally
+      lScriptNames.Free;
+      if TDirectory.Exists(lScriptsDir) then
+        TDirectory.Delete(lScriptsDir, True);
+    end;
+    Exit;
+  end;
   if SameText(aArg, cShortCutValueParsingSelfTestArg) then
   begin
     Result := 0;

@@ -15,6 +15,12 @@ Accessibility tool for active application / explorer quick selection
 - Lines starting with `#` or `;`, or empty lines, are ignored.
 - Patterns match against the full executable path (e.g., `C:\Windows\System32\cmd.exe`).
 
+## Scripts folder
+- The Scripts list shows runnable files from `Scripts` next to `ActiveAppView.exe`.
+- Supported runnable extensions are `.cmd`, `.bat`, `.ps1`, `.exe`, and `.py`.
+- Add helper scripts to `Scripts\.ignore`, one filename per line, to keep them out of the F3 Scripts list.
+- `.ignore` entries are matched case-insensitively by filename. Empty lines and `#` comments are ignored.
+
 ## ShortCuts.txt (next to ActiveAppView.exe)
 - One mapping per line: `KEY=VALUE` (KEY may include spaces).
 - VALUE is everything after the first `=`.

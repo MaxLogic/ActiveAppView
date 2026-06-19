@@ -13,8 +13,10 @@ All notable changes to this project are documented in this file.
 - Chat monitor now supports a PrefixMask-style review filter file (`ChatReviewMask.txt`), configured by `[ChatMonitor] ReviewMaskFile` in `settings.ini`.
 - Main form now includes a `Play chat notification sounds` checkbox that toggles chat sounds at runtime and persists to `[ChatMonitor] SoundEnabled`.
 - Applications and Console instances now support temporary per-window caption overrides via context-menu Rename, with dialog Reset restoring the live window title while preserving the normal filename/path display and preventing Enter-confirm from activating the selected window.
+- Scripts can now be hidden from the F3 Scripts list with a `Scripts\.ignore` file, one filename per line.
 
 ### Changed
+- Desktop recovery launchers now delegate to PowerShell scripts that discover NVDA, MouseBeam, and Logi Options+ paths at runtime instead of relying on fixed local paths.
 - Applications and Explorer lists now support window actions via context menu (`Close`, `Terminate`) and `Ctrl+W` on focused list items for normal close.
 - Post-close/post-terminate cleanup now retries process/window validation with increasing delays for up to 5 seconds, removing entries only after the target is actually gone; refocus still performs a quick stale-entry prune before full refresh.
 - Unread caption parsing now accepts all Unicode decimal digits (including fullwidth, Arabic-Indic, and Devanagari digits) inside supported parentheses, preserving unread detection for localized counters.
