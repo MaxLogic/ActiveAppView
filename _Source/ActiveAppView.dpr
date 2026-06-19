@@ -1,6 +1,7 @@
 program ActiveAppView;
 
 uses
+  System.SysUtils,
   Winapi.Windows,
   Vcl.Forms,
   madExcept,
@@ -13,13 +14,26 @@ uses
   ActiveAppViewCore in 'ActiveAppViewCore.pas',
   ActiveAppViewMainForm in 'ActiveAppViewMainForm.pas' {AppsViewMainFrm},
   ActiveAppView.SelfTests in 'ActiveAppView.SelfTests.pas',
-  MaxLogic.StrUtils in '..\..\myPas\MaxLogic.StrUtils.pas',
-  srDeskTop in '..\..\myPas\srDeskTop.pas';
+  MaxLogic.MadExcept.AiRunner in '..\..\MaxLogic\MaxLogicFoundation\MaxLogic.MadExcept.AiRunner.pas',
+  MaxLogic.StrUtils in '..\..\MaxLogic\MaxLogicFoundation\MaxLogic.StrUtils.pas',
+  maxLogic.Windows.Desktop in '..\..\MaxLogic\MaxLogicFoundation\maxLogic.Windows.Desktop.pas';
 
 {$R *.res}
 
 const
   cSingleInstanceMutexName = 'Local\ActiveAppView.SingleInstance';
+
+function GetSingleInstanceMutexName: string;
+begin
+  Result := cSingleInstanceMutexName;
+  {$IF DEFINED(madExcept) AND DEFINED(DEBUG)}
+  if MaxLogic.MadExcept.AiRunner.EnvironmentValueEnablesAiRunner(
+    System.SysUtils.GetEnvironmentVariable(MaxLogic.MadExcept.AiRunner.cMadExceptAiRunnerEnvironmentVariable)) then
+  begin
+    Result := Result + '.AiRunner';
+  end;
+  {$IFEND}
+end;
 
 function FindExistingInstanceWindow: HWND;
 var
@@ -66,7 +80,7 @@ begin
     begin
       ShowWindow(lExistingWnd, SW_RESTORE);
     end;
-    ForceForegroundWindow(lExistingWnd);
+    maxLogic.Windows.Desktop.ForceForegroundWindow(lExistingWnd);
   end;
 end;
 
@@ -76,6 +90,10 @@ var
   lSingleInstanceMutex: THandle;
 
 begin
+  {$IF DEFINED(madExcept) AND DEFINED(DEBUG)}
+  MaxLogic.MadExcept.AiRunner.ConfigureFromEnvironment;
+  {$IFEND}
+
   lLaunchHelperResult := RunLauncherHelperFromCommandLine;
   if lLaunchHelperResult <> -1 then
   begin
@@ -88,7 +106,7 @@ begin
     Halt(lSelfTestResult);
   end;
 
-  lSingleInstanceMutex := CreateMutex(nil, False, PChar(cSingleInstanceMutexName));
+  lSingleInstanceMutex := CreateMutex(nil, False, PChar(GetSingleInstanceMutexName));
   if (lSingleInstanceMutex <> 0) and (GetLastError = ERROR_ALREADY_EXISTS) then
   begin
     ActivateExistingInstance;

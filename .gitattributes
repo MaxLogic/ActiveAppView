@@ -9,6 +9,10 @@
 # Scripts should stay LF
 *.sh       text eol=lf
 
+# Project config files should not store CRLF in Git; git diff --check treats it as trailing whitespace.
+.gitattributes text eol=lf
+*.ini      text eol=lf
+
 
 # Then normalize:
 # ```bash

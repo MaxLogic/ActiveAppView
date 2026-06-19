@@ -10,12 +10,26 @@ uses
   System.Classes, System.Diagnostics, System.IniFiles, System.IOUtils, System.SysUtils,
   Winapi.Windows,
   ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore, ActiveAppView.Launcher,
-  ActiveAppViewMainForm;
+  ActiveAppViewMainForm, maxLogic.Windows.Desktop;
 
 const
   cConfigCacheParseBenchmarkSelfTestArg = '--self-test-config-cache-parse-benchmark';
   cConfigCacheRuleSpacingSelfTestArg = '--self-test-config-cache-rule-spacing';
   cInvalidWndMetadataSelfTestArg = '--self-test-chat-monitor-invalid-wnd';
+  cWindowEnumerationSelfTestArg = '--self-test-window-enumeration';
+
+function RunWindowEnumerationSelfTest: Integer;
+var
+  lWindows: maxLogic.Windows.Desktop.TWndList;
+begin
+  Result := 0;
+  lWindows := maxLogic.Windows.Desktop.TWndList.Create;
+  try
+    maxLogic.Windows.Desktop.GetWndList(lWindows);
+  finally
+    lWindows.Free;
+  end;
+end;
 
 function RunInvalidWndMetadataSelfTest: Integer;
 var
@@ -309,6 +323,17 @@ begin
   begin
     try
       Result := RunInvalidWndMetadataSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+  end else if SameText(ParamStr(1), cWindowEnumerationSelfTestArg) then
+  begin
+    try
+      Result := RunWindowEnumerationSelfTest;
     except
       on lException: Exception do
       begin

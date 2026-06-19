@@ -87,7 +87,7 @@ implementation
 uses
   System.DateUtils, System.IOUtils, System.StrUtils, System.Threading,
   Winapi.MMSystem,
-  maxLogic.StrUtils, srDesktop,
+  maxLogic.StrUtils, maxLogic.Windows.Desktop,
   ActiveAppViewCore;
 
 type
@@ -736,23 +736,23 @@ begin
           lCommandLineParams := '';
 
           try
-            lFileName := srDesktop.GetFileName(aWnd);
+            lFileName := maxLogic.Windows.Desktop.GetFileName(aWnd);
           except
             lFileName := '';
           end;
 
           try
-            lAppUserModelID := RetrieveAppUserModelID(aWnd);
+            lAppUserModelID := maxLogic.Windows.Desktop.RetrieveAppUserModelID(aWnd);
           except
             lAppUserModelID := '';
           end;
 
           try
-            lPid := RetrievePID(aWnd);
+            lPid := maxLogic.Windows.Desktop.RetrievePID(aWnd);
             if lPid = 0 then
               lCommandLine := ''
             else
-              lCommandLine := RetrieveCommandLine(lPid);
+              lCommandLine := maxLogic.Windows.Desktop.RetrieveCommandLine(lPid);
           except
             lCommandLine := '';
           end;

@@ -230,8 +230,8 @@ implementation
 uses
   System.Diagnostics, System.IniFiles, System.IOUtils, System.StrUtils, System.Threading,
   Winapi.ActiveX, Winapi.KnownFolders, Winapi.MMSystem, Winapi.ShellAPI, Winapi.ShlObj,
-  AutoFree, bsUtils, maxCallMeLater, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils,
-  ActiveAppView.Launcher, srDesktop;
+  AutoFree, maxCallMeLater, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils, maxLogic.Windows.Desktop,
+  ActiveAppView.Launcher;
 
 {$R *.dfm}
 
@@ -334,6 +334,30 @@ begin
     Result := aCaption + ' | ' + ExtractFileName(aFileName) + ' (' + aFileName + ')'
   else
     Result := aCaption;
+end;
+
+procedure ApplyConsolePrefixRule(var aTitle: string; const aCaption: string; const aFileName: string;
+  const aRules: TPrefixRuleArray);
+var
+  lRule: TPrefixRule;
+begin
+  for lRule in aRules do
+  begin
+    if ((lRule.CaptionMask <> '') and maxLogic.StrUtils.StringMatches(aCaption, lRule.CaptionMask, False))
+      or ((lRule.FileNameMask <> '') and maxLogic.StrUtils.StringMatches(aFileName, lRule.FileNameMask, False)) then
+    begin
+      if lRule.Prefix <> '' then
+        aTitle := lRule.Prefix + ' - ' + aTitle;
+      Exit;
+    end;
+  end;
+end;
+
+function BuildConsoleDisplayCaption(const aCaption: string; const aFileName: string;
+  const aRules: TPrefixRuleArray): string;
+begin
+  Result := Trim(BuildWindowDisplayCaption(aCaption, aFileName));
+  ApplyConsolePrefixRule(Result, aCaption, aFileName, aRules);
 end;
 
 function ExecuteCaptionOverrideDialog(aOwner: TComponent; const aCaption: string;
@@ -1328,7 +1352,7 @@ begin
   if not GetSelectedWindowInfo(lListBox, lWnd, lProcessId) then
     Exit;
 
-  lCaption := srDesktop.GetWinCaption(lWnd);
+  lCaption := maxLogic.Windows.Desktop.GetWinCaption(lWnd);
   lCaption := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lWnd, lProcessId, lCaption);
   lDialogResult := codCancel;
   try
@@ -2641,6 +2665,7 @@ var
   lOverrideKey: string;
   lOverrides: TDictionary<string, string>;
   lParams: string;
+  lPrefixRules: TPrefixRuleArray;
   lResultIndex: Integer;
   lScripts: TStringArray;
   lScriptsDir: string;
@@ -2860,6 +2885,18 @@ begin
   if SameText(aArg, cWindowTitlePollingSelfTestArg) then
   begin
     Result := 0;
+    SetLength(lPrefixRules, 1);
+    lPrefixRules[0].Prefix := '*';
+    lPrefixRules[0].CaptionMask := 'PowerShell*';
+    lTitle := BuildConsoleDisplayCaption(
+      'PowerShell - ActiveAppView',
+      'C:\Windows\System32\WindowsTerminal.exe',
+      lPrefixRules);
+    if lTitle <> '* - PowerShell - ActiveAppView | WindowsTerminal.exe (C:\Windows\System32\WindowsTerminal.exe)' then
+    begin
+      Writeln(Format('SELFTEST FAILED: console poll title expected prefix/display actual="%s"', [lTitle]));
+      Result := 1;
+    end;
     if ShouldEnablePeriodicWindowPolling(False, 5000) then
     begin
       Writeln('SELFTEST FAILED: window title polling should stay disabled before startup data is ready');
@@ -3148,15 +3185,13 @@ var
   lCaption: string;
   lConsoleFocusedCaption: string;
   lConsoleWnd: hWnd;
-  lExcludeMasks: TStringArray;
   lIndex: Integer;
   lOldConsoleIndex: Integer;
   lPrefixRules: TPrefixRuleArray;
+  lRemoved: Boolean;
   lStartupDataReady: Boolean;
-  lTerminalCount: Integer;
-  lTerminalPatterns: TStringArray;
-  lTerminalWindows: TArray<hWnd>;
   lTitle: string;
+  lWnd: hWnd;
   lWindowProcessId: Cardinal;
 begin
   if IsShuttingDown then
@@ -3169,55 +3204,69 @@ begin
     Exit;
   end;
 
-  EnsureSharedAppsSnapshotFresh(0);
-
-  lExcludeMasks := fConfigCache.GetHideMasks(cHideMaskFileName);
   lPrefixRules := fConfigCache.GetPrefixRules(cPrefixMaskFileName);
-  lTerminalPatterns := fConfigCache.GetTerminalPatterns(cTerminalPatternsFileName);
 
   lOldConsoleIndex := lbConsole.ItemIndex;
   lConsoleFocusedCaption := '';
   if lOldConsoleIndex <> -1 then
     lConsoleFocusedCaption := lbConsole.Items[lOldConsoleIndex];
   lConsoleWnd := GetWnd(lbConsole);
-  SetLength(lTerminalWindows, fApps.Count);
-  lTerminalCount := 0;
+  lRemoved := False;
 
   lbConsole.Items.BeginUpdate;
   try
-    lbConsole.Items.Clear;
-    for lIndex := 0 to fApps.Count - 1 do
+    for lIndex := lbConsole.Items.Count - 1 downto 0 do
     begin
-      lApp := fApps[lIndex];
-      if (lApp.wnd = application.Handle)
-        or (lApp.wnd = self.Handle) then
+      lWnd := hWnd(lbConsole.Items.Objects[lIndex]);
+      if (lWnd = 0) or (not IsWindow(lWnd)) then
+      begin
+        lbConsole.Items.Delete(lIndex);
+        lRemoved := True;
         Continue;
+      end;
 
-      if lApp.caption = '' then
+      lWindowProcessId := 0;
+      GetWindowThreadProcessId(lWnd, lWindowProcessId);
+      if (lWindowProcessId = 0) or (not IsProcessActive(lWindowProcessId)) then
+      begin
+        lbConsole.Items.Delete(lIndex);
+        lRemoved := True;
         Continue;
-      if ExcludeByMask(lApp, lExcludeMasks, True) then
-        Continue;
-      if not IsTerminalApp(lApp.FileName, lTerminalPatterns) then
-        Continue;
+      end;
 
-      lWindowProcessId := lApp.PID;
-      lCaption := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lApp.wnd, lWindowProcessId, lApp.Caption);
-      lTitle := Trim(BuildWindowDisplayCaption(lCaption, lApp.FileName));
-      CheckPrefixRule(lTitle, lApp, lPrefixRules, True, False);
-      lbConsole.Items.AddObject(lTitle, TObject(lApp.wnd));
-      lTerminalWindows[lTerminalCount] := lApp.wnd;
-      Inc(lTerminalCount);
+      lCaption := maxLogic.Windows.Desktop.GetWinCaption(lWnd);
+      if lCaption = '' then
+      begin
+        lbConsole.Items.Delete(lIndex);
+        lRemoved := True;
+        Continue;
+      end;
+
+      lTitle := '';
+      if fApps.TryGetApp(lWnd, lApp) then
+      begin
+        lCaption := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lWnd, lWindowProcessId, lCaption);
+        lTitle := BuildConsoleDisplayCaption(lCaption, lApp.FileName, lPrefixRules);
+      end else begin
+        lCaption := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lWnd, lWindowProcessId, lCaption);
+        lTitle := BuildConsoleDisplayCaption(lCaption, '', lPrefixRules);
+      end;
+      if lbConsole.Items[lIndex] <> lTitle then
+        lbConsole.Items[lIndex] := lTitle;
     end;
     SortConsoleItems(lbConsole.Items);
   finally
     lbConsole.Items.EndUpdate;
   end;
 
-  SetLength(lTerminalWindows, lTerminalCount);
-  if RemoveWindowsFromListBox(lbApps, lTerminalWindows) then
-    UpdateAppDetail(False);
-
   RestoreItemIndex(lbConsole, lConsoleWnd, lOldConsoleIndex, lConsoleFocusedCaption);
+  if lRemoved then
+    TThread.Queue(nil,
+      procedure
+      begin
+        if not IsShuttingDown then
+          RestoreItemIndex(lbConsole, lConsoleWnd, lOldConsoleIndex, lConsoleFocusedCaption);
+      end);
 end;
 
 procedure TAppsViewMainFrm.UpdateAppDetail(const aAllowExtendedMetadata: Boolean);
