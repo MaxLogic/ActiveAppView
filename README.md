@@ -15,6 +15,11 @@ Accessibility tool for active application / explorer quick selection
 - Lines starting with `#` or `;`, or empty lines, are ignored.
 - Patterns match against the full executable path (e.g., `C:\Windows\System32\cmd.exe`).
 
+## Window title polling
+- Terminal window titles in the Console list are refreshed periodically.
+- Configure the interval in `settings.ini` under `[WindowTitlePolling] RefreshIntervalSeconds`.
+- Set `RefreshIntervalSeconds=0` to disable periodic title polling.
+
 ## Scripts folder
 - The Scripts list shows runnable files from `Scripts` next to `ActiveAppView.exe`.
 - Supported runnable extensions are `.cmd`, `.bat`, `.ps1`, `.exe`, and `.py`.
