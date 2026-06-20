@@ -247,10 +247,50 @@ function Resolve-ExecutablePath {
 function Invoke-TaskKill {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$ImageName
+        [string]$ImageName,
+
+        [int]$TimeoutSeconds = 10,
+
+        [switch]$IgnoreFailure
     )
 
-    taskkill.exe /f /im $ImageName *> $null
+    $processName = Get-ProcessNameFromImageName -ImageName $ImageName
+    if ($null -eq (Get-Process -Name $processName -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        return
+    }
+
+    $processInfo = [Diagnostics.ProcessStartInfo]::new()
+    $processInfo.FileName = (Join-Path $env:SystemRoot 'System32\taskkill.exe')
+    $processInfo.Arguments = "/f /im `"$ImageName`""
+    $processInfo.UseShellExecute = $false
+    $processInfo.RedirectStandardError = $true
+    $processInfo.RedirectStandardOutput = $true
+
+    $process = [Diagnostics.Process]::Start($processInfo)
+    $process.WaitForExit()
+
+    if ($process.ExitCode -ne 0) {
+        if ($IgnoreFailure) {
+            Write-Warning "Could not stop cleanup process $ImageName; continuing."
+            return
+        }
+
+        throw "taskkill failed for $ImageName with exit code $($process.ExitCode)"
+    }
+
+    $effectiveTimeoutSeconds = $TimeoutSeconds
+    if ($IgnoreFailure) {
+        $effectiveTimeoutSeconds = [Math]::Min($TimeoutSeconds, 1)
+    }
+
+    if (-not (Wait-ProcessState -ProcessName $processName -ShouldBeRunning $false -TimeoutSeconds $effectiveTimeoutSeconds)) {
+        if ($IgnoreFailure) {
+            Write-Warning "Process is still running after restart cleanup attempt: $ImageName"
+            return
+        }
+
+        throw "Process did not stop within $TimeoutSeconds seconds: $ImageName"
+    }
 }
 
 function Invoke-ServiceRestartIfPresent {
@@ -282,4 +322,65 @@ function Resolve-MouseBeamPath {
         -ExplicitPath $ExplicitPath `
         -EnvironmentVariableName 'MOUSEBEAM_EXE' `
         -FallbackPaths @('D:\Projects\MouseBeam\xMouse.exe', 'D:\Projects\MouseBeam\src\xMouse.exe')
+}
+
+function Get-ProcessNameFromImageName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ImageName
+    )
+
+    [IO.Path]::GetFileNameWithoutExtension($ImageName)
+}
+
+function Wait-ProcessState {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProcessName,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$ShouldBeRunning,
+
+        [int]$TimeoutSeconds = 10
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $isRunning = $null -ne (Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($isRunning -eq $ShouldBeRunning) {
+            return $true
+        }
+
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    return $false
+}
+
+function Invoke-ExecutableAndWait {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ProcessName,
+
+        [string[]]$ArgumentList = @(),
+
+        [int]$TimeoutSeconds = 15
+    )
+
+    if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+        throw "Executable not found: $FilePath"
+    }
+
+    if ($ArgumentList.Count -gt 0) {
+        Start-Process -FilePath $FilePath -ArgumentList $ArgumentList
+    } else {
+        Start-Process -FilePath $FilePath
+    }
+
+    if (-not (Wait-ProcessState -ProcessName $ProcessName -ShouldBeRunning $true -TimeoutSeconds $TimeoutSeconds)) {
+        throw "Process did not start within $TimeoutSeconds seconds: $ProcessName ($FilePath)"
+    }
 }
