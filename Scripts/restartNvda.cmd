@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0restartNvda.ps1" %*
-exit /b %ERRORLEVEL%
+set "RESTART_SCRIPT=%~dp0restartNvda.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process -WindowStyle Hidden -FilePath powershell.exe -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File ""%RESTART_SCRIPT%"" %*'"
+exit /b 0
