@@ -275,6 +275,9 @@ const
   cWindowActionProbeSelfTestArg = '--self-test-window-action-probe';
   cWindowTitlePollingSelfTestArg = '--self-test-window-title-polling';
   cScriptsIgnoreSelfTestArg = '--self-test-scripts-ignore';
+  cPrefixRuleAppUserModelIDPrecedenceSelfTestArg = '--self-test-prefix-rule-aumid-precedence';
+  cPrefixRuleAppUserModelIDNoCmdFallbackSelfTestArg = '--self-test-prefix-rule-aumid-no-cmd-fallback';
+  cPrefixRuleSinglePrefixSelfTestArg = '--self-test-prefix-rule-single-prefix';
   cWarmupPrefetchSelfTestArg = '--self-test-startup-warmup-prefetch';
   cWarmupShutdownCheckSelfTestArg = '--self-test-startup-warmup-shutdown-check';
   cAppsColumnDesignWidth = 506;
@@ -661,6 +664,31 @@ function CalculateWindowItemIndexAfterValidation(const aItems: TStrings; const a
   const aOldWnd: hWnd): Integer;
 begin
   Result := CalculateWindowItemIndexAfterRemoval(aItems, aOldItemIndex, aOldWnd, 0);
+end;
+
+function TitleHasDisplayPrefix(const aTitle: string; const aPrefix: string): Boolean;
+begin
+  Result := (aPrefix <> '') and StartsText(aPrefix + ' - ', aTitle);
+end;
+
+procedure ApplyDisplayPrefix(var aTitle: string; const aPrefix: string);
+begin
+  if (aPrefix = '') or TitleHasDisplayPrefix(aTitle, aPrefix) then
+    Exit;
+
+  aTitle := aPrefix + ' - ' + aTitle;
+end;
+
+function TitleHasKnownDisplayPrefix(const aTitle: string; const aRules: TPrefixRuleArray): Boolean;
+var
+  lRule: TPrefixRule;
+begin
+  Result := False;
+  for lRule in aRules do
+  begin
+    if TitleHasDisplayPrefix(aTitle, lRule.Prefix) then
+      Exit(True);
+  end;
 end;
 
 function CalculateRestoredItemIndex(const aItems: TStrings; const aWnd: hWnd; const aOldItemIndex: Integer;
@@ -2146,26 +2174,67 @@ begin
     lb.ItemIndex := 0;
 end;
 
-procedure TAppsViewMainFrm.CheckPrefixRule(var s: string; app: TAppInfo; const aRules: TPrefixRuleArray;
-  aAllowFileNameMatching: Boolean; aAllowDeepMetadata: Boolean);
+procedure ApplyPrefixRuleForMetadata(var aTitle: string; const aCaption: string; const aFileName: string;
+  const aAppUserModelID: string; const aCommandLineParams: string; const aRules: TPrefixRuleArray;
+  const aAllowFileNameMatching: Boolean; const aAllowDeepMetadata: Boolean);
 var
+  lHasWindowIdentity: Boolean;
   lRule: TPrefixRule;
 begin
+  lHasWindowIdentity := aAllowDeepMetadata and (aAppUserModelID <> '');
+  if TitleHasKnownDisplayPrefix(aTitle, aRules) then
+    Exit;
+
+  if lHasWindowIdentity then
+  begin
+    for lRule in aRules do
+    begin
+      if (lRule.AppUserModelIDMask <> '')
+        and maxLogic.StrUtils.StringMatches(aAppUserModelID, lRule.AppUserModelIDMask, False) then
+      begin
+        ApplyDisplayPrefix(aTitle, lRule.Prefix);
+        Exit;
+      end;
+    end;
+  end;
+
   for lRule in aRules do
   begin
-    if ((lRule.CaptionMask <> '') and maxLogic.StrUtils.StringMatches(app.caption, lRule.CaptionMask, False))
+    if ((lRule.CaptionMask <> '') and maxLogic.StrUtils.StringMatches(aCaption, lRule.CaptionMask, False))
       or (aAllowFileNameMatching and (lRule.FileNameMask <> '')
-      and maxLogic.StrUtils.StringMatches(app.FileName, lRule.FileNameMask, False))
-      or (aAllowDeepMetadata and (lRule.AppUserModelIDMask <> '')
-      and maxLogic.StrUtils.StringMatches(app.AppUserModelID, lRule.AppUserModelIDMask, False))
-      or (aAllowDeepMetadata and (lRule.CmdParamsMask <> '')
-      and maxLogic.StrUtils.StringMatches(app.CommandLineParams, lRule.CmdParamsMask, False)) then
+      and maxLogic.StrUtils.StringMatches(aFileName, lRule.FileNameMask, False))
+      or ((not lHasWindowIdentity) and aAllowDeepMetadata and (lRule.CmdParamsMask <> '')
+      and maxLogic.StrUtils.StringMatches(aCommandLineParams, lRule.CmdParamsMask, False)) then
     begin
-      if lRule.Prefix <> '' then
-        s := lRule.Prefix + ' - ' + s;
+      ApplyDisplayPrefix(aTitle, lRule.Prefix);
       Exit;
     end;
   end;
+end;
+
+procedure TAppsViewMainFrm.CheckPrefixRule(var s: string; app: TAppInfo; const aRules: TPrefixRuleArray;
+  aAllowFileNameMatching: Boolean; aAllowDeepMetadata: Boolean);
+var
+  lAppUserModelID: string;
+  lCommandLineParams: string;
+begin
+  lAppUserModelID := '';
+  lCommandLineParams := '';
+  if aAllowDeepMetadata then
+  begin
+    lAppUserModelID := app.AppUserModelID;
+    lCommandLineParams := app.CommandLineParams;
+  end;
+
+  ApplyPrefixRuleForMetadata(
+    s,
+    app.Caption,
+    app.FileName,
+    lAppUserModelID,
+    lCommandLineParams,
+    aRules,
+    aAllowFileNameMatching,
+    aAllowDeepMetadata);
 end;
 
 function TAppsViewMainFrm.ExcludeByMask(app: TAppInfo; const aMasks: TStringArray;
@@ -3052,6 +3121,88 @@ begin
       lScriptNames.Free;
       if TDirectory.Exists(lScriptsDir) then
         TDirectory.Delete(lScriptsDir, True);
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cPrefixRuleAppUserModelIDPrecedenceSelfTestArg) then
+  begin
+    Result := 0;
+    SetLength(lPrefixRules, 2);
+    lPrefixRules[0].Prefix := 'OEC';
+    lPrefixRules[0].CmdParamsMask := '*OEC - Microsoft Teams (PWA).lnk*';
+    lPrefixRules[1].Prefix := 'Osyon';
+    lPrefixRules[1].AppUserModelIDMask := 'MSEdge.teams.micrt.com_/v2/.UserData.Profile1';
+    lTitle := 'Czat | Max Dieckmann | Microsoft Teams';
+
+    ApplyPrefixRuleForMetadata(
+      lTitle,
+      'Czat | Max Dieckmann | Microsoft Teams',
+      'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+      'MSEdge.teams.micrt.com_/v2/.UserData.Profile1',
+      '--source-shortcut="C:\Users\pawel\Desktop\OEC - Microsoft Teams (PWA).lnk"',
+      lPrefixRules,
+      True,
+      True);
+
+    if not SameText(lTitle, 'Osyon - Czat | Max Dieckmann | Microsoft Teams') then
+    begin
+      Writeln(Format('SELFTEST FAILED: expected Osyon prefix, got "%s"', [lTitle]));
+      Exit(1);
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cPrefixRuleAppUserModelIDNoCmdFallbackSelfTestArg) then
+  begin
+    Result := 0;
+    SetLength(lPrefixRules, 1);
+    lPrefixRules[0].Prefix := 'OEC';
+    lPrefixRules[0].CmdParamsMask := '*OEC - Microsoft Teams (PWA).lnk*';
+    lTitle := 'Skype-Teams - Czat | Agnieszka Piotrowska | Microsoft Teams';
+
+    ApplyPrefixRuleForMetadata(
+      lTitle,
+      'Skype-Teams - Czat | Agnieszka Piotrowska | Microsoft Teams',
+      'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+      'teams.live.com-FD8206EA_hwygv5gbeahhp!App',
+      '--source-shortcut="C:\Users\pawel\Desktop\OEC - Microsoft Teams (PWA).lnk"',
+      lPrefixRules,
+      True,
+      True);
+
+    if not SameText(lTitle, 'Skype-Teams - Czat | Agnieszka Piotrowska | Microsoft Teams') then
+    begin
+      Writeln(Format('SELFTEST FAILED: expected no fallback prefix, got "%s"', [lTitle]));
+      Exit(1);
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cPrefixRuleSinglePrefixSelfTestArg) then
+  begin
+    Result := 0;
+    SetLength(lPrefixRules, 2);
+    lPrefixRules[0].Prefix := 'OEC';
+    lPrefixRules[0].CaptionMask := '*Microsoft Teams';
+    lPrefixRules[1].Prefix := 'Skype-Teams';
+    lPrefixRules[1].AppUserModelIDMask := 'teams.live.com-FD8206EA_hwygv5gbeahhp!App';
+    lTitle := 'Skype-Teams - Czat | Agnieszka Piotrowska | Microsoft Teams';
+
+    ApplyPrefixRuleForMetadata(
+      lTitle,
+      'Skype-Teams - Czat | Agnieszka Piotrowska | Microsoft Teams',
+      'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+      '',
+      '',
+      lPrefixRules,
+      True,
+      True);
+
+    if not SameText(lTitle, 'Skype-Teams - Czat | Agnieszka Piotrowska | Microsoft Teams') then
+    begin
+      Writeln(Format('SELFTEST FAILED: expected a single prefix, got "%s"', [lTitle]));
+      Exit(1);
     end;
     Exit;
   end;
