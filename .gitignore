@@ -33,6 +33,7 @@ __recovery
 *.cmds
 /ShortCuts.txt
 /PrefixMask.txt
+/WindowCaptionOverrides.ini
 _analysis/
 .agent/
 .agents/
