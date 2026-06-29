@@ -5,6 +5,8 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Rename on an already-renamed Applications or Console item now opens with the current displayed caption selected instead of an empty edit box.
+- Shutdown no longer calls `TThread.Terminate` through the async stop path, avoiding `EThread: Cannot terminate an externally created thread` during application exit.
 - ShortCuts entries now open unquoted file/folder paths containing spaces, while still supporting quoted targets with arguments and command-style entries.
 - Main form columns now resize proportionally to the form width, preserving the design-time column ratios on smaller screens.
 - Desktop and shortcut activation now runs through an isolated helper process, so third-party shell extension crashes during item launch no longer terminate `ActiveAppView.exe`.
@@ -13,7 +15,7 @@ All notable changes to this project are documented in this file.
 ### Added
 - Chat monitor now supports a PrefixMask-style review filter file (`ChatReviewMask.txt`), configured by `[ChatMonitor] ReviewMaskFile` in `settings.ini`.
 - Main form now includes a `Play chat notification sounds` checkbox that toggles chat sounds at runtime and persists to `[ChatMonitor] SoundEnabled`.
-- Applications and Console instances now support temporary per-window caption overrides via context-menu Rename, with dialog Reset restoring the live window title while preserving the normal filename/path display and preventing Enter-confirm from activating the selected window.
+- Applications and Console instances now support per-window caption overrides via context-menu Rename; overrides survive tool restarts within the current Windows boot, expire after reboot, and dialog Reset restores the live window title while preserving the normal filename/path display and preventing Enter-confirm from activating the selected window.
 - Console window title polling is configurable with `[WindowTitlePolling] RefreshIntervalSeconds` in `settings.ini`.
 - Scripts can now be hidden from the F3 Scripts list with a `Scripts\.ignore` file, one filename per line.
 
