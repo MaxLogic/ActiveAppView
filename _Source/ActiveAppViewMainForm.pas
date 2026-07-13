@@ -8,7 +8,8 @@ uses
   Vcl.Buttons, Vcl.Controls, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.Forms, Vcl.Graphics, Vcl.Menus,
   Vcl.StdCtrls,
   CancelToken, maxAsync,
-  ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore;
+  ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore,
+  ActiveAppView.RenameJournal;
 
 type
   TAppsViewMainFrm = class(TForm)
@@ -133,6 +134,7 @@ type
     fWindowActionsPopupMenu: TPopupMenu;
     fCloseWindowMenuItem: TMenuItem;
     fRenameWindowMenuItem: TMenuItem;
+    fRenameJournalConfig: TRenameJournalConfig;
     fTerminateWindowMenuItem: TMenuItem;
     fWindowCaptionOverrides: TDictionary<string, string>;
     fSuppressNextReturnListBox: TListBox;
@@ -183,6 +185,7 @@ type
       out aProcessId: Cardinal): Boolean;
     function IsCaptionOverrideListBox(const aListBox: TListBox): Boolean;
     function IsProcessActive(const aProcessId: Cardinal): Boolean;
+    procedure JournalWindowRename(const aWnd: hWnd; const aProcessId: Cardinal; const aNewCaption: string);
     function PruneWindowCaptionOverrides: Boolean;
     procedure RemoveWindowCaptionOverridesForWnd(const aWnd: hWnd);
     procedure RestoreFocusAfterWindowCaptionDialog(const aListBox: TListBox);
@@ -233,7 +236,7 @@ function RunMainFormSelfTests(const aArg: string): Integer;
 implementation
 
 uses
-  System.Diagnostics, System.IniFiles, System.IOUtils, System.StrUtils, System.Threading,
+  System.DateUtils, System.Diagnostics, System.IniFiles, System.IOUtils, System.StrUtils, System.Threading,
   Winapi.ActiveX, Winapi.KnownFolders, Winapi.MMSystem, Winapi.ShellAPI, Winapi.ShlObj,
   AutoFree, maxCallMeLater, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils, maxLogic.Windows.Desktop,
   ActiveAppView.Launcher;
@@ -1293,6 +1296,25 @@ begin
   Result := (aListBox = lbApps) or (aListBox = lbConsole);
 end;
 
+procedure TAppsViewMainFrm.JournalWindowRename(const aWnd: hWnd; const aProcessId: Cardinal;
+  const aNewCaption: string);
+var
+  lErrorMessage: string;
+  lRenameTime: TDateTime;
+begin
+  lRenameTime := Now;
+  if TryRecordWindowRename(
+    fRenameJournalConfig,
+    aWnd,
+    aProcessId,
+    (DateTimeToUnix(lRenameTime, False) * 1000) + MilliSecondOf(lRenameTime),
+    aNewCaption,
+    lErrorMessage) = rjwrFailed then
+  begin
+    LogStartupTiming('RenameJournal.WriteFailed', lErrorMessage);
+  end;
+end;
+
 function TAppsViewMainFrm.PruneWindowCaptionOverrides: Boolean;
 begin
   Result := ActiveAppViewMainForm.PruneWindowCaptionOverrides(
@@ -1725,6 +1747,7 @@ begin
       begin
         fWindowCaptionOverrides.AddOrSetValue(lKey, lCaption);
         SaveWindowCaptionOverrides;
+        JournalWindowRename(lWnd, lProcessId, lCaption);
         QueueGuiRefresh;
       end;
       codReset:
@@ -2622,6 +2645,7 @@ begin
   application.OnActivate := AppOnActivate;
 
   gc(lIniFile, TMemIniFile.Create(CombinePath([GetInstallDir, cSettingsFileName]), TEncoding.Utf8, False));
+  fRenameJournalConfig := LoadRenameJournalConfig(lIniFile);
   fChatMonitor := TChatMonitor.Create(lIniFile);
   fChatMonitor.UseConfigCache(fConfigCache);
   chkChatNotificationSound.Checked := lIniFile.ReadBool('ChatMonitor', 'SoundEnabled', True);

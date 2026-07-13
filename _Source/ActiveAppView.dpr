@@ -14,6 +14,8 @@ uses
   ActiveAppViewCore in 'ActiveAppViewCore.pas',
   ActiveAppViewMainForm in 'ActiveAppViewMainForm.pas' {AppsViewMainFrm},
   ActiveAppView.SelfTests in 'ActiveAppView.SelfTests.pas',
+  ActiveAppView.RenameJournal in 'ActiveAppView.RenameJournal.pas',
+  ActiveAppView.RenameJournal.SelfTests in 'ActiveAppView.RenameJournal.SelfTests.pas',
   MaxLogic.MadExcept.AiRunner in '..\..\MaxLogic\MaxLogicFoundation\MaxLogic.MadExcept.AiRunner.pas',
   MaxLogic.StrUtils in '..\..\MaxLogic\MaxLogicFoundation\MaxLogic.StrUtils.pas',
   maxLogic.Windows.Desktop in '..\..\MaxLogic\MaxLogicFoundation\maxLogic.Windows.Desktop.pas';

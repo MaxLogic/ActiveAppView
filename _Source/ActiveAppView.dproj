@@ -147,6 +147,8 @@
         <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\maxLogic.Windows.Desktop.pas"/>
         <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\MaxLogic.StrUtils.pas"/>
         <DCCReference Include="ActiveAppView.ChatMonitor.pas"/>
+        <DCCReference Include="ActiveAppView.RenameJournal.pas"/>
+        <DCCReference Include="ActiveAppView.RenameJournal.SelfTests.pas"/>
         <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\MaxLogic.MadExcept.AiRunner.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
