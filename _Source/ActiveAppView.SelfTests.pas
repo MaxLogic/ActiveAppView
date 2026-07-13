@@ -10,7 +10,7 @@ uses
   System.Classes, System.Diagnostics, System.IniFiles, System.IOUtils, System.SysUtils,
   Winapi.Windows,
   ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore, ActiveAppView.Launcher,
-  ActiveAppViewMainForm, maxLogic.Windows.Desktop;
+  ActiveAppView.RenameJournal.SelfTests, ActiveAppViewMainForm, maxLogic.Windows.Desktop;
 
 const
   cConfigCacheParseBenchmarkSelfTestArg = '--self-test-config-cache-parse-benchmark';
@@ -293,6 +293,10 @@ begin
     Exit;
 
   Result := RunChatMonitorSelfTests(ParamStr(1));
+  if Result <> -1 then
+    Exit;
+
+  Result := RunRenameJournalSelfTests(ParamStr(1));
   if Result <> -1 then
     Exit;
 

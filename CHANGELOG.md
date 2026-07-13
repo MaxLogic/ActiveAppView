@@ -13,6 +13,7 @@ All notable changes to this project are documented in this file.
 - Console window title polling now refreshes existing Console entries without forcing a full app scan on every timer tick.
 
 ### Added
+- Successful window-caption Rename actions can now be written to Shadow Journal with their UTC timestamp, PID, HWND, and Unicode caption through the opt-in `[save-renames-to-journal]` settings.
 - Chat monitor now supports a PrefixMask-style review filter file (`ChatReviewMask.txt`), configured by `[ChatMonitor] ReviewMaskFile` in `settings.ini`.
 - Main form now includes a `Play chat notification sounds` checkbox that toggles chat sounds at runtime and persists to `[ChatMonitor] SoundEnabled`.
 - Applications and Console instances now support per-window caption overrides via context-menu Rename; overrides survive tool restarts within the current Windows boot, expire after reboot, and dialog Reset restores the live window title while preserving the normal filename/path display and preventing Enter-confirm from activating the selected window.

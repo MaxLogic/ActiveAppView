@@ -20,6 +20,12 @@ Accessibility tool for active application / explorer quick selection
 - Configure the interval in `settings.ini` under `[WindowTitlePolling] RefreshIntervalSeconds`.
 - Set `RefreshIntervalSeconds=0` to disable periodic title polling.
 
+## Shadow Journal rename history
+- Successful Applications and Console Rename actions can be appended to Shadow Journal's `window_rename_events` table.
+- Configure `[save-renames-to-journal]` in `settings.ini` with `enabled=1` and the exact existing SQLite filename in `db-file`.
+- ActiveAppView does not create or migrate the journal database. Missing databases, missing migration 004, and SQLite write failures leave the local caption override intact.
+- Reset actions are not journaled because they remove an ActiveAppView display override rather than assign a new caption.
+
 ## Scripts folder
 - The Scripts list shows runnable files from `Scripts` next to `ActiveAppView.exe`.
 - Supported runnable extensions are `.cmd`, `.bat`, `.ps1`, `.exe`, and `.py`.
