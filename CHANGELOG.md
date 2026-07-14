@@ -5,6 +5,8 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Window-caption rename journaling now uses one bounded FIFO background writer instead of opening and writing SQLite on the VCL thread; queue overflow and SQLite failures remain fail-open.
+- Confirmed Rename actions now revalidate that the HWND still exists and belongs to the captured PID before saving the override or journaling it.
 - Rename on an already-renamed Applications or Console item now opens with the current displayed caption selected instead of an empty edit box.
 - Shutdown no longer calls `TThread.Terminate` through the async stop path, avoiding `EThread: Cannot terminate an externally created thread` during application exit.
 - ShortCuts entries now open unquoted file/folder paths containing spaces, while still supporting quoted targets with arguments and command-style entries.

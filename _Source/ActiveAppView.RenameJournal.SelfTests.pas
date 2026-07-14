@@ -7,14 +7,14 @@ function RunRenameJournalSelfTests(const aArg: string): Integer;
 implementation
 
 uses
-  System.IniFiles, System.IOUtils, System.SysUtils,
+  System.Diagnostics, System.IniFiles, System.IOUtils, System.SysUtils,
   Winapi.Windows,
   Vcl.Forms,
   AutoFree,
   FireDAC.Comp.Client, FireDAC.Phys.SQLite, FireDAC.Phys.SQLiteDef,
   FireDAC.Phys.SQLiteWrapper.Stat, FireDAC.Stan.Async, FireDAC.Stan.Def,
   FireDAC.VCLUI.Wait,
-  ActiveAppView.RenameJournal;
+  ActiveAppView.RenameJournal, CancelToken;
 
 const
   cRenameJournalWriteSelfTestArg = '--self-test-rename-journal';
@@ -30,21 +30,30 @@ end;
 function RunRenameJournalWriteSelfTest: Integer;
 const
   cExpectedCaption = 'Żółć 東京';
-  cExpectedHwnd = 123456;
+  cExpectedHwnd: UInt64 = $0000000100000001;
   cExpectedPid = 4321;
   cExpectedRenamedAt = 1783900800123;
 var
   g: TGarbos;
+  i: Integer;
+  lCancelToken: iCancelToken;
   lConfig: TRenameJournalConfig;
   lConnection: TFDConnection;
   lDatabaseFileName: string;
   lDriverLink: TFDPhysSQLiteDriverLink;
   lErrorMessage: string;
+  lFifoWriter: TRenameJournalWriter;
   lIniFile: TMemIniFile;
+  lLockedWriter: TRenameJournalWriter;
+  lOverflowCount: Integer;
+  lOverflowWriter: TRenameJournalWriter;
   lQuery: TFDQuery;
+  lQueueResult: TRenameJournalEnqueueResult;
   lRoot: string;
   lSettingsFileName: string;
+  lStopwatch: TStopwatch;
   lUnavailableDatabaseFileName: string;
+  lWriter: TRenameJournalWriter;
 begin
   g := Default(TGarbos);
   Result := 1;
@@ -87,7 +96,7 @@ begin
     lConfig.DatabaseFileName := lUnavailableDatabaseFileName;
     if TryRecordWindowRename(
       lConfig,
-      HWND(cExpectedHwnd),
+      HWND(NativeUInt(cExpectedHwnd)),
       cExpectedPid,
       cExpectedRenamedAt,
       cExpectedCaption,
@@ -105,7 +114,7 @@ begin
     lConfig.Enabled := True;
     if TryRecordWindowRename(
       lConfig,
-      HWND(cExpectedHwnd),
+      HWND(NativeUInt(cExpectedHwnd)),
       cExpectedPid,
       cExpectedRenamedAt,
       cExpectedCaption,
@@ -130,7 +139,7 @@ begin
     lConfig.DatabaseFileName := lDatabaseFileName;
     if TryRecordWindowRename(
       lConfig,
-      HWND(cExpectedHwnd),
+      HWND(NativeUInt(cExpectedHwnd)),
       cExpectedPid,
       cExpectedRenamedAt,
       cExpectedCaption,
@@ -150,7 +159,7 @@ begin
 
     if TryRecordWindowRename(
       lConfig,
-      HWND(cExpectedHwnd),
+      HWND(NativeUInt(cExpectedHwnd)),
       cExpectedPid,
       cExpectedRenamedAt,
       cExpectedCaption,
@@ -173,7 +182,7 @@ begin
         [cExpectedRenamedAt, lQuery.FieldByName('renamed_at').AsLargeInt]));
       Exit;
     end;
-    if lQuery.FieldByName('hwnd').AsLargeInt <> cExpectedHwnd then
+    if lQuery.FieldByName('hwnd').AsLargeInt <> Int64(cExpectedHwnd) then
     begin
       Writeln('SELFTEST FAILED: rename journal HWND mismatch');
       Exit;
@@ -188,6 +197,149 @@ begin
       Writeln('SELFTEST FAILED: rename journal Unicode caption mismatch');
       Exit;
     end;
+
+    lQuery.Close;
+    lConnection.ExecSQL('DELETE FROM window_rename_events;');
+    lConnection.Connected := False;
+    lCancelToken := TCancelToken.Create;
+    GC(lWriter, TRenameJournalWriter.Create(lConfig, lCancelToken), g);
+    if lWriter.Enqueue(
+      HWND(NativeUInt(cExpectedHwnd)),
+      cExpectedPid,
+      cExpectedRenamedAt + 1,
+      cExpectedCaption + ' queued') <> rjerQueued then
+    begin
+      Writeln('SELFTEST FAILED: rename journal writer did not queue the event');
+      Exit;
+    end;
+    lWriter.StopAndWait;
+
+    lConnection.Connected := True;
+    lQuery.SQL.Text :=
+      'SELECT COUNT(*) AS event_count, MIN(renamed_at) AS renamed_at, MIN(hwnd) AS hwnd, ' +
+      'MIN(pid) AS pid, MIN(new_caption) AS new_caption FROM window_rename_events;';
+    lQuery.Open;
+    if lQuery.FieldByName('event_count').AsInteger <> 1 then
+    begin
+      Writeln('SELFTEST FAILED: rename journal writer did not persist exactly one row');
+      Exit;
+    end;
+    if lQuery.FieldByName('renamed_at').AsLargeInt <> cExpectedRenamedAt + 1 then
+    begin
+      Writeln('SELFTEST FAILED: rename journal writer timestamp mismatch');
+      Exit;
+    end;
+    if lQuery.FieldByName('hwnd').AsLargeInt <> Int64(cExpectedHwnd) then
+    begin
+      Writeln('SELFTEST FAILED: rename journal writer truncated the 64-bit HWND');
+      Exit;
+    end;
+    if lQuery.FieldByName('pid').AsLargeInt <> cExpectedPid then
+    begin
+      Writeln('SELFTEST FAILED: rename journal writer PID mismatch');
+      Exit;
+    end;
+    if lQuery.FieldByName('new_caption').AsWideString <> cExpectedCaption + ' queued' then
+    begin
+      Writeln('SELFTEST FAILED: rename journal writer Unicode caption mismatch');
+      Exit;
+    end;
+
+    lQuery.Close;
+    lConnection.ExecSQL('DELETE FROM window_rename_events;');
+    lConnection.Connected := False;
+    lCancelToken := TCancelToken.Create;
+    GC(lFifoWriter, TRenameJournalWriter.Create(lConfig, lCancelToken), g);
+    for i := 1 to 3 do
+    begin
+      if lFifoWriter.Enqueue(
+        HWND(NativeUInt(cExpectedHwnd)),
+        cExpectedPid,
+        cExpectedRenamedAt + 10 + i,
+        Format('FIFO %d', [i])) <> rjerQueued then
+      begin
+        Writeln('SELFTEST FAILED: rename journal FIFO event was not queued');
+        Exit;
+      end;
+    end;
+    lFifoWriter.StopAndWait;
+
+    lConnection.Connected := True;
+    lQuery.SQL.Text := 'SELECT new_caption FROM window_rename_events ORDER BY id;';
+    lQuery.Open;
+    for i := 1 to 3 do
+    begin
+      if lQuery.Eof or (lQuery.FieldByName('new_caption').AsWideString <> Format('FIFO %d', [i])) then
+      begin
+        Writeln('SELFTEST FAILED: rename journal events were not persisted FIFO');
+        Exit;
+      end;
+      lQuery.Next;
+    end;
+    if not lQuery.Eof then
+    begin
+      Writeln('SELFTEST FAILED: rename journal FIFO persisted an unexpected extra row');
+      Exit;
+    end;
+
+    lQuery.Close;
+    lConnection.ExecSQL('DELETE FROM window_rename_events;');
+    lConnection.ExecSQL('BEGIN EXCLUSIVE;');
+    lCancelToken := TCancelToken.Create;
+    GC(lLockedWriter, TRenameJournalWriter.Create(lConfig, lCancelToken), g);
+    if lLockedWriter.Enqueue(
+      HWND(NativeUInt(cExpectedHwnd)),
+      cExpectedPid,
+      cExpectedRenamedAt + 2,
+      cExpectedCaption + ' locked') <> rjerQueued then
+    begin
+      Writeln('SELFTEST FAILED: locked rename journal event was not queued fail-open');
+      Exit;
+    end;
+    lLockedWriter.StopAndWait;
+    lConnection.ExecSQL('ROLLBACK;');
+    lQuery.SQL.Text := 'SELECT COUNT(*) AS event_count FROM window_rename_events;';
+    lQuery.Open;
+    if lQuery.FieldByName('event_count').AsInteger <> 0 then
+    begin
+      Writeln('SELFTEST FAILED: locked rename journal write changed persisted rows');
+      Exit;
+    end;
+
+    lQuery.Close;
+    lConnection.ExecSQL('BEGIN EXCLUSIVE;');
+    lCancelToken := TCancelToken.Create;
+    GC(lOverflowWriter, TRenameJournalWriter.Create(lConfig, lCancelToken), g);
+    lOverflowCount := 0;
+    lStopwatch := TStopwatch.StartNew;
+    for i := 1 to 66 do
+    begin
+      lQueueResult := lOverflowWriter.Enqueue(
+        HWND(NativeUInt(cExpectedHwnd)),
+        cExpectedPid,
+        cExpectedRenamedAt + 100 + i,
+        cExpectedCaption + ' overflow');
+      if lQueueResult = rjerFull then
+        Inc(lOverflowCount)
+      else if lQueueResult <> rjerQueued then
+      begin
+        Writeln('SELFTEST FAILED: rename journal queue stopped before overflow');
+        Exit;
+      end;
+    end;
+    lStopwatch.Stop;
+    if lOverflowCount = 0 then
+    begin
+      Writeln('SELFTEST FAILED: rename journal queue did not enforce its 64-event bound');
+      Exit;
+    end;
+    if lStopwatch.ElapsedMilliseconds >= 1000 then
+    begin
+      Writeln('SELFTEST FAILED: rename journal queue overflow blocked the producer');
+      Exit;
+    end;
+    lOverflowWriter.StopAndWait;
+    lConnection.ExecSQL('ROLLBACK;');
     Result := 0;
   finally
     g.Clear;

@@ -135,6 +135,7 @@ type
     fCloseWindowMenuItem: TMenuItem;
     fRenameWindowMenuItem: TMenuItem;
     fRenameJournalConfig: TRenameJournalConfig;
+    fRenameJournalWriter: TRenameJournalWriter;
     fTerminateWindowMenuItem: TMenuItem;
     fWindowCaptionOverrides: TDictionary<string, string>;
     fSuppressNextReturnListBox: TListBox;
@@ -326,10 +327,48 @@ type
   TCaptionOverrideDialogRunner = function(aOwner: TComponent; const aCaption: string;
     out aNewCaption: string): TCaptionOverrideDialogResult;
   TWindowCaptionOverrideIsAliveFunc = reference to function(const aWnd: hWnd; const aProcessId: Cardinal): Boolean;
+  TWindowCaptionDialogApplyResult = (wcdarNone, wcdarRenamed, wcdarReset, wcdarStale);
 
 function BuildWindowCaptionOverrideKey(const aWnd: hWnd; const aProcessId: Cardinal): string;
 begin
   Result := UIntToStr(aProcessId) + ':' + UIntToStr(NativeUInt(aWnd));
+end;
+
+function ApplyWindowCaptionDialogOutcome(const aOverrides: TDictionary<string, string>;
+  const aWnd: hWnd; const aProcessId: Cardinal; const aOutcome: TCaptionOverrideDialogOutcome;
+  const aIsCurrent: TWindowCaptionOverrideIsAliveFunc): TWindowCaptionDialogApplyResult;
+var
+  lKey: string;
+begin
+  Result := wcdarNone;
+  lKey := BuildWindowCaptionOverrideKey(aWnd, aProcessId);
+  case aOutcome.DialogResult of
+    codRename:
+    begin
+      if (not Assigned(aIsCurrent)) or (not aIsCurrent(aWnd, aProcessId)) then
+        Exit(wcdarStale);
+      aOverrides.AddOrSetValue(lKey, aOutcome.Caption);
+      Result := wcdarRenamed;
+    end;
+    codReset:
+    begin
+      aOverrides.Remove(lKey);
+      Result := wcdarReset;
+    end;
+  end;
+end;
+
+function IsWindowIdentityCurrent(const aWnd: hWnd; const aProcessId: Cardinal): Boolean;
+var
+  lCurrentProcessId: Cardinal;
+begin
+  Result := False;
+  if (aWnd = 0) or (aProcessId = 0) or (not IsWindow(aWnd)) then
+    Exit;
+
+  lCurrentProcessId := 0;
+  GetWindowThreadProcessId(aWnd, lCurrentProcessId);
+  Result := lCurrentProcessId = aProcessId;
 end;
 
 function TryParseWindowCaptionOverrideKey(const aKey: string; out aWnd: hWnd; out aProcessId: Cardinal): Boolean;
@@ -1299,19 +1338,20 @@ end;
 procedure TAppsViewMainFrm.JournalWindowRename(const aWnd: hWnd; const aProcessId: Cardinal;
   const aNewCaption: string);
 var
-  lErrorMessage: string;
+  lEnqueueResult: TRenameJournalEnqueueResult;
   lRenameTime: TDateTime;
 begin
   lRenameTime := Now;
-  if TryRecordWindowRename(
-    fRenameJournalConfig,
+  lEnqueueResult := fRenameJournalWriter.Enqueue(
     aWnd,
     aProcessId,
     (DateTimeToUnix(lRenameTime, False) * 1000) + MilliSecondOf(lRenameTime),
-    aNewCaption,
-    lErrorMessage) = rjwrFailed then
-  begin
-    LogStartupTiming('RenameJournal.WriteFailed', lErrorMessage);
+    aNewCaption);
+  case lEnqueueResult of
+    rjerFull:
+      LogStartupTiming('RenameJournal.QueueFull', 'rename event dropped');
+    rjerStopped:
+      LogStartupTiming('RenameJournal.Stopped', 'rename event dropped during shutdown');
   end;
 end;
 
@@ -1712,11 +1752,11 @@ end;
 
 procedure TAppsViewMainFrm.WindowRenameMenuItemClick(aSender: TObject);
 var
+  lApplyResult: TWindowCaptionDialogApplyResult;
   lCaption: string;
   lDisplayCaption: string;
   lDialogOutcome: TCaptionOverrideDialogOutcome;
   lDialogResult: TCaptionOverrideDialogResult;
-  lKey: string;
   lListBox: TListBox;
   lProcessId: Cardinal;
   lWnd: hWnd;
@@ -1740,20 +1780,29 @@ begin
   try
     lDialogOutcome := ExecuteCaptionOverrideDialogWithInitialCaption(Self, lCaption, ExecuteCaptionOverrideDialog);
     lDialogResult := lDialogOutcome.DialogResult;
-    lCaption := lDialogOutcome.Caption;
-    lKey := BuildWindowCaptionOverrideKey(lWnd, lProcessId);
-    case lDialogResult of
-      codRename:
+    lApplyResult := ApplyWindowCaptionDialogOutcome(
+      fWindowCaptionOverrides,
+      lWnd,
+      lProcessId,
+      lDialogOutcome,
+      IsWindowIdentityCurrent);
+    case lApplyResult of
+      wcdarRenamed:
       begin
-        fWindowCaptionOverrides.AddOrSetValue(lKey, lCaption);
         SaveWindowCaptionOverrides;
-        JournalWindowRename(lWnd, lProcessId, lCaption);
+        JournalWindowRename(lWnd, lProcessId, lDialogOutcome.Caption);
         QueueGuiRefresh;
       end;
-      codReset:
+      wcdarReset:
       begin
-        fWindowCaptionOverrides.Remove(lKey);
         SaveWindowCaptionOverrides;
+        QueueGuiRefresh;
+      end;
+      wcdarStale:
+      begin
+        LogStartupTiming(
+          'RenameWindow.StaleIdentity',
+          Format('hwnd=%d pid=%d', [NativeUInt(lWnd), lProcessId]));
         QueueGuiRefresh;
       end;
     end;
@@ -2645,7 +2694,9 @@ begin
   application.OnActivate := AppOnActivate;
 
   gc(lIniFile, TMemIniFile.Create(CombinePath([GetInstallDir, cSettingsFileName]), TEncoding.Utf8, False));
+  fShutdownToken := TCancelToken.Create;
   fRenameJournalConfig := LoadRenameJournalConfig(lIniFile);
+  fRenameJournalWriter := TRenameJournalWriter.Create(fRenameJournalConfig, fShutdownToken);
   fChatMonitor := TChatMonitor.Create(lIniFile);
   fChatMonitor.UseConfigCache(fConfigCache);
   chkChatNotificationSound.Checked := lIniFile.ReadBool('ChatMonitor', 'SoundEnabled', True);
@@ -2680,7 +2731,6 @@ begin
   TInterlocked.Exchange(fStartupDataReady, 0);
   TInterlocked.Exchange(fStartupSkipSharedRefreshOnce, 0);
   TInterlocked.Exchange(fShuttingDown, 0);
-  fShutdownToken := TCancelToken.Create;
   LogStartupTiming(
     'FormCreate.Done',
     Format('chatMonitorEnabled=%s chatSoundEnabled=%s',
@@ -2703,6 +2753,7 @@ begin
   RequestAsyncStop(fChatMonitorTask);
   RequestAsyncStop(fDeepPrefixLoadTask);
   RequestAsyncStop(fStartupDataLoadTask);
+  FreeAndNil(fRenameJournalWriter);
 
   WaitAsyncWithShutdown(fAuxListRefresh, cShutdownTaskWaitTimeoutMs);
   WaitAsyncWithShutdown(fChatMonitorTask, cShutdownTaskWaitTimeoutMs);
@@ -3073,6 +3124,7 @@ end;
 function RunMainFormSelfTests(const aArg: string): Integer;
 var
   lApps: TArray<TAppInfo>;
+  lApplyResult: TWindowCaptionDialogApplyResult;
   lAppsWidth: Integer;
   lCallCount: Integer;
   lCancelToken: iCancelToken;
@@ -3097,6 +3149,9 @@ var
   lTempDir: string;
   lTitle: string;
   lTargetPath: string;
+  lTestOverrideKey: string;
+  lTestProcessId: Cardinal;
+  lTestWnd: hWnd;
   lWasPruned: Boolean;
 begin
   Result := -1;
@@ -3635,6 +3690,100 @@ begin
         Result := 1;
       end;
 
+      lCallCount := 0;
+      lDialogOutcome.DialogResult := codCancel;
+      lDialogOutcome.Caption := 'Canceled caption';
+      lApplyResult := ApplyWindowCaptionDialogOutcome(
+        lOverrides,
+        hWnd(100),
+        200,
+        lDialogOutcome,
+        function(const aWnd: hWnd; const aProcessId: Cardinal): Boolean
+        begin
+          Inc(lCallCount);
+          Result := False;
+        end);
+      if (lApplyResult <> wcdarNone) or (lCallCount <> 0) or
+        (ApplyWindowCaptionOverride(lOverrides, hWnd(100), 200, '') <> 'Custom caption') then
+      begin
+        Writeln('SELFTEST FAILED: canceled window rename changed the override');
+        Result := 1;
+      end;
+
+      lDialogOutcome.DialogResult := codReset;
+      lApplyResult := ApplyWindowCaptionDialogOutcome(
+        lOverrides,
+        hWnd(100),
+        200,
+        lDialogOutcome,
+        function(const aWnd: hWnd; const aProcessId: Cardinal): Boolean
+        begin
+          Inc(lCallCount);
+          Result := False;
+        end);
+      if (lApplyResult <> wcdarReset) or (lCallCount <> 0) or
+        HasWindowCaptionOverride(lOverrides, hWnd(100), 200) then
+      begin
+        Writeln('SELFTEST FAILED: window caption reset did not remove exactly its override');
+        Result := 1;
+      end;
+
+      lTestWnd := CreateWindowEx(0, 'STATIC', '', WS_POPUP, 0, 0, 0, 0, 0, 0, HInstance, nil);
+      if lTestWnd = 0 then
+      begin
+        Writeln('SELFTEST FAILED: could not create a real window for identity validation');
+        Result := 1;
+      end else begin
+        lTestProcessId := GetCurrentProcessId;
+        lTestOverrideKey := BuildWindowCaptionOverrideKey(lTestWnd, lTestProcessId);
+        lOverrides.AddOrSetValue(lTestOverrideKey, 'Original caption');
+        lDialogOutcome.DialogResult := codRename;
+        lDialogOutcome.Caption := 'Current caption';
+        lApplyResult := ApplyWindowCaptionDialogOutcome(
+          lOverrides,
+          lTestWnd,
+          lTestProcessId,
+          lDialogOutcome,
+          IsWindowIdentityCurrent);
+        if (lApplyResult <> wcdarRenamed) or
+          (ApplyWindowCaptionOverride(lOverrides, lTestWnd, lTestProcessId, '') <> 'Current caption') then
+        begin
+          Writeln('SELFTEST FAILED: current real window identity did not apply the rename');
+          Result := 1;
+        end;
+
+        lDialogOutcome.Caption := 'Wrong process caption';
+        lApplyResult := ApplyWindowCaptionDialogOutcome(
+          lOverrides,
+          lTestWnd,
+          lTestProcessId + 1,
+          lDialogOutcome,
+          IsWindowIdentityCurrent);
+        if (lApplyResult <> wcdarStale) or
+          (ApplyWindowCaptionOverride(lOverrides, lTestWnd, lTestProcessId, '') <> 'Current caption') then
+        begin
+          Writeln('SELFTEST FAILED: live HWND with a different PID changed the override');
+          Result := 1;
+        end;
+
+        DestroyWindow(lTestWnd);
+        lDialogOutcome.Caption := 'Stale caption';
+        lApplyResult := ApplyWindowCaptionDialogOutcome(
+          lOverrides,
+          lTestWnd,
+          lTestProcessId,
+          lDialogOutcome,
+          IsWindowIdentityCurrent);
+        if (lApplyResult <> wcdarStale) or
+          (ApplyWindowCaptionOverride(lOverrides, lTestWnd, lTestProcessId, '') <> 'Current caption') then
+        begin
+          Writeln('SELFTEST FAILED: destroyed window identity changed the override');
+          Result := 1;
+        end;
+        lOverrides.Remove(lTestOverrideKey);
+      end;
+
+      lOverrides.AddOrSetValue(lOverrideKey, 'Custom caption');
       SaveWindowCaptionOverridesToFile(lStateFileName, lOverrides, 12345);
       LoadWindowCaptionOverridesFromFile(lStateFileName, lLoadedOverrides, 12347);
       if ApplyWindowCaptionOverride(lLoadedOverrides, hWnd(100), 200, 'Normal caption') <> 'Custom caption' then
