@@ -174,6 +174,7 @@ function ConcurrentStopJoins(const aWriter: TRenameJournalWriter; const aWnd: HW
 var
   g: TGarbos;
   lCompleted: Integer;
+  lDiagnostics: TRenameJournalDiagnostics;
   lQueueResult: TRenameJournalEnqueueResult;
   lStopThread: TThread;
   lStopwatch: TStopwatch;
@@ -206,12 +207,20 @@ begin
     end;
 
     aWriter.StopAndWait;
-    if TInterlocked.CompareExchange(lCompleted, 0, 0) = 0 then
+    lDiagnostics := aWriter.GetDiagnostics;
+    if lDiagnostics.ActiveWorkerCount <> 0 then
     begin
-      aErrorMessage := 'concurrent StopAndWait returned before the worker joined';
+      aErrorMessage := Format(
+        'concurrent StopAndWait returned with %d active worker(s)',
+        [lDiagnostics.ActiveWorkerCount]);
       Exit;
     end;
     lStopThread.WaitFor;
+    if TInterlocked.CompareExchange(lCompleted, 0, 0) = 0 then
+    begin
+      aErrorMessage := 'concurrent StopAndWait peer did not complete';
+      Exit;
+    end;
     Result := True;
   finally
     g.Clear;

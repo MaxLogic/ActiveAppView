@@ -11,6 +11,8 @@ uses
   madListModules,
   ActiveAppView.Launcher in 'ActiveAppView.Launcher.pas',
   ActiveAppView.ChatMonitor in 'ActiveAppView.ChatMonitor.pas',
+  ActiveAppView.CaptionOverrideState in 'ActiveAppView.CaptionOverrideState.pas',
+  ActiveAppView.CaptionOverrideState.SelfTests in 'ActiveAppView.CaptionOverrideState.SelfTests.pas',
   ActiveAppViewCore in 'ActiveAppViewCore.pas',
   ActiveAppViewMainForm in 'ActiveAppViewMainForm.pas' {AppsViewMainFrm},
   ActiveAppView.SelfTests in 'ActiveAppView.SelfTests.pas',
@@ -18,6 +20,7 @@ uses
   ActiveAppView.RenameJournal.SelfTests in 'ActiveAppView.RenameJournal.SelfTests.pas',
   MaxLogic.MadExcept.AiRunner in '..\..\MaxLogic\MaxLogicFoundation\MaxLogic.MadExcept.AiRunner.pas',
   MaxLogic.StrUtils in '..\..\MaxLogic\MaxLogicFoundation\MaxLogic.StrUtils.pas',
+  MaxLogic.Windows.Identity in '..\..\MaxLogic\MaxLogicFoundation\MaxLogic.Windows.Identity.pas',
   maxLogic.Windows.Desktop in '..\..\MaxLogic\MaxLogicFoundation\maxLogic.Windows.Desktop.pas';
 
 {$R *.res}

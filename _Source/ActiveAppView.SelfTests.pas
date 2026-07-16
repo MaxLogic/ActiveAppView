@@ -9,8 +9,9 @@ implementation
 uses
   System.Classes, System.Diagnostics, System.IniFiles, System.IOUtils, System.SysUtils,
   Winapi.Windows,
-  ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore, ActiveAppView.Launcher,
-  ActiveAppView.RenameJournal.SelfTests, ActiveAppViewMainForm, maxLogic.Windows.Desktop;
+  ActiveAppView.CaptionOverrideState.SelfTests, ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache,
+  ActiveAppViewCore, ActiveAppView.Launcher, ActiveAppView.RenameJournal.SelfTests,
+  ActiveAppViewMainForm, maxLogic.Windows.Desktop;
 
 const
   cConfigCacheParseBenchmarkSelfTestArg = '--self-test-config-cache-parse-benchmark';
@@ -280,6 +281,14 @@ end;
 
 function RunSelfTests: Integer;
 begin
+  Result := RunCaptionOverrideStateSelfTests(ParamStr(1));
+  if Result <> -1 then
+  begin
+    if Result = 0 then
+      Result := RunMainFormSelfTests(ParamStr(1));
+    Exit;
+  end;
+
   Result := RunCoreSelfTests(ParamStr(1));
   if Result <> -1 then
     Exit;

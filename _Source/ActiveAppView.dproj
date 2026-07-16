@@ -149,6 +149,9 @@
         <DCCReference Include="ActiveAppView.ChatMonitor.pas"/>
         <DCCReference Include="ActiveAppView.RenameJournal.pas"/>
         <DCCReference Include="ActiveAppView.RenameJournal.SelfTests.pas"/>
+        <DCCReference Include="ActiveAppView.CaptionOverrideState.pas"/>
+        <DCCReference Include="ActiveAppView.CaptionOverrideState.SelfTests.pas"/>
+        <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\MaxLogic.Windows.Identity.pas"/>
         <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\MaxLogic.MadExcept.AiRunner.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
