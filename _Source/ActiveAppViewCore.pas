@@ -21,6 +21,8 @@ type
     fAppUserModelIDRetrieved: Boolean;
     fRelaunchCommand: String;
     fRelaunchCommandRetrieved: Boolean;
+    fProcessIdentityReady: Integer;
+    fProcessStartedAt: Int64;
 
     fCaption: string;
     function GetIcon: TIcon;
@@ -37,8 +39,10 @@ type
     destructor Destroy; override;
 
     procedure Update;
+    procedure PrefetchProcessIdentity;
     procedure ScreenShoot(aBitMap: TBitmap);
     procedure SHOW;
+    function TryGetCachedProcessStartedAt(out aProcessStartedAt: Int64): Boolean;
 
     property Wnd: hWnd read fWnd;
     property caption: string read fCaption;
@@ -77,7 +81,9 @@ function RunCoreSelfTests(const aArg: string): Integer;
 implementation
 
 uses
-  AutoFree, maxLogic.StrUtils, maxLogic.Windows.Desktop, StrUtils;
+  System.SyncObjs, StrUtils,
+  AutoFree,
+  MaxLogic.Windows.Identity, maxLogic.StrUtils, maxLogic.Windows.Desktop;
 
 const
   cCoreCommandLineParamsSelfTestArg = '--self-test-core-command-line-params';
@@ -291,6 +297,30 @@ begin
   fCaption := maxLogic.Windows.Desktop.GetWinCaption(Wnd);
 end;
 
+procedure TAppInfo.PrefetchProcessIdentity;
+var
+  lProcessStartedAt: Int64;
+begin
+  if TInterlocked.CompareExchange(fProcessIdentityReady, 0, 0) <> 0 then
+    Exit;
+  if TryGetProcessStartedAtUtcMilliseconds(PID, lProcessStartedAt) then
+  begin
+    fProcessStartedAt := lProcessStartedAt;
+    TInterlocked.Exchange(fProcessIdentityReady, 1);
+  end else
+    TInterlocked.Exchange(fProcessIdentityReady, -1);
+end;
+
+function TAppInfo.TryGetCachedProcessStartedAt(
+  out aProcessStartedAt: Int64): Boolean;
+begin
+  Result := TInterlocked.CompareExchange(fProcessIdentityReady, 0, 0) = 1;
+  if Result then
+    aProcessStartedAt := fProcessStartedAt
+  else
+    aProcessStartedAt := 0;
+end;
+
 { TAppList }
 
 procedure TAppList.Clear;
@@ -329,6 +359,7 @@ function TAppList.TryGetApp(Wnd: hWnd; out App: TAppInfo): boolean;
 var
   i: integer;
 begin
+  App := nil;
   if fApps.find(Wnd, i) then
   begin
     Result := True;

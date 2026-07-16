@@ -15,19 +15,22 @@ uses
   FireDAC.Phys.SQLite, FireDAC.Phys.SQLiteDef,
   FireDAC.Phys.SQLiteWrapper.Stat, FireDAC.Stan.Async, FireDAC.Stan.Def,
   FireDAC.VCLUI.Wait,
-  ActiveAppView.RenameJournal, CancelToken;
+  MaxLogic.Windows.Identity,
+  ActiveAppView.CaptionOverrideState, ActiveAppView.RenameJournal, CancelToken;
 
 const
-  cMigrationDescriptions: array[0..3] of string = (
+  cMigrationDescriptions: array[0..4] of string = (
     'Initial schema',
     'Capture codec modes',
     'Focus page URL',
-    'Window rename events');
-  cMigrationFileNames: array[0..3] of string = (
+    'Window rename events',
+    'Window caption override lifecycle');
+  cMigrationFileNames: array[0..4] of string = (
     '001_initial.sql',
     '002_capture_codec_modes.sql',
     '003_focus_page_url.sql',
-    '004_window_rename_events.sql');
+    '004_window_rename_events.sql',
+    '005_window_caption_override_lifecycle.sql');
   cRenameJournalWriteSelfTestArg = '--self-test-rename-journal';
 
 procedure ConfigureTestConnection(const aDatabaseFileName: string; const aConnection: TFDConnection);
@@ -130,6 +133,204 @@ begin
     'MaxLogic\PawelsPersonalShadowJourney\migrations');
 end;
 
+function PrepareMigratedTestDatabase(const aDatabaseFileName: string;
+  const aMigrationDirectory: string; const aConnection: TFDConnection;
+  out aErrorMessage: string): Boolean;
+var
+  lDriverLink: TFDPhysSQLiteDriverLink;
+begin
+  lDriverLink := TFDPhysSQLiteDriverLink.Create(aConnection);
+  lDriverLink.DriverID := 'SQLite';
+  ConfigureTestConnection(aDatabaseFileName, aConnection);
+  Result := ApplyCanonicalShadowJournalMigrations(
+    aConnection,
+    aMigrationDirectory,
+    1,
+    5,
+    aErrorMessage);
+  aConnection.Connected := False;
+end;
+
+function QueueLifecycleEvent(const aWriter: TRenameJournalWriter;
+  const aEvent: TCaptionOverrideLifecycleEvent;
+  const aFailureMessage: string; out aErrorMessage: string): Boolean;
+begin
+  aErrorMessage := '';
+  Result := aWriter.EnqueueLifecycle(aEvent) =
+    TRenameJournalEnqueueResult.rjerQueued;
+  if not Result then
+    aErrorMessage := aFailureMessage;
+end;
+
+function QueueLifecycleContractEvents(const aWriter: TRenameJournalWriter;
+  var aIdentity: TCaptionOverrideIdentity; out aErrorMessage: string): Boolean;
+var
+  lEvent: TCaptionOverrideLifecycleEvent;
+begin
+  Result := False;
+  lEvent := TCaptionOverrideLifecycleEvent.CreateRename(
+    aIdentity,
+    1783900800123,
+    'Żółć 東京');
+  if not QueueLifecycleEvent(aWriter, lEvent,
+    'schema-v5 lifecycle rename event was not queued', aErrorMessage) then
+    Exit;
+  lEvent := TCaptionOverrideLifecycleEvent.CreateRename(
+    aIdentity,
+    1783900800122,
+    'Replacement');
+  if not QueueLifecycleEvent(aWriter, lEvent,
+    'replacement lifecycle rename event was not queued', aErrorMessage) then
+    Exit;
+  lEvent := TCaptionOverrideLifecycleEvent.CreateEnd(
+    TCaptionOverrideEventKind.coekReset,
+    aIdentity,
+    1783900800124,
+    'user_reset');
+  if not QueueLifecycleEvent(aWriter, lEvent,
+    'lifecycle reset event was not queued', aErrorMessage) then
+    Exit;
+  aIdentity.HasProcessStartedAt := False;
+  aIdentity.ProcessStartedAt := 0;
+  lEvent := TCaptionOverrideLifecycleEvent.CreateRename(
+    aIdentity,
+    1783900800125,
+    'Nullable identity');
+  if not QueueLifecycleEvent(aWriter, lEvent,
+    'nullable lifecycle rename event was not queued', aErrorMessage) then
+    Exit;
+  lEvent := TCaptionOverrideLifecycleEvent.CreateEnd(
+    TCaptionOverrideEventKind.coekExpired,
+    aIdentity,
+    1783900800126,
+    'local_prune');
+  Result := QueueLifecycleEvent(aWriter, lEvent,
+    'lifecycle expiration event was not queued', aErrorMessage);
+end;
+
+function ValidateStrongLifecycleRows(const aQuery: TFDQuery;
+  const aIdentity: TCaptionOverrideIdentity;
+  out aErrorMessage: string): Boolean;
+begin
+  Result := False;
+  aErrorMessage := '';
+  if aQuery.RecordCount <> 5 then
+  begin
+    aErrorMessage := Format('expected 5 lifecycle events, got %d', [aQuery.RecordCount]);
+    Exit;
+  end;
+  if (aQuery.FieldByName('event_kind').AsWideString <> 'rename') or
+    (aQuery.FieldByName('caption').AsWideString <> 'Żółć 東京') or
+    (aQuery.FieldByName('reason').AsWideString <> 'user_rename') or
+    (aQuery.FieldByName('boot_id').AsLargeInt <> aIdentity.BootId) or
+    (aQuery.FieldByName('process_started_at').AsLargeInt <> 1783900000123) or
+    (aQuery.FieldByName('hwnd').AsLargeInt <> Int64(aIdentity.Hwnd)) then
+  begin
+    aErrorMessage := 'strong lifecycle rename payload mismatch';
+    Exit;
+  end;
+  aQuery.Next;
+  if (aQuery.FieldByName('occurred_at').AsLargeInt <> 1783900800122) or
+    (aQuery.FieldByName('caption').AsWideString <> 'Replacement') then
+  begin
+    aErrorMessage := 'replacement rename was reordered by regressive wall time';
+    Exit;
+  end;
+  aQuery.Next;
+  if (aQuery.FieldByName('event_kind').AsWideString <> 'reset') or
+    (not aQuery.FieldByName('caption').IsNull) or
+    (aQuery.FieldByName('reason').AsWideString <> 'user_reset') then
+  begin
+    aErrorMessage := 'reset lifecycle payload mismatch';
+    Exit;
+  end;
+  Result := True;
+end;
+
+function ValidateNullableLifecycleRows(const aQuery: TFDQuery;
+  out aErrorMessage: string): Boolean;
+begin
+  Result := False;
+  aErrorMessage := '';
+  aQuery.Next;
+  if (aQuery.FieldByName('event_kind').AsWideString <> 'rename') or
+    (not aQuery.FieldByName('process_started_at').IsNull) then
+  begin
+    aErrorMessage := 'nullable lifecycle identity payload mismatch';
+    Exit;
+  end;
+  aQuery.Next;
+  if (aQuery.FieldByName('event_kind').AsWideString <> 'expired') or
+    (not aQuery.FieldByName('caption').IsNull) or
+    (aQuery.FieldByName('reason').AsWideString <> 'local_prune') then
+  begin
+    aErrorMessage := 'expiration lifecycle payload mismatch';
+    Exit;
+  end;
+  Result := True;
+end;
+
+function ValidateLifecycleContractRows(const aConnection: TFDConnection;
+  const aIdentity: TCaptionOverrideIdentity;
+  out aErrorMessage: string): Boolean;
+var
+  g: TGarbos;
+  lQuery: TFDQuery;
+begin
+  g := Default(TGarbos);
+  try
+    aConnection.Connected := True;
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := aConnection;
+    lQuery.SQL.Text :=
+      'SELECT occurred_at, boot_id, process_started_at, pid, hwnd, event_kind, caption, reason ' +
+      'FROM window_caption_override_events ORDER BY id;';
+    lQuery.Open;
+    Result := ValidateStrongLifecycleRows(lQuery, aIdentity, aErrorMessage) and
+      ValidateNullableLifecycleRows(lQuery, aErrorMessage);
+  finally
+    g.Clear;
+  end;
+end;
+
+function VerifyLifecycleContract(const aRoot: string;
+  const aMigrationDirectory: string; out aErrorMessage: string): Boolean;
+var
+  g: TGarbos;
+  lCancelToken: iCancelToken;
+  lConfig: TRenameJournalConfig;
+  lConnection: TFDConnection;
+  lDatabaseFileName: string;
+  lIdentity: TCaptionOverrideIdentity;
+  lWriter: TRenameJournalWriter;
+begin
+  g := Default(TGarbos);
+  Result := False;
+  aErrorMessage := '';
+  lDatabaseFileName := TPath.Combine(aRoot, 'lifecycle-v5.db');
+  GC(lConnection, TFDConnection.Create(nil), g);
+  if not PrepareMigratedTestDatabase(
+    lDatabaseFileName, aMigrationDirectory, lConnection, aErrorMessage) then
+    Exit;
+
+  lConfig := Default(TRenameJournalConfig);
+  lConfig.Enabled := True;
+  lConfig.DatabaseFileName := lDatabaseFileName;
+  lCancelToken := TCancelToken.Create;
+  GC(lWriter, TRenameJournalWriter.Create(lConfig, lCancelToken), g);
+  lIdentity := Default(TCaptionOverrideIdentity);
+  lIdentity.HasBootId := True;
+  lIdentity.BootId := 1783900000000;
+  lIdentity.HasProcessStartedAt := True;
+  lIdentity.ProcessStartedAt := 1783900000123;
+  lIdentity.ProcessId := 4321;
+  lIdentity.Hwnd := $0000000100000001;
+  if not QueueLifecycleContractEvents(lWriter, lIdentity, aErrorMessage) then
+    Exit;
+  lWriter.StopAndWait;
+  Result := ValidateLifecycleContractRows(lConnection, lIdentity, aErrorMessage);
+end;
+
 function WaitForWriterProgress(const aWriter: TRenameJournalWriter;
   const aMinimumDequeued: Int64; const aMinimumDropped: Int64;
   const aMinimumPersisted: Int64): Boolean;
@@ -149,6 +350,265 @@ begin
   Result := False;
 end;
 
+function TryCreateWindowMissingState(out aState: TCaptionOverrideState;
+  out aWnd: HWND; out aErrorMessage: string): Boolean;
+var
+  lBootIdentity: TWindowsBootIdentity;
+  lProcessStartedAt: Int64;
+begin
+  Result := False;
+  aState := nil;
+  aWnd := 0;
+  aErrorMessage := '';
+  if not TryGetWindowsBootIdentity(1000, False, lBootIdentity) then
+  begin
+    aErrorMessage := 'expiration self-test could not obtain boot identity';
+    Exit;
+  end;
+  if not TryGetProcessStartedAtUtcMilliseconds(
+    GetCurrentProcessId, lProcessStartedAt) then
+  begin
+    aErrorMessage := 'expiration self-test could not obtain process-start identity';
+    Exit;
+  end;
+  aWnd := CreateWindowEx(0, 'STATIC', 'LifecycleExpirationSelfTest', 0,
+    0, 0, 0, 0, 0, 0, HInstance, nil);
+  if aWnd = 0 then
+  begin
+    aErrorMessage := 'expiration self-test could not create a real window';
+    Exit;
+  end;
+  SetLength(aState, 1);
+  aState[0].Caption := 'Expires with window';
+  aState[0].CreatedAt := 1783900800200;
+  aState[0].UpdatedAt := 1783900800200;
+  aState[0].Reason := 'user_rename';
+  aState[0].Identity.HasBootId := True;
+  aState[0].Identity.BootId := lBootIdentity.UtcMilliseconds;
+  aState[0].Identity.HasProcessStartedAt := True;
+  aState[0].Identity.ProcessStartedAt := lProcessStartedAt;
+  aState[0].Identity.ProcessId := GetCurrentProcessId;
+  aState[0].Identity.Hwnd := UInt64(NativeUInt(aWnd));
+  Result := True;
+end;
+
+function WaitForWindowMissingExpiration(const aWriter: TRenameJournalWriter;
+  out aErrorMessage: string): Boolean;
+var
+  lExpirations: TCaptionOverrideExpirations;
+begin
+  Result := False;
+  aErrorMessage := '';
+  if not WaitForWriterProgress(aWriter, 1, 0, 1) then
+  begin
+    aErrorMessage := 'window-missing expiration was not persisted';
+    Exit;
+  end;
+  if (not aWriter.TryTakeExpiredOverrides(lExpirations)) or
+    (Length(lExpirations) <> 1) or
+    (lExpirations[0].Reason <> 'window_missing') then
+  begin
+    aErrorMessage := 'window-missing expiration was not published to the UI boundary';
+    Exit;
+  end;
+  Result := True;
+end;
+
+function ValidateWindowMissingResults(const aConnection: TFDConnection;
+  const aStateFileName: string; const aState: TCaptionOverrideState;
+  out aErrorMessage: string): Boolean;
+var
+  g: TGarbos;
+  lIniFile: TMemIniFile;
+  lQuery: TFDQuery;
+begin
+  g := Default(TGarbos);
+  Result := False;
+  aErrorMessage := '';
+  try
+    aConnection.Connected := True;
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := aConnection;
+    lQuery.SQL.Text :=
+      'SELECT event_kind, caption, reason, boot_id, process_started_at, pid, hwnd ' +
+      'FROM window_caption_override_events ORDER BY id;';
+    lQuery.Open;
+    if (lQuery.RecordCount <> 1) or
+      (lQuery.FieldByName('event_kind').AsWideString <> 'expired') or
+      (not lQuery.FieldByName('caption').IsNull) or
+      (lQuery.FieldByName('reason').AsWideString <> 'window_missing') or
+      (lQuery.FieldByName('boot_id').AsLargeInt <> aState[0].Identity.BootId) or
+      (lQuery.FieldByName('process_started_at').AsLargeInt <>
+      aState[0].Identity.ProcessStartedAt) then
+    begin
+      aErrorMessage := 'window-missing expiration database payload mismatch';
+      Exit;
+    end;
+    GC(lIniFile, TMemIniFile.Create(aStateFileName, TEncoding.UTF8, False), g);
+    if lIniFile.ReadInteger('Metadata', 'Count', -1) <> 0 then
+    begin
+      aErrorMessage := 'expired override remained in the persisted local state';
+      Exit;
+    end;
+    Result := True;
+  finally
+    g.Clear;
+  end;
+end;
+
+function VerifyWindowMissingExpiration(const aRoot: string;
+  const aMigrationDirectory: string; out aErrorMessage: string): Boolean;
+var
+  g: TGarbos;
+  lConfig: TRenameJournalConfig;
+  lConnection: TFDConnection;
+  lState: TCaptionOverrideState;
+  lTestWnd: HWND;
+  lWriter: TRenameJournalWriter;
+begin
+  g := Default(TGarbos);
+  Result := False;
+  aErrorMessage := '';
+  lTestWnd := 0;
+  try
+    if not TryCreateWindowMissingState(lState, lTestWnd, aErrorMessage) then
+      Exit;
+
+    lConfig := Default(TRenameJournalConfig);
+    lConfig.Enabled := True;
+    lConfig.DatabaseFileName := TPath.Combine(aRoot, 'expiration-v5.db');
+    lConfig.OverrideStateFileName := TPath.Combine(aRoot, 'expiration-state.ini');
+    GC(lConnection, TFDConnection.Create(nil), g);
+    if not PrepareMigratedTestDatabase(lConfig.DatabaseFileName,
+      aMigrationDirectory, lConnection, aErrorMessage) then
+      Exit;
+    GC(lWriter, TRenameJournalWriter.Create(lConfig, TCancelToken.Create), g);
+    if (not lWriter.SubmitOverrideState(lState)) or
+      (not lWriter.WaitForOverrideStatePersistence(5000)) then
+    begin
+      aErrorMessage := 'expiration setup state was not persisted';
+      Exit;
+    end;
+    DestroyWindow(lTestWnd);
+    lTestWnd := 0;
+    if not WaitForWindowMissingExpiration(lWriter, aErrorMessage) then
+      Exit;
+    lWriter.StopAndWait;
+    Result := ValidateWindowMissingResults(
+      lConnection, lConfig.OverrideStateFileName, lState, aErrorMessage);
+  finally
+    if lTestWnd <> 0 then
+      DestroyWindow(lTestWnd);
+    g.Clear;
+  end;
+end;
+
+function VerifyObservedExpirationReason(const aRoot: string;
+  const aMigrationDirectory: string; const aExpectedReason: string;
+  out aErrorMessage: string): Boolean;
+var
+  g: TGarbos;
+  lBootIdentity: TWindowsBootIdentity;
+  lCancelToken: iCancelToken;
+  lConfig: TRenameJournalConfig;
+  lConnection: TFDConnection;
+  lDatabaseFileName: string;
+  lDriverLink: TFDPhysSQLiteDriverLink;
+  lExpirations: TCaptionOverrideExpirations;
+  lQuery: TFDQuery;
+  lState: TCaptionOverrideState;
+  lTestWnd: HWND;
+  lWriter: TRenameJournalWriter;
+begin
+  g := Default(TGarbos);
+  Result := False;
+  aErrorMessage := '';
+  lTestWnd := 0;
+  try
+    if not TryGetWindowsBootIdentity(1000, False, lBootIdentity) then
+    begin
+      aErrorMessage := 'observed expiration self-test could not obtain boot identity';
+      Exit;
+    end;
+    lDatabaseFileName := TPath.Combine(aRoot, aExpectedReason + '-v5.db');
+    GC(lConnection, TFDConnection.Create(nil), g);
+    lDriverLink := TFDPhysSQLiteDriverLink.Create(lConnection);
+    lDriverLink.DriverID := 'SQLite';
+    ConfigureTestConnection(lDatabaseFileName, lConnection);
+    if not ApplyCanonicalShadowJournalMigrations(
+      lConnection,
+      aMigrationDirectory,
+      1,
+      5,
+      aErrorMessage) then
+      Exit;
+    lConnection.Connected := False;
+
+    SetLength(lState, 1);
+    lState[0].Caption := 'Observed expiration';
+    lState[0].CreatedAt := 1783900800400;
+    lState[0].UpdatedAt := 1783900800400;
+    lState[0].Reason := 'user_rename';
+    lState[0].Identity.HasBootId := True;
+    lState[0].Identity.BootId := lBootIdentity.UtcMilliseconds;
+    lState[0].Identity.ProcessId := High(Cardinal);
+    if aExpectedReason = 'identity_changed' then
+    begin
+      lTestWnd := CreateWindowEx(0, 'STATIC', 'IdentityChangedSelfTest', 0,
+        0, 0, 0, 0, 0, 0, HInstance, nil);
+      if lTestWnd = 0 then
+      begin
+        aErrorMessage := 'identity-change self-test could not create a real window';
+        Exit;
+      end;
+      lState[0].Identity.Hwnd := UInt64(NativeUInt(lTestWnd));
+    end else
+      lState[0].Identity.Hwnd := High(UInt64);
+
+    lConfig := Default(TRenameJournalConfig);
+    lConfig.Enabled := True;
+    lConfig.DatabaseFileName := lDatabaseFileName;
+    lConfig.OverrideStateFileName := TPath.Combine(
+      aRoot,
+      aExpectedReason + '-state.ini');
+    lCancelToken := TCancelToken.Create;
+    GC(lWriter, TRenameJournalWriter.Create(lConfig, lCancelToken), g);
+    if (not lWriter.SubmitOverrideState(lState)) or
+      (not lWriter.WaitForOverrideStatePersistence(5000)) or
+      (not WaitForWriterProgress(lWriter, 1, 0, 1)) then
+    begin
+      aErrorMessage := aExpectedReason + ' expiration was not persisted';
+      Exit;
+    end;
+    if (not lWriter.TryTakeExpiredOverrides(lExpirations)) or
+      (Length(lExpirations) <> 1) or
+      (lExpirations[0].Reason <> aExpectedReason) then
+    begin
+      aErrorMessage := aExpectedReason + ' expiration notification mismatch';
+      Exit;
+    end;
+    lWriter.StopAndWait;
+
+    lConnection.Connected := True;
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := lConnection;
+    lQuery.SQL.Text :=
+      'SELECT reason FROM window_caption_override_events ORDER BY id;';
+    lQuery.Open;
+    if (lQuery.RecordCount <> 1) or
+      (lQuery.FieldByName('reason').AsWideString <> aExpectedReason) then
+    begin
+      aErrorMessage := aExpectedReason + ' expiration database mismatch';
+      Exit;
+    end;
+    Result := True;
+  finally
+    if lTestWnd <> 0 then
+      DestroyWindow(lTestWnd);
+    g.Clear;
+  end;
+end;
+
 function WriterDiagnosticsMatch(const aWriter: TRenameJournalWriter;
   const aExpectedAccepted: Int64; const aExpectedDropped: Int64;
   const aExpectedPending: Integer; const aExpectedPersisted: Int64;
@@ -156,6 +616,7 @@ function WriterDiagnosticsMatch(const aWriter: TRenameJournalWriter;
 var
   lDiagnostics: TRenameJournalDiagnostics;
 begin
+  aErrorMessage := '';
   lDiagnostics := aWriter.GetDiagnostics;
   Result := (lDiagnostics.Accepted = aExpectedAccepted) and
     (lDiagnostics.Dropped = aExpectedDropped) and
@@ -284,6 +745,38 @@ begin
       Exit;
     end;
 
+    if not VerifyLifecycleContract(lRoot, FindCanonicalMigrationDirectory, lErrorMessage) then
+    begin
+      Writeln('SELFTEST FAILED: ' + lErrorMessage);
+      Exit;
+    end;
+    if not VerifyWindowMissingExpiration(
+      lRoot,
+      FindCanonicalMigrationDirectory,
+      lErrorMessage) then
+    begin
+      Writeln('SELFTEST FAILED: ' + lErrorMessage);
+      Exit;
+    end;
+    if not VerifyObservedExpirationReason(
+      lRoot,
+      FindCanonicalMigrationDirectory,
+      'process_exited',
+      lErrorMessage) then
+    begin
+      Writeln('SELFTEST FAILED: ' + lErrorMessage);
+      Exit;
+    end;
+    if not VerifyObservedExpirationReason(
+      lRoot,
+      FindCanonicalMigrationDirectory,
+      'identity_changed',
+      lErrorMessage) then
+    begin
+      Writeln('SELFTEST FAILED: ' + lErrorMessage);
+      Exit;
+    end;
+
     lIniFile.EraseSection('save-renames-to-journal');
     lConfig := LoadRenameJournalConfig(lIniFile);
     if lConfig.Enabled then
@@ -358,11 +851,11 @@ begin
       lConnection,
       FindCanonicalMigrationDirectory,
       1,
-      3,
+      4,
       lErrorMessage) then
     begin
       Writeln(
-        'SELFTEST FAILED: canonical Shadow Journal migrations 001-003 were not applied: ' +
+        'SELFTEST FAILED: canonical Shadow Journal migrations 001-004 were not applied: ' +
         lErrorMessage);
       Exit;
     end;
@@ -387,7 +880,7 @@ begin
     end;
     if not TFile.Exists(ChangeFileExt(lDatabaseFileName, '.rename-journal.log')) or
       (Pos(
-        'window_rename_events',
+        'window_caption_override_events',
         TFile.ReadAllText(
           ChangeFileExt(lDatabaseFileName, '.rename-journal.log'),
           TEncoding.UTF8)) = 0) then
@@ -399,12 +892,12 @@ begin
     if not ApplyCanonicalShadowJournalMigrations(
       lConnection,
       FindCanonicalMigrationDirectory,
-      4,
-      4,
+      5,
+      5,
       lErrorMessage) then
     begin
       Writeln(
-        'SELFTEST FAILED: canonical Shadow Journal migration 004 was not applied: ' +
+        'SELFTEST FAILED: canonical Shadow Journal migration 005 was not applied: ' +
         lErrorMessage);
       Exit;
     end;
@@ -423,7 +916,11 @@ begin
     lWriter.StopAndWait;
     if not WriterDiagnosticsMatch(lWriter, 2, 1, 0, 1, lErrorMessage) then
     begin
-      Writeln('SELFTEST FAILED: schema-recovery diagnostics ' + lErrorMessage);
+      Writeln(
+        'SELFTEST FAILED: schema-recovery diagnostics ' + lErrorMessage + sLineBreak +
+        TFile.ReadAllText(
+          ChangeFileExt(lDatabaseFileName, '.rename-journal.log'),
+          TEncoding.UTF8));
       Exit;
     end;
 
@@ -431,20 +928,20 @@ begin
     GC(lQuery, TFDQuery.Create(nil), g);
     lQuery.Connection := lConnection;
     lQuery.SQL.Text :=
-      'SELECT renamed_at, hwnd, pid, new_caption, ' +
-      '(SELECT COUNT(*) FROM window_rename_events) AS event_count ' +
-      'FROM window_rename_events ORDER BY id DESC LIMIT 1;';
+      'SELECT occurred_at, hwnd, pid, caption, ' +
+      '(SELECT COUNT(*) FROM window_caption_override_events) AS event_count ' +
+      'FROM window_caption_override_events ORDER BY id DESC LIMIT 1;';
     lQuery.Open;
     if lQuery.FieldByName('event_count').AsInteger <> 1 then
     begin
       Writeln('SELFTEST FAILED: canonical writer path did not persist exactly one row');
       Exit;
     end;
-    if lQuery.FieldByName('renamed_at').AsLargeInt <> cExpectedRenamedAt then
+    if lQuery.FieldByName('occurred_at').AsLargeInt <> cExpectedRenamedAt then
     begin
       Writeln(Format(
         'SELFTEST FAILED: rename journal timestamp expected=%d actual=%d',
-        [cExpectedRenamedAt, lQuery.FieldByName('renamed_at').AsLargeInt]));
+        [cExpectedRenamedAt, lQuery.FieldByName('occurred_at').AsLargeInt]));
       Exit;
     end;
     if lQuery.FieldByName('hwnd').AsLargeInt <> Int64(cExpectedHwnd) then
@@ -457,14 +954,14 @@ begin
       Writeln('SELFTEST FAILED: rename journal PID mismatch');
       Exit;
     end;
-    if lQuery.FieldByName('new_caption').AsWideString <> cExpectedCaption then
+    if lQuery.FieldByName('caption').AsWideString <> cExpectedCaption then
     begin
       Writeln('SELFTEST FAILED: rename journal Unicode caption mismatch');
       Exit;
     end;
 
     lQuery.Close;
-    lConnection.ExecSQL('DELETE FROM window_rename_events;');
+    lConnection.ExecSQL('DELETE FROM window_caption_override_events;');
     lConnection.Connected := False;
     lCancelToken := TCancelToken.Create;
     GC(lFifoWriter, TRenameJournalWriter.Create(lConfig, lCancelToken), g);
@@ -483,11 +980,11 @@ begin
     lFifoWriter.StopAndWait;
 
     lConnection.Connected := True;
-    lQuery.SQL.Text := 'SELECT new_caption FROM window_rename_events ORDER BY id;';
+    lQuery.SQL.Text := 'SELECT caption FROM window_caption_override_events ORDER BY id;';
     lQuery.Open;
     for i := 1 to 3 do
     begin
-      if lQuery.Eof or (lQuery.FieldByName('new_caption').AsWideString <> Format('FIFO %d', [i])) then
+      if lQuery.Eof or (lQuery.FieldByName('caption').AsWideString <> Format('FIFO %d', [i])) then
       begin
         Writeln('SELFTEST FAILED: rename journal events were not persisted FIFO');
         Exit;
@@ -501,10 +998,10 @@ begin
     end;
 
     lQuery.Close;
-    lConnection.ExecSQL('DELETE FROM window_rename_events;');
+    lConnection.ExecSQL('DELETE FROM window_caption_override_events;');
     lConnection.StartTransaction;
     lConnection.ExecSQL(
-      'UPDATE schema_version SET description = description WHERE version = 4;');
+      'UPDATE schema_version SET description = description WHERE version = 5;');
     lCancelToken := TCancelToken.Create;
     GC(lLockedWriter, TRenameJournalWriter.Create(lConfig, lCancelToken), g);
     if lLockedWriter.Enqueue(
@@ -540,21 +1037,21 @@ begin
     end;
     lConnection.Connected := True;
     lQuery.SQL.Text :=
-      'SELECT COUNT(*) AS event_count, MIN(new_caption) AS new_caption ' +
-      'FROM window_rename_events;';
+      'SELECT COUNT(*) AS event_count, MIN(caption) AS caption ' +
+      'FROM window_caption_override_events;';
     lQuery.Open;
     if (lQuery.FieldByName('event_count').AsInteger <> 1) or
-      (lQuery.FieldByName('new_caption').AsWideString <> cExpectedCaption + ' recovered') then
+      (lQuery.FieldByName('caption').AsWideString <> cExpectedCaption + ' recovered') then
     begin
       Writeln('SELFTEST FAILED: same writer did not recover after the database lock');
       Exit;
     end;
 
     lQuery.Close;
-    lConnection.ExecSQL('DELETE FROM window_rename_events;');
+    lConnection.ExecSQL('DELETE FROM window_caption_override_events;');
     lConnection.StartTransaction;
     lConnection.ExecSQL(
-      'UPDATE schema_version SET description = description WHERE version = 4;');
+      'UPDATE schema_version SET description = description WHERE version = 5;');
     lCancelToken := TCancelToken.Create;
     GC(lOverflowWriter, TRenameJournalWriter.Create(lConfig, lCancelToken), g);
     if lOverflowWriter.Enqueue(
@@ -619,6 +1116,12 @@ begin
     if not WriterDiagnosticsMatch(lOverflowWriter, 65, 65, 0, 0, lErrorMessage) then
     begin
       Writeln('SELFTEST FAILED: overflow diagnostics ' + lErrorMessage);
+      Exit;
+    end;
+    if (lOverflowWriter.GetDiagnostics.FirstDroppedSequenceId <> 1) or
+      (lOverflowWriter.GetDiagnostics.LastDroppedSequenceId <> 65) then
+    begin
+      Writeln('SELFTEST FAILED: shutdown did not retain exact dropped sequence bounds');
       Exit;
     end;
     if Pos(

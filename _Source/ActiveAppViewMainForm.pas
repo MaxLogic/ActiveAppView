@@ -144,7 +144,10 @@ type
     fShutdownToken: iCancelToken;
     fShuttingDown: Integer;
     procedure AppOnActivate(Sender: TObject);
+    function ApplyExpiredWindowCaptionOverrides: Boolean;
     procedure ApplyLoadedWindowCaptionOverrideState;
+    function BuildWindowCaptionOverrideIdentity(const aWnd: hWnd;
+      const aProcessId: Cardinal): TCaptionOverrideIdentity;
     function BuildWindowCaptionOverrideState: TCaptionOverrideState;
     procedure ApplyAuxListsSnapshot(aSnapshotObject: TObject);
     procedure ApplyDesktopSnapshot(const aItems: TNamedValueArray);
@@ -180,6 +183,10 @@ type
     procedure WaitAsyncWithShutdown(const aAsync: iAsync; const aTimeoutMs: Cardinal);
     procedure UpdateGui;
     procedure ApplyProportionalColumnWidths;
+    procedure ApplyWindowCaptionRename(const aWnd: hWnd;
+      const aProcessId: Cardinal; const aCaption: string);
+    procedure ApplyWindowCaptionReset(const aWnd: hWnd;
+      const aProcessId: Cardinal);
     function ColumnLayoutAvailableWidth: Integer;
     function ControlLayoutWidth(const aControl: TControl): Integer;
     procedure CloseSelectedWindow(const aListBox: TListBox);
@@ -189,9 +196,9 @@ type
       out aProcessId: Cardinal): Boolean;
     function IsCaptionOverrideListBox(const aListBox: TListBox): Boolean;
     function IsProcessActive(const aProcessId: Cardinal): Boolean;
-    procedure JournalWindowRename(const aWnd: hWnd; const aProcessId: Cardinal; const aNewCaption: string);
+    procedure JournalWindowCaptionOverride(
+      const aEvent: TCaptionOverrideLifecycleEvent);
     function PruneWindowCaptionOverrides: Boolean;
-    procedure RemoveWindowCaptionOverridesForWnd(const aWnd: hWnd);
     procedure RemoveStaleWindowCaptionOverrideRecords;
     procedure RestoreFocusAfterWindowCaptionDialog(const aListBox: TListBox);
     procedure SaveWindowCaptionOverrides;
@@ -244,6 +251,7 @@ uses
   System.DateUtils, System.Diagnostics, System.IniFiles, System.IOUtils, System.StrUtils, System.Threading,
   Winapi.ActiveX, Winapi.KnownFolders, Winapi.MMSystem, Winapi.ShellAPI, Winapi.ShlObj,
   AutoFree, maxCallMeLater, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils, maxLogic.Windows.Desktop,
+  MaxLogic.Windows.Identity,
   ActiveAppView.Launcher;
 
 {$R *.dfm}
@@ -359,6 +367,93 @@ begin
       aOverrides.Remove(lKey);
       Result := wcdarReset;
     end;
+  end;
+end;
+
+function BuildRenameCaptionOverrideTransition(
+  const aIdentity: TCaptionOverrideIdentity; const aCaption: string;
+  const aOccurredAt: Int64; out aRecord: TCaptionOverrideRecord;
+  out aEvent: TCaptionOverrideLifecycleEvent): Boolean;
+begin
+  aRecord := Default(TCaptionOverrideRecord);
+  aEvent := Default(TCaptionOverrideLifecycleEvent);
+  Result := (Trim(aCaption) <> '') and (aOccurredAt > 0) and
+    (aIdentity.ProcessId <> 0) and (aIdentity.Hwnd <> 0);
+  if not Result then
+    Exit;
+  aRecord.Caption := aCaption;
+  aRecord.CreatedAt := aOccurredAt;
+  aRecord.Identity := aIdentity;
+  aRecord.Reason := 'user_rename';
+  aRecord.UpdatedAt := aOccurredAt;
+  aEvent := TCaptionOverrideLifecycleEvent.CreateRename(
+    aIdentity,
+    aOccurredAt,
+    aCaption);
+end;
+
+function BuildEndCaptionOverrideTransition(
+  const aRecord: TCaptionOverrideRecord;
+  const aEventKind: TCaptionOverrideEventKind; const aOccurredAt: Int64;
+  const aReason: string; out aEvent: TCaptionOverrideLifecycleEvent): Boolean;
+begin
+  aEvent := Default(TCaptionOverrideLifecycleEvent);
+  Result := (aOccurredAt > 0) and (aRecord.Identity.ProcessId <> 0) and
+    (aRecord.Identity.Hwnd <> 0) and
+    (((aEventKind = TCaptionOverrideEventKind.coekReset) and
+      (aReason = 'user_reset')) or
+    ((aEventKind = TCaptionOverrideEventKind.coekExpired) and
+      ((aReason = 'window_missing') or (aReason = 'process_exited') or
+      (aReason = 'identity_changed') or (aReason = 'local_prune'))));
+  if not Result then
+    Exit;
+  aEvent := TCaptionOverrideLifecycleEvent.CreateEnd(
+    aEventKind,
+    aRecord.Identity,
+    aOccurredAt,
+    aReason);
+end;
+
+function CurrentUtcUnixMilliseconds: Int64;
+var
+  lNow: TDateTime;
+begin
+  lNow := Now;
+  Result := (DateTimeToUnix(lNow, False) * 1000) + MilliSecondOf(lNow);
+end;
+
+function SameCaptionOverrideIdentity(const aLeft: TCaptionOverrideIdentity;
+  const aRight: TCaptionOverrideIdentity): Boolean;
+begin
+  Result := (aLeft.HasBootId = aRight.HasBootId) and
+    ((not aLeft.HasBootId) or (aLeft.BootId = aRight.BootId)) and
+    (aLeft.HasProcessStartedAt = aRight.HasProcessStartedAt) and
+    ((not aLeft.HasProcessStartedAt) or
+      (aLeft.ProcessStartedAt = aRight.ProcessStartedAt)) and
+    (aLeft.ProcessId = aRight.ProcessId) and (aLeft.Hwnd = aRight.Hwnd);
+end;
+
+function SelectCurrentCaptionOverrideIdentity(
+  const aStored: TCaptionOverrideIdentity;
+  const aObserved: TCaptionOverrideIdentity): TCaptionOverrideIdentity;
+begin
+  if (aStored.ProcessId <> aObserved.ProcessId) or
+    (aStored.Hwnd <> aObserved.Hwnd) or
+    (aStored.HasBootId and aObserved.HasBootId and
+      (aStored.BootId <> aObserved.BootId)) or
+    (aStored.HasProcessStartedAt and aObserved.HasProcessStartedAt and
+      (aStored.ProcessStartedAt <> aObserved.ProcessStartedAt)) then
+    Exit(aObserved);
+  Result := aStored;
+  if (not Result.HasBootId) and aObserved.HasBootId then
+  begin
+    Result.HasBootId := True;
+    Result.BootId := aObserved.BootId;
+  end;
+  if (not Result.HasProcessStartedAt) and aObserved.HasProcessStartedAt then
+  begin
+    Result.HasProcessStartedAt := True;
+    Result.ProcessStartedAt := aObserved.ProcessStartedAt;
   end;
 end;
 
@@ -1189,6 +1284,7 @@ begin
           Exit;
 
         lApp.FileName;
+        lApp.PrefetchProcessIdentity;
       except
         // Window metadata can disappear while we prefetch in parallel; skip transient failures.
       end;
@@ -1339,68 +1435,80 @@ begin
   Result := (aListBox = lbApps) or (aListBox = lbConsole);
 end;
 
-procedure TAppsViewMainFrm.JournalWindowRename(const aWnd: hWnd; const aProcessId: Cardinal;
-  const aNewCaption: string);
+function TAppsViewMainFrm.ApplyExpiredWindowCaptionOverrides: Boolean;
+var
+  lExpiration: TCaptionOverrideExpiration;
+  lExpirations: TCaptionOverrideExpirations;
+  lKey: string;
+  lRecord: TCaptionOverrideRecord;
+begin
+  Result := False;
+  if (not Assigned(fRenameJournalWriter)) or
+    (not fRenameJournalWriter.TryTakeExpiredOverrides(lExpirations)) then
+    Exit;
+  for lExpiration in lExpirations do
+  begin
+    lKey := BuildWindowCaptionOverrideKey(
+      HWND(NativeUInt(lExpiration.Identity.Hwnd)),
+      lExpiration.Identity.ProcessId);
+    if fWindowCaptionOverrideRecords.TryGetValue(lKey, lRecord) and
+      SameCaptionOverrideIdentity(lRecord.Identity, lExpiration.Identity) then
+    begin
+      fWindowCaptionOverrideRecords.Remove(lKey);
+      fWindowCaptionOverrides.Remove(lKey);
+      Result := True;
+    end;
+  end;
+end;
+
+function TAppsViewMainFrm.BuildWindowCaptionOverrideIdentity(const aWnd: hWnd;
+  const aProcessId: Cardinal): TCaptionOverrideIdentity;
+var
+  lApp: TAppInfo;
+  lBootIdentity: TWindowsBootIdentity;
+  lObserved: TCaptionOverrideIdentity;
+  lProcessStartedAt: Int64;
+  lRecord: TCaptionOverrideRecord;
+begin
+  lObserved := Default(TCaptionOverrideIdentity);
+  lObserved.Hwnd := UInt64(NativeUInt(aWnd));
+  lObserved.ProcessId := aProcessId;
+  if TryGetCachedWindowsBootIdentity(lBootIdentity) then
+  begin
+    lObserved.HasBootId := True;
+    lObserved.BootId := lBootIdentity.UtcMilliseconds;
+  end;
+  if fApps.TryGetApp(aWnd, lApp) and
+    lApp.TryGetCachedProcessStartedAt(lProcessStartedAt) then
+  begin
+    lObserved.HasProcessStartedAt := True;
+    lObserved.ProcessStartedAt := lProcessStartedAt;
+  end;
+  if fWindowCaptionOverrideRecords.TryGetValue(
+    BuildWindowCaptionOverrideKey(aWnd, aProcessId),
+    lRecord) then
+    Result := SelectCurrentCaptionOverrideIdentity(lRecord.Identity, lObserved)
+  else
+    Result := lObserved;
+end;
+
+procedure TAppsViewMainFrm.JournalWindowCaptionOverride(
+  const aEvent: TCaptionOverrideLifecycleEvent);
 var
   lEnqueueResult: TRenameJournalEnqueueResult;
-  lRenameTime: TDateTime;
 begin
-  lRenameTime := Now;
-  lEnqueueResult := fRenameJournalWriter.Enqueue(
-    aWnd,
-    aProcessId,
-    (DateTimeToUnix(lRenameTime, False) * 1000) + MilliSecondOf(lRenameTime),
-    aNewCaption);
+  lEnqueueResult := fRenameJournalWriter.EnqueueLifecycle(aEvent);
   case lEnqueueResult of
     rjerFull:
-      LogStartupTiming('RenameJournal.QueueFull', 'rename event dropped');
+      LogStartupTiming('RenameJournal.QueueFull', 'lifecycle event dropped');
     rjerStopped:
-      LogStartupTiming('RenameJournal.Stopped', 'rename event dropped during shutdown');
+      LogStartupTiming('RenameJournal.Stopped', 'lifecycle event dropped during shutdown');
   end;
 end;
 
 function TAppsViewMainFrm.PruneWindowCaptionOverrides: Boolean;
 begin
-  Result := ActiveAppViewMainForm.PruneWindowCaptionOverrides(
-    fWindowCaptionOverrides,
-    function(const aWnd: hWnd; const aProcessId: Cardinal): Boolean
-    var
-      lWindowProcessId: Cardinal;
-    begin
-      Result := False;
-      if (aWnd = 0) or (not IsWindow(aWnd)) or (aProcessId = 0) or (not IsProcessActive(aProcessId)) then
-        Exit;
-
-      lWindowProcessId := 0;
-      GetWindowThreadProcessId(aWnd, lWindowProcessId);
-      Result := lWindowProcessId = aProcessId;
-    end);
-end;
-
-procedure TAppsViewMainFrm.RemoveWindowCaptionOverridesForWnd(const aWnd: hWnd);
-var
-  lKey: string;
-  lKeys: TArray<string>;
-  lProcessId: Cardinal;
-  lStoredWnd: hWnd;
-  lWasChanged: Boolean;
-begin
-  if (aWnd = 0) or (not Assigned(fWindowCaptionOverrides)) then
-    Exit;
-
-  lWasChanged := False;
-  lKeys := fWindowCaptionOverrides.Keys.ToArray;
-  for lKey in lKeys do
-  begin
-    if TryParseWindowCaptionOverrideKey(lKey, lStoredWnd, lProcessId) and (lStoredWnd = aWnd) then
-    begin
-      fWindowCaptionOverrides.Remove(lKey);
-      lWasChanged := True;
-    end;
-  end;
-
-  if lWasChanged then
-    SaveWindowCaptionOverrides;
+  Result := ApplyExpiredWindowCaptionOverrides;
 end;
 
 procedure TAppsViewMainFrm.RestoreFocusAfterWindowCaptionDialog(const aListBox: TListBox);
@@ -1459,14 +1567,15 @@ begin
     if not TryParseWindowCaptionOverrideKey(lPair.Key, lWnd, lProcessId) then
       Continue;
     if not fWindowCaptionOverrideRecords.TryGetValue(lPair.Key, lRecord) then
+    begin
       lRecord := Default(TCaptionOverrideRecord);
-    lRecord.Caption := lPair.Value;
-    if lRecord.CreatedAt = 0 then
       lRecord.CreatedAt := lNowMilliseconds;
-    lRecord.UpdatedAt := lNowMilliseconds;
-    lRecord.Reason := 'user_rename';
-    lRecord.Identity.Hwnd := UInt64(NativeUInt(lWnd));
-    lRecord.Identity.ProcessId := lProcessId;
+      lRecord.UpdatedAt := lNowMilliseconds;
+      lRecord.Reason := 'user_rename';
+      lRecord.Identity.Hwnd := UInt64(NativeUInt(lWnd));
+      lRecord.Identity.ProcessId := lProcessId;
+    end;
+    lRecord.Caption := lPair.Value;
     fWindowCaptionOverrideRecords.AddOrSetValue(lPair.Key, lRecord);
     Result[i] := lRecord;
     Inc(i);
@@ -1637,7 +1746,7 @@ begin
   QuickValidateListBoxProcesses(lbExplorer);
   QuickValidateListBoxProcesses(lbConsole);
   if PruneWindowCaptionOverrides then
-    SaveWindowCaptionOverrides;
+    QueueGuiRefresh;
   fSharedAppsSnapshotTick := 0;
   UpdateAppDetail(False);
 end;
@@ -1685,7 +1794,6 @@ begin
   if aWnd = 0 then
     Exit;
 
-  RemoveWindowCaptionOverridesForWnd(aWnd);
   RemoveWindowFromSnapshots(aWnd);
   RemoveWindowFromListBox(lbApps, aWnd);
   RemoveWindowFromListBox(lbExplorer, aWnd);
@@ -1830,13 +1938,56 @@ begin
   CloseSelectedWindow(GetPopupSourceListBox);
 end;
 
+procedure TAppsViewMainFrm.ApplyWindowCaptionRename(const aWnd: hWnd;
+  const aProcessId: Cardinal; const aCaption: string);
+var
+  lEvent: TCaptionOverrideLifecycleEvent;
+  lIdentity: TCaptionOverrideIdentity;
+  lOccurredAt: Int64;
+  lRecord: TCaptionOverrideRecord;
+begin
+  lOccurredAt := CurrentUtcUnixMilliseconds;
+  lIdentity := BuildWindowCaptionOverrideIdentity(aWnd, aProcessId);
+  if BuildRenameCaptionOverrideTransition(
+    lIdentity,
+    aCaption,
+    lOccurredAt,
+    lRecord,
+    lEvent) then
+  begin
+    fWindowCaptionOverrideRecords.AddOrSetValue(
+      BuildWindowCaptionOverrideKey(aWnd, aProcessId),
+      lRecord);
+    JournalWindowCaptionOverride(lEvent);
+  end;
+  SaveWindowCaptionOverrides;
+end;
+
+procedure TAppsViewMainFrm.ApplyWindowCaptionReset(const aWnd: hWnd;
+  const aProcessId: Cardinal);
+var
+  lEvent: TCaptionOverrideLifecycleEvent;
+  lKey: string;
+  lRecord: TCaptionOverrideRecord;
+begin
+  lKey := BuildWindowCaptionOverrideKey(aWnd, aProcessId);
+  if fWindowCaptionOverrideRecords.TryGetValue(lKey, lRecord) and
+    BuildEndCaptionOverrideTransition(
+      lRecord,
+      TCaptionOverrideEventKind.coekReset,
+      CurrentUtcUnixMilliseconds,
+      'user_reset',
+      lEvent) then
+    JournalWindowCaptionOverride(lEvent);
+  fWindowCaptionOverrideRecords.Remove(lKey);
+  SaveWindowCaptionOverrides;
+end;
+
 procedure TAppsViewMainFrm.WindowRenameMenuItemClick(aSender: TObject);
 var
-  lApplyResult: TWindowCaptionDialogApplyResult;
   lCaption: string;
   lDisplayCaption: string;
   lDialogOutcome: TCaptionOverrideDialogOutcome;
-  lDialogResult: TCaptionOverrideDialogResult;
   lListBox: TListBox;
   lProcessId: Cardinal;
   lWnd: hWnd;
@@ -1856,26 +2007,23 @@ begin
     lProcessId,
     maxLogic.Windows.Desktop.GetWinCaption(lWnd),
     lDisplayCaption);
-  lDialogResult := codCancel;
+  lDialogOutcome := Default(TCaptionOverrideDialogOutcome);
   try
     lDialogOutcome := ExecuteCaptionOverrideDialogWithInitialCaption(Self, lCaption, ExecuteCaptionOverrideDialog);
-    lDialogResult := lDialogOutcome.DialogResult;
-    lApplyResult := ApplyWindowCaptionDialogOutcome(
+    case ApplyWindowCaptionDialogOutcome(
       fWindowCaptionOverrides,
       lWnd,
       lProcessId,
       lDialogOutcome,
-      IsWindowIdentityCurrent);
-    case lApplyResult of
+      IsWindowIdentityCurrent) of
       wcdarRenamed:
       begin
-        SaveWindowCaptionOverrides;
-        JournalWindowRename(lWnd, lProcessId, lDialogOutcome.Caption);
+        ApplyWindowCaptionRename(lWnd, lProcessId, lDialogOutcome.Caption);
         QueueGuiRefresh;
       end;
       wcdarReset:
       begin
-        SaveWindowCaptionOverrides;
+        ApplyWindowCaptionReset(lWnd, lProcessId);
         QueueGuiRefresh;
       end;
       wcdarStale:
@@ -1887,7 +2035,7 @@ begin
       end;
     end;
   finally
-    if lDialogResult <> codCancel then
+    if lDialogOutcome.DialogResult <> codCancel then
       SuppressNextReturnKey(lListBox);
     RestoreFocusAfterWindowCaptionDialog(lListBox);
   end;
@@ -3212,13 +3360,17 @@ var
   lConsoleWidth: Integer;
   lDesktopWidth: Integer;
   lDialogOutcome: TCaptionOverrideDialogOutcome;
+  lEvent: TCaptionOverrideLifecycleEvent;
   lExplorerWidth: Integer;
   lItems: TStringList;
+  lIdentity: TCaptionOverrideIdentity;
+  lObservedIdentity: TCaptionOverrideIdentity;
   lLoadedOverrides: TDictionary<string, string>;
   lOverrideKey: string;
   lOverrides: TDictionary<string, string>;
   lParams: string;
   lPrefixRules: TPrefixRuleArray;
+  lRecord: TCaptionOverrideRecord;
   lResultIndex: Integer;
   lScripts: TStringArray;
   lScriptsDir: string;
@@ -3231,6 +3383,7 @@ var
   lTitle: string;
   lTargetPath: string;
   lTestOverrideKey: string;
+  lTestApp: TAppInfo;
   lTestProcessId: Cardinal;
   lTestWnd: hWnd;
   lWasPruned: Boolean;
@@ -3721,6 +3874,65 @@ begin
   if SameText(aArg, cWindowCaptionOverridesSelfTestArg) then
   begin
     Result := 0;
+    lIdentity := Default(TCaptionOverrideIdentity);
+    lIdentity.HasBootId := True;
+    lIdentity.BootId := 1783900000000;
+    lIdentity.HasProcessStartedAt := True;
+    lIdentity.ProcessStartedAt := 1783900000123;
+    lIdentity.ProcessId := 200;
+    lIdentity.Hwnd := 100;
+    lObservedIdentity := lIdentity;
+    Inc(lObservedIdentity.ProcessStartedAt);
+    if SelectCurrentCaptionOverrideIdentity(
+      lIdentity,
+      lObservedIdentity).ProcessStartedAt <> lObservedIdentity.ProcessStartedAt then
+    begin
+      Writeln('SELFTEST FAILED: observed process reuse retained stale override identity');
+      Exit(1);
+    end;
+    if not BuildRenameCaptionOverrideTransition(
+      lIdentity,
+      'First label',
+      1783900800100,
+      lRecord,
+      lEvent) then
+    begin
+      Writeln('SELFTEST FAILED: rename lifecycle transition is unavailable');
+      Exit(1);
+    end;
+    if (lRecord.Caption <> 'First label') or
+      (lRecord.CreatedAt <> 1783900800100) or
+      (lEvent.EventKind <> TCaptionOverrideEventKind.coekRename) or
+      (lEvent.Identity.ProcessStartedAt <> lIdentity.ProcessStartedAt) then
+    begin
+      Writeln('SELFTEST FAILED: rename lifecycle transition payload mismatch');
+      Exit(1);
+    end;
+    if not BuildRenameCaptionOverrideTransition(
+      lIdentity,
+      'Replacement label',
+      1783900800200,
+      lRecord,
+      lEvent) or
+      (lRecord.CreatedAt <> 1783900800200) or
+      (lEvent.Caption <> 'Replacement label') then
+    begin
+      Writeln('SELFTEST FAILED: replacement lifecycle transition mismatch');
+      Exit(1);
+    end;
+    if not BuildEndCaptionOverrideTransition(
+      lRecord,
+      TCaptionOverrideEventKind.coekReset,
+      1783900800300,
+      'user_reset',
+      lEvent) or
+      (lEvent.EventKind <> TCaptionOverrideEventKind.coekReset) or
+      (lEvent.Identity.ProcessStartedAt <> lIdentity.ProcessStartedAt) or
+      (lEvent.Caption <> '') then
+    begin
+      Writeln('SELFTEST FAILED: reset lifecycle transition mismatch');
+      Exit(1);
+    end;
     lTempDir := TPath.Combine(TPath.GetTempPath, 'ActiveAppViewCaptionOverrideSelfTest-' + UIntToStr(GetTickCount64));
     TDirectory.CreateDirectory(lTempDir);
     lStateFileName := TPath.Combine(lTempDir, cWindowCaptionOverridesFileName);
@@ -3809,13 +4021,28 @@ begin
         Result := 1;
       end;
 
-      lTestWnd := CreateWindowEx(0, 'STATIC', '', WS_POPUP, 0, 0, 0, 0, 0, 0, HInstance, nil);
+      lTestWnd := CreateWindowEx(0, 'STATIC', 'Identity self-test', WS_POPUP,
+        0, 0, 0, 0, 0, 0, HInstance, nil);
       if lTestWnd = 0 then
       begin
         Writeln('SELFTEST FAILED: could not create a real window for identity validation');
         Result := 1;
       end else begin
         lTestProcessId := GetCurrentProcessId;
+        lTestApp := TAppInfo.Create(lTestWnd);
+        try
+          SetLength(lApps, 1);
+          lApps[0] := lTestApp;
+          PrefetchAppFileNamesInParallel(lApps, nil);
+          if not lTestApp.TryGetCachedProcessStartedAt(lRecord.Identity.ProcessStartedAt) then
+          begin
+            Writeln('SELFTEST FAILED: background snapshot did not cache process-start identity');
+            Result := 1;
+          end;
+        finally
+          lTestApp.Free;
+          lApps := nil;
+        end;
         lTestOverrideKey := BuildWindowCaptionOverrideKey(lTestWnd, lTestProcessId);
         lOverrides.AddOrSetValue(lTestOverrideKey, 'Original caption');
         lDialogOutcome.DialogResult := codRename;
@@ -4154,6 +4381,8 @@ var
   lIndex: Integer;
 begin
   ApplyLoadedWindowCaptionOverrideState;
+  if PruneWindowCaptionOverrides then
+    QueueGuiRefresh;
   if IsShuttingDown then
     Exit;
 

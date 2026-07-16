@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Window-caption overrides now publish schema-v5 Rename, replacement Rename, Reset, and observed expiration lifecycle events with retained boot/process identity; the same bounded worker handles SQLite, process observation, atomic state persistence, and deterministic dropped-event diagnostics.
 - Caption-override state loading, one-time legacy upgrade, process identity enrichment, and atomic persistence now run on the existing background writer; Rename and Reset no longer write the override INI on the UI thread.
 - Window-caption rename journaling now uses one bounded FIFO background writer instead of opening and writing SQLite on the VCL thread; queue overflow and SQLite failures remain fail-open.
 - Confirmed Rename actions now revalidate that the HWND still exists and belongs to the captured PID before saving the override or journaling it.
