@@ -17,11 +17,42 @@ type
 
   TRenameJournalWriteResult = (rjwrDisabled, rjwrSaved, rjwrFailed);
   TRenameJournalEnqueueResult = (rjerDisabled, rjerQueued, rjerFull, rjerStopped);
+  TCaptionOverrideEventKind = (coekRename, coekReset, coekExpired);
+
+  TCaptionOverrideLifecycleEvent = record
+  strict private
+    fCaption: string;
+    fEventKind: TCaptionOverrideEventKind;
+    fIdentity: TCaptionOverrideIdentity;
+    fOccurredAt: Int64;
+    fReason: string;
+  public
+    constructor CreateEnd(const aEventKind: TCaptionOverrideEventKind;
+      const aIdentity: TCaptionOverrideIdentity; const aOccurredAt: Int64;
+      const aReason: string);
+    constructor CreateRename(const aIdentity: TCaptionOverrideIdentity;
+      const aOccurredAt: Int64; const aCaption: string);
+    property Caption: string read fCaption;
+    property EventKind: TCaptionOverrideEventKind read fEventKind;
+    property Identity: TCaptionOverrideIdentity read fIdentity;
+    property OccurredAt: Int64 read fOccurredAt;
+    property Reason: string read fReason;
+  end;
+
+  TCaptionOverrideExpiration = record
+    Identity: TCaptionOverrideIdentity;
+    OccurredAt: Int64;
+    Reason: string;
+  end;
+
+  TCaptionOverrideExpirations = TArray<TCaptionOverrideExpiration>;
 
   TRenameJournalDiagnostics = record
     Accepted: Int64;
     Dequeued: Int64;
     Dropped: Int64;
+    FirstDroppedSequenceId: Int64;
+    LastDroppedSequenceId: Int64;
     Pending: Integer;
     Persisted: Int64;
     ActiveWorkerCount: Integer;
@@ -42,9 +73,13 @@ type
     destructor Destroy; override;
     function Enqueue(const aWnd: HWND; const aProcessId: Cardinal; const aRenamedAt: Int64;
       const aNewCaption: string): TRenameJournalEnqueueResult;
+    function EnqueueLifecycle(
+      const aEvent: TCaptionOverrideLifecycleEvent): TRenameJournalEnqueueResult;
     function GetDiagnostics: TRenameJournalDiagnostics;
     function SubmitOverrideState(const aState: TCaptionOverrideState): Boolean;
     procedure StopAndWait;
+    function TryTakeExpiredOverrides(
+      out aExpirations: TCaptionOverrideExpirations): Boolean;
     function TryTakeLoadedOverrideState(out aState: TCaptionOverrideState;
       out aStatus: TCaptionOverrideStateLoadStatus): Boolean;
     function WaitForOverrideStatePersistence(const aTimeoutMilliseconds: Cardinal): Boolean;
@@ -64,12 +99,13 @@ function RenameJournalWorkerConstructionFailureIsSafeForSelfTest: Boolean;
 implementation
 
 uses
-  System.Classes, System.Diagnostics, System.Generics.Collections, System.IOUtils, System.SyncObjs,
+  Data.DB, System.Classes, System.DateUtils, System.Diagnostics, System.Generics.Collections,
+  System.IOUtils, System.SyncObjs,
   MaxLogic.Windows.Identity,
   AutoFree,
   FireDAC.Comp.Client, FireDAC.DApt, FireDAC.Phys.SQLite, FireDAC.Phys.SQLiteDef,
   FireDAC.Phys.SQLiteWrapper.Stat, FireDAC.Stan.Async, FireDAC.Stan.Def,
-  FireDAC.VCLUI.Wait;
+  FireDAC.Stan.Param, FireDAC.VCLUI.Wait;
 
 const
   cRenameJournalBusyTimeoutMs = 250;
@@ -81,21 +117,39 @@ const
 procedure ConfigureRenameJournalConnection(const aDatabaseFileName: string;
   const aConnection: TFDConnection); forward;
 
+function CaptionOverrideEventKindText(
+  const aEventKind: TCaptionOverrideEventKind): string;
+begin
+  case aEventKind of
+    TCaptionOverrideEventKind.coekRename:
+      Result := 'rename';
+    TCaptionOverrideEventKind.coekReset:
+      Result := 'reset';
+    TCaptionOverrideEventKind.coekExpired:
+      Result := 'expired';
+  else
+    Result := '';
+  end;
+end;
+
 type
+  TShutdownDrainState = record
+    Started: Boolean;
+    Stopwatch: TStopwatch;
+  end;
+
   TRenameJournalEvent = record
   strict private
-    fHwnd: Int64;
-    fNewCaption: string;
-    fProcessId: Cardinal;
-    fRenamedAt: Int64;
+    fLifecycle: TCaptionOverrideLifecycleEvent;
+    fSequenceId: Int64;
     fValid: Boolean;
   public
     constructor Create(const aWnd: HWND; const aProcessId: Cardinal; const aRenamedAt: Int64;
       const aNewCaption: string);
-    property Hwnd: Int64 read fHwnd;
-    property NewCaption: string read fNewCaption;
-    property ProcessId: Cardinal read fProcessId;
-    property RenamedAt: Int64 read fRenamedAt;
+    constructor CreateLifecycle(const aEvent: TCaptionOverrideLifecycleEvent;
+      const aSequenceId: Int64 = 0);
+    property Lifecycle: TCaptionOverrideLifecycleEvent read fLifecycle;
+    property SequenceId: Int64 read fSequenceId;
     property Valid: Boolean read fValid;
   end;
 
@@ -106,19 +160,24 @@ type
     fConfig: TRenameJournalConfig;
     fDequeued: Int64;
     fDropped: Int64;
+    fDrainDeadlineReached: Integer;
     fExited: Integer;
     fOverflowCount: Integer;
     fPersisted: Int64;
     fActiveWorkerCount: Integer;
     fLastStatePersistThreadId: Int64;
     fLastStateSubmitThreadId: Int64;
+    fFirstDroppedSequenceId: Int64;
+    fLastDroppedSequenceId: Int64;
     fLoadedState: TCaptionOverrideState;
     fLoadedStateReady: Boolean;
     fLoadedStateStatus: TCaptionOverrideStateLoadStatus;
+    fPendingExpirations: TCaptionOverrideExpirations;
     fPendingState: TCaptionOverrideState;
     fPendingStateSequence: Int64;
     fPersistedOverrideState: TCaptionOverrideState;
     fQueue: TThreadedQueue<TRenameJournalEvent>;
+    fNextSequenceId: Int64;
     fStatePersistedEvent: TEvent;
     fStateLock: TCriticalSection;
     fStateSnapshotsCoalesced: Int64;
@@ -128,11 +187,20 @@ type
     fStopping: Integer;
     fWorkerStarted: Integer;
     procedure DebugLogFailure(const aMessage: string);
+    function CommitExpiredOverrides(const aRemaining: TCaptionOverrideState;
+      const aExpirations: TCaptionOverrideExpirations): Boolean;
+    procedure CollectExpiredOverrides(const aState: TCaptionOverrideState;
+      const aOccurredAt: Int64; out aRemaining: TCaptionOverrideState;
+      out aExpirations: TCaptionOverrideExpirations);
+    procedure DetectExpiredOverrides;
+    procedure DropQueuedEvents;
+    procedure EnrichLifecycleEvent(var aEvent: TRenameJournalEvent);
     procedure CreateJournalDependencies(var aGarbos: TGarbos;
       out aConnection: TFDConnection; out aQuery: TFDQuery);
     procedure FinishExecution;
     procedure FlushOverflowDiagnostics;
     procedure LogFailure(const aMessage: string);
+    procedure RecordDroppedEvent(const aEvent: TRenameJournalEvent);
     procedure EnrichOverrideState(var aState: TCaptionOverrideState);
     function FindPersistedIdentity(const aState: TCaptionOverrideState;
       const aRecord: TCaptionOverrideRecord): TCaptionOverrideIdentity;
@@ -140,13 +208,18 @@ type
     procedure LoadInitialOverrideState(const aBootIdentity: TWindowsBootIdentity;
       const aHasBootIdentity: Boolean);
     procedure PersistLatestOverrideState;
+    procedure QueueExpiredLifecycleEvents(
+      const aExpirations: TCaptionOverrideExpirations);
     function ProcessNextQueueItem(const aConnection: TFDConnection;
       const aQuery: TFDQuery): Boolean;
     procedure ProcessEvents;
+    function ProcessHasExited(const aProcessId: Cardinal): Boolean;
     function ResolveProcessIdentity(const aWnd: HWND;
       const aProcessId: Cardinal): TCaptionOverrideResolvedProcess;
-    function ShouldStopForCancellation(var aDrainStarted: Boolean;
-      var aDrainStopwatch: TStopwatch): Boolean;
+    function ShouldStopForCancellation(
+      var aDrainState: TShutdownDrainState): Boolean;
+    function TryGetExpirationReason(const aRecord: TCaptionOverrideRecord;
+      out aReason: string): Boolean;
     procedure WriteEvent(const aConnection: TFDConnection; const aQuery: TFDQuery;
       const aEvent: TRenameJournalEvent);
   protected
@@ -160,6 +233,8 @@ type
     function SubmitOverrideState(const aState: TCaptionOverrideState): Boolean;
     procedure StartWorker;
     procedure StopAndWait;
+    function TryTakeExpiredOverrides(
+      out aExpirations: TCaptionOverrideExpirations): Boolean;
     function TryTakeLoadedOverrideState(out aState: TCaptionOverrideState;
       out aStatus: TCaptionOverrideStateLoadStatus): Boolean;
     function WaitForOverrideStatePersistence(const aTimeoutMilliseconds: Cardinal): Boolean;
@@ -169,13 +244,50 @@ function TryRecordWindowRenameUsingConnection(const aConfig: TRenameJournalConfi
   const aConnection: TFDConnection; const aQuery: TFDQuery; const aEvent: TRenameJournalEvent;
   out aErrorMessage: string): TRenameJournalWriteResult; forward;
 
+constructor TCaptionOverrideLifecycleEvent.CreateEnd(
+  const aEventKind: TCaptionOverrideEventKind;
+  const aIdentity: TCaptionOverrideIdentity; const aOccurredAt: Int64;
+  const aReason: string);
+begin
+  fCaption := '';
+  fEventKind := aEventKind;
+  fIdentity := aIdentity;
+  fOccurredAt := aOccurredAt;
+  fReason := aReason;
+end;
+
+constructor TCaptionOverrideLifecycleEvent.CreateRename(
+  const aIdentity: TCaptionOverrideIdentity; const aOccurredAt: Int64;
+  const aCaption: string);
+begin
+  fCaption := aCaption;
+  fEventKind := TCaptionOverrideEventKind.coekRename;
+  fIdentity := aIdentity;
+  fOccurredAt := aOccurredAt;
+  fReason := 'user_rename';
+end;
+
 constructor TRenameJournalEvent.Create(const aWnd: HWND; const aProcessId: Cardinal;
   const aRenamedAt: Int64; const aNewCaption: string);
+var
+  lIdentity: TCaptionOverrideIdentity;
 begin
-  fHwnd := Int64(NativeUInt(aWnd));
-  fNewCaption := aNewCaption;
-  fProcessId := aProcessId;
-  fRenamedAt := aRenamedAt;
+  lIdentity := Default(TCaptionOverrideIdentity);
+  lIdentity.Hwnd := UInt64(NativeUInt(aWnd));
+  lIdentity.ProcessId := aProcessId;
+  fLifecycle := TCaptionOverrideLifecycleEvent.CreateRename(
+    lIdentity,
+    aRenamedAt,
+    aNewCaption);
+  fSequenceId := 0;
+  fValid := True;
+end;
+
+constructor TRenameJournalEvent.CreateLifecycle(
+  const aEvent: TCaptionOverrideLifecycleEvent; const aSequenceId: Int64);
+begin
+  fLifecycle := aEvent;
+  fSequenceId := aSequenceId;
   fValid := True;
 end;
 
@@ -194,6 +306,112 @@ begin
   GC(aQuery, TFDQuery.Create(nil), aGarbos);
   ConfigureRenameJournalConnection(fConfig.DatabaseFileName, aConnection);
   aQuery.Connection := aConnection;
+end;
+
+function TRenameJournalWorker.CommitExpiredOverrides(
+  const aRemaining: TCaptionOverrideState;
+  const aExpirations: TCaptionOverrideExpirations): Boolean;
+var
+  i: Integer;
+  lNotificationIndex: Integer;
+begin
+  fStateLock.Acquire;
+  try
+    if fPendingStateSequence > fPersistedStateSequence then
+      Exit(False);
+    fPendingState := Copy(aRemaining);
+    fPendingStateSequence := TInterlocked.Increment(fStateSnapshotsSubmitted);
+    lNotificationIndex := Length(fPendingExpirations);
+    SetLength(fPendingExpirations, lNotificationIndex + Length(aExpirations));
+    for i := 0 to High(aExpirations) do
+      fPendingExpirations[lNotificationIndex + i] := aExpirations[i];
+    fStatePersistedEvent.ResetEvent;
+    Result := True;
+  finally
+    fStateLock.Release;
+  end;
+end;
+
+procedure TRenameJournalWorker.CollectExpiredOverrides(
+  const aState: TCaptionOverrideState; const aOccurredAt: Int64;
+  out aRemaining: TCaptionOverrideState;
+  out aExpirations: TCaptionOverrideExpirations);
+var
+  i: Integer;
+  lExpiration: TCaptionOverrideExpiration;
+  lExpiredCount: Integer;
+  lReason: string;
+  lRemainingCount: Integer;
+begin
+  SetLength(aRemaining, Length(aState));
+  SetLength(aExpirations, Length(aState));
+  lExpiredCount := 0;
+  lRemainingCount := 0;
+  for i := 0 to High(aState) do
+  begin
+    if TryGetExpirationReason(aState[i], lReason) then
+    begin
+      lExpiration.Identity := aState[i].Identity;
+      lExpiration.OccurredAt := aOccurredAt;
+      lExpiration.Reason := lReason;
+      aExpirations[lExpiredCount] := lExpiration;
+      Inc(lExpiredCount);
+    end else begin
+      aRemaining[lRemainingCount] := aState[i];
+      Inc(lRemainingCount);
+    end;
+  end;
+  SetLength(aRemaining, lRemainingCount);
+  SetLength(aExpirations, lExpiredCount);
+end;
+
+procedure TRenameJournalWorker.DetectExpiredOverrides;
+var
+  lExpirations: TCaptionOverrideExpirations;
+  lNow: TDateTime;
+  lRemaining: TCaptionOverrideState;
+  lState: TCaptionOverrideState;
+begin
+  fStateLock.Acquire;
+  try
+    if fPendingStateSequence > fPersistedStateSequence then
+      Exit;
+    lState := Copy(fPersistedOverrideState);
+  finally
+    fStateLock.Release;
+  end;
+  if Length(lState) = 0 then
+    Exit;
+  lNow := Now;
+  CollectExpiredOverrides(
+    lState,
+    (DateTimeToUnix(lNow, False) * 1000) + MilliSecondOf(lNow),
+    lRemaining,
+    lExpirations);
+  if (Length(lExpirations) = 0) or
+    (not CommitExpiredOverrides(lRemaining, lExpirations)) then
+    Exit;
+  QueueExpiredLifecycleEvents(lExpirations);
+end;
+
+procedure TRenameJournalWorker.QueueExpiredLifecycleEvents(
+  const aExpirations: TCaptionOverrideExpirations);
+var
+  i: Integer;
+  lEvent: TCaptionOverrideLifecycleEvent;
+begin
+  if not fConfig.Enabled then
+    Exit;
+  for i := 0 to High(aExpirations) do
+  begin
+    lEvent := TCaptionOverrideLifecycleEvent.CreateEnd(
+      TCaptionOverrideEventKind.coekExpired,
+      aExpirations[i].Identity,
+      aExpirations[i].OccurredAt,
+      aExpirations[i].Reason);
+    if Enqueue(TRenameJournalEvent.CreateLifecycle(lEvent)) = rjerFull then
+      LogFailure('expiration event rejected because the lifecycle queue is full');
+  end;
 end;
 
 procedure TRenameJournalWorker.EnrichOverrideState(var aState: TCaptionOverrideState);
@@ -241,6 +459,58 @@ begin
         aState[i].Identity.ProcessStartedAt := lKnownIdentity.ProcessStartedAt;
       end;
     end;
+  end;
+end;
+
+procedure TRenameJournalWorker.EnrichLifecycleEvent(var aEvent: TRenameJournalEvent);
+var
+  lBootIdentity: TWindowsBootIdentity;
+  lIdentity: TCaptionOverrideIdentity;
+  lLifecycle: TCaptionOverrideLifecycleEvent;
+  lResolved: TCaptionOverrideResolvedProcess;
+begin
+  lLifecycle := aEvent.Lifecycle;
+  lIdentity := lLifecycle.Identity;
+  if (not lIdentity.HasBootId) and TryGetCachedWindowsBootIdentity(lBootIdentity) then
+  begin
+    lIdentity.HasBootId := True;
+    lIdentity.BootId := lBootIdentity.UtcMilliseconds;
+  end;
+  if not lIdentity.HasProcessStartedAt then
+  begin
+    lResolved := ResolveProcessIdentity(
+      HWND(NativeUInt(lIdentity.Hwnd)),
+      lIdentity.ProcessId);
+    if lResolved.Current and lResolved.HasProcessStartedAt then
+    begin
+      lIdentity.HasProcessStartedAt := True;
+      lIdentity.ProcessStartedAt := lResolved.ProcessStartedAt;
+    end;
+  end;
+  if lLifecycle.EventKind = TCaptionOverrideEventKind.coekRename then
+    lLifecycle := TCaptionOverrideLifecycleEvent.CreateRename(
+      lIdentity,
+      lLifecycle.OccurredAt,
+      lLifecycle.Caption)
+  else
+    lLifecycle := TCaptionOverrideLifecycleEvent.CreateEnd(
+      lLifecycle.EventKind,
+      lIdentity,
+      lLifecycle.OccurredAt,
+      lLifecycle.Reason);
+  aEvent := TRenameJournalEvent.CreateLifecycle(lLifecycle, aEvent.SequenceId);
+end;
+
+procedure TRenameJournalWorker.DropQueuedEvents;
+var
+  lEvent: TRenameJournalEvent;
+begin
+  lEvent := Default(TRenameJournalEvent);
+  while (fQueue.QueueSize > 0) and (fQueue.PopItem(lEvent) = wrSignaled) do
+  begin
+    if lEvent.Valid then
+      RecordDroppedEvent(lEvent);
+    lEvent := Default(TRenameJournalEvent);
   end;
 end;
 
@@ -328,6 +598,19 @@ begin
   end;
 end;
 
+procedure TRenameJournalWorker.RecordDroppedEvent(
+  const aEvent: TRenameJournalEvent);
+begin
+  TInterlocked.Increment(fDropped);
+  if aEvent.SequenceId <= 0 then
+    Exit;
+  TInterlocked.CompareExchange(
+    fFirstDroppedSequenceId,
+    aEvent.SequenceId,
+    0);
+  TInterlocked.Exchange(fLastDroppedSequenceId, aEvent.SequenceId);
+end;
+
 procedure TRenameJournalWorker.PersistLatestOverrideState;
 var
   lErrorMessage: string;
@@ -394,11 +677,28 @@ begin
     if fConfig.Enabled then
       WriteEvent(aConnection, aQuery, lEvent)
     else
-      TInterlocked.Increment(fDropped);
+      RecordDroppedEvent(lEvent);
   end else if (lWaitResult = wrAbandoned) and
     (TInterlocked.CompareExchange(fStopping, 0, 0) <> 0) and
     (not HasPendingOverrideState) then
     Result := False;
+end;
+
+function TRenameJournalWorker.ProcessHasExited(
+  const aProcessId: Cardinal): Boolean;
+var
+  lProcessHandle: THandle;
+begin
+  if aProcessId = 0 then
+    Exit(True);
+  lProcessHandle := OpenProcess(Winapi.Windows.SYNCHRONIZE, False, aProcessId);
+  if lProcessHandle = 0 then
+    Exit(GetLastError = ERROR_INVALID_PARAMETER);
+  try
+    Result := WaitForSingleObject(lProcessHandle, 0) = WAIT_OBJECT_0;
+  finally
+    CloseHandle(lProcessHandle);
+  end;
 end;
 
 function TRenameJournalWorker.ResolveProcessIdentity(const aWnd: HWND;
@@ -421,23 +721,21 @@ begin
 end;
 
 function TRenameJournalWorker.ShouldStopForCancellation(
-  var aDrainStarted: Boolean; var aDrainStopwatch: TStopwatch): Boolean;
+  var aDrainState: TShutdownDrainState): Boolean;
 begin
   Result := False;
   if (not Assigned(fCancelToken)) or (not fCancelToken.Canceled) then
     Exit;
-  if not aDrainStarted then
+  if not aDrainState.Started then
   begin
-    aDrainStopwatch := TStopwatch.StartNew;
-    aDrainStarted := True;
+    aDrainState.Stopwatch := TStopwatch.StartNew;
+    aDrainState.Started := True;
   end;
   if (fQueue.QueueSize = 0) and (not HasPendingOverrideState) then
     Exit(True);
-  Result := aDrainStopwatch.ElapsedMilliseconds >= cRenameJournalDrainTimeoutMs;
+  Result := aDrainState.Stopwatch.ElapsedMilliseconds >= cRenameJournalDrainTimeoutMs;
   if Result then
-    LogFailure(Format(
-      'shutdown drain deadline reached; %d accepted event(s) dropped',
-      [fQueue.QueueSize]));
+    TInterlocked.Exchange(fDrainDeadlineReached, 1);
 end;
 
 procedure TRenameJournalWorker.FlushOverflowDiagnostics;
@@ -465,16 +763,21 @@ begin
   begin
     fStateLock.Acquire;
     try
-      if Assigned(fQueue) and (fQueue.QueueSize > 0) then
-        TInterlocked.Add(fDropped, fQueue.QueueSize);
-      TInterlocked.Exchange(fExited, 1);
+      TInterlocked.Exchange(fStopping, 1);
       if Assigned(fQueue) then
         fQueue.DoShutDown;
     finally
       fStateLock.Release;
     end;
-  end else
-    TInterlocked.Exchange(fExited, 1);
+  end;
+  if Assigned(fQueue) then
+    DropQueuedEvents;
+  TInterlocked.Exchange(fExited, 1);
+  if TInterlocked.CompareExchange(fDrainDeadlineReached, 0, 0) <> 0 then
+    LogFailure(Format(
+      'shutdown drain deadline reached; dropped sequence ids %d..%d',
+      [TInterlocked.CompareExchange(fFirstDroppedSequenceId, 0, 0),
+      TInterlocked.CompareExchange(fLastDroppedSequenceId, 0, 0)]));
   FlushOverflowDiagnostics;
 end;
 
@@ -483,14 +786,14 @@ var
   g: TGarbos;
   lBootIdentity: TWindowsBootIdentity;
   lConnection: TFDConnection;
-  lDrainStarted: Boolean;
-  lDrainStopwatch: TStopwatch;
+  lDrainState: TShutdownDrainState;
+  lExpirationStopwatch: TStopwatch;
   lHasBootIdentity: Boolean;
   lQuery: TFDQuery;
 begin
   g := Default(TGarbos);
-  lDrainStarted := False;
-  lDrainStopwatch := Default(TStopwatch);
+  lDrainState := Default(TShutdownDrainState);
+  lExpirationStopwatch := TStopwatch.StartNew;
   try
     lHasBootIdentity := TryGetWindowsBootIdentity(1000, False, lBootIdentity);
     LoadInitialOverrideState(lBootIdentity, lHasBootIdentity);
@@ -499,7 +802,12 @@ begin
     while True do
     begin
       PersistLatestOverrideState;
-      if ShouldStopForCancellation(lDrainStarted, lDrainStopwatch) or
+      if lExpirationStopwatch.ElapsedMilliseconds >= 250 then
+      begin
+        DetectExpiredOverrides;
+        lExpirationStopwatch := TStopwatch.StartNew;
+      end;
+      if ShouldStopForCancellation(lDrainState) or
         (not ProcessNextQueueItem(lConnection, lQuery)) then
         Break;
       FlushOverflowDiagnostics;
@@ -507,6 +815,41 @@ begin
   finally
     g.Clear;
   end;
+end;
+
+function TRenameJournalWorker.TryGetExpirationReason(
+  const aRecord: TCaptionOverrideRecord; out aReason: string): Boolean;
+var
+  lCurrentProcessId: Cardinal;
+  lCurrentProcessStartedAt: Int64;
+  lWnd: HWND;
+begin
+  aReason := '';
+  lWnd := HWND(NativeUInt(aRecord.Identity.Hwnd));
+  if not IsWindow(lWnd) then
+  begin
+    if ProcessHasExited(aRecord.Identity.ProcessId) then
+      aReason := 'process_exited'
+    else
+      aReason := 'window_missing';
+    Exit(True);
+  end;
+
+  lCurrentProcessId := 0;
+  GetWindowThreadProcessId(lWnd, lCurrentProcessId);
+  if lCurrentProcessId <> aRecord.Identity.ProcessId then
+  begin
+    aReason := 'identity_changed';
+    Exit(True);
+  end;
+  if aRecord.Identity.HasProcessStartedAt and
+    TryGetProcessStartedAtUtcMilliseconds(lCurrentProcessId, lCurrentProcessStartedAt) and
+    (lCurrentProcessStartedAt <> aRecord.Identity.ProcessStartedAt) then
+  begin
+    aReason := 'identity_changed';
+    Exit(True);
+  end;
+  Result := False;
 end;
 
 procedure TRenameJournalWorker.Execute;
@@ -534,6 +877,9 @@ end;
 
 function TRenameJournalWorker.Enqueue(
   const aEvent: TRenameJournalEvent): TRenameJournalEnqueueResult;
+var
+  lQueuedEvent: TRenameJournalEvent;
+  lSequenceId: Int64;
 begin
   fStateLock.Acquire;
   try
@@ -541,12 +887,17 @@ begin
       (TInterlocked.CompareExchange(fExited, 0, 0) <> 0) then
       Exit(rjerStopped);
 
-    if fQueue.PushItem(aEvent) <> wrSignaled then
+    lSequenceId := fNextSequenceId + 1;
+    lQueuedEvent := TRenameJournalEvent.CreateLifecycle(
+      aEvent.Lifecycle,
+      lSequenceId);
+    if fQueue.PushItem(lQueuedEvent) <> wrSignaled then
     begin
       TInterlocked.Increment(fOverflowCount);
       DebugLogFailure('queue overflow; rename event rejected');
       Exit(rjerFull);
     end;
+    fNextSequenceId := lSequenceId;
     TInterlocked.Increment(fAccepted);
     Result := rjerQueued;
   finally
@@ -561,6 +912,10 @@ begin
   Result.Accepted := TInterlocked.CompareExchange(fAccepted, 0, 0);
   Result.Dequeued := TInterlocked.CompareExchange(fDequeued, 0, 0);
   Result.Dropped := TInterlocked.CompareExchange(fDropped, 0, 0);
+  Result.FirstDroppedSequenceId := TInterlocked.CompareExchange(
+    fFirstDroppedSequenceId, 0, 0);
+  Result.LastDroppedSequenceId := TInterlocked.CompareExchange(
+    fLastDroppedSequenceId, 0, 0);
   Result.Persisted := TInterlocked.CompareExchange(fPersisted, 0, 0);
   Result.ActiveWorkerCount := TInterlocked.CompareExchange(fActiveWorkerCount, 0, 0);
   Result.LastStatePersistThreadId := Cardinal(
@@ -653,6 +1008,22 @@ begin
   end;
 end;
 
+function TRenameJournalWorker.TryTakeExpiredOverrides(
+  out aExpirations: TCaptionOverrideExpirations): Boolean;
+begin
+  aExpirations := nil;
+  fStateLock.Acquire;
+  try
+    Result := Length(fPendingExpirations) <> 0;
+    if not Result then
+      Exit;
+    aExpirations := Copy(fPendingExpirations);
+    fPendingExpirations := nil;
+  finally
+    fStateLock.Release;
+  end;
+end;
+
 procedure TRenameJournalWorker.StartWorker;
 begin
   Start;
@@ -694,12 +1065,15 @@ procedure TRenameJournalWorker.WriteEvent(const aConnection: TFDConnection;
   const aQuery: TFDQuery; const aEvent: TRenameJournalEvent);
 var
   lErrorMessage: string;
+  lEvent: TRenameJournalEvent;
 begin
+  lEvent := aEvent;
+  EnrichLifecycleEvent(lEvent);
   if TryRecordWindowRenameUsingConnection(
     fConfig,
     aConnection,
     aQuery,
-    aEvent,
+    lEvent,
     lErrorMessage) = rjwrSaved then
     TInterlocked.Increment(fPersisted)
   else
@@ -724,8 +1098,8 @@ begin
             'failed write disconnect failed: ' + lException.ClassName + ': ' + lException.Message);
       end;
     end;
-    LogFailure(lErrorMessage);
-    TInterlocked.Increment(fDropped);
+    LogFailure(Format('sequence=%d %s', [aEvent.SequenceId, lErrorMessage]));
+    RecordDroppedEvent(aEvent);
   end;
 end;
 
@@ -786,6 +1160,18 @@ begin
     TRenameJournalEvent.Create(aWnd, aProcessId, aRenamedAt, aNewCaption));
 end;
 
+function TRenameJournalWriter.EnqueueLifecycle(
+  const aEvent: TCaptionOverrideLifecycleEvent): TRenameJournalEnqueueResult;
+begin
+  if not fEnabled then
+    Exit(TRenameJournalEnqueueResult.rjerDisabled);
+  if (TInterlocked.CompareExchange(fStopped, 0, 0) <> 0) or
+    (not Assigned(fWorker)) then
+    Exit(TRenameJournalEnqueueResult.rjerStopped);
+  Result := TRenameJournalWorker(fWorker).Enqueue(
+    TRenameJournalEvent.CreateLifecycle(aEvent));
+end;
+
 procedure TRenameJournalWriter.StopAndWait;
 begin
   TInterlocked.Exchange(fStopped, 1);
@@ -825,6 +1211,14 @@ begin
     TRenameJournalWorker(fWorker).TryTakeLoadedOverrideState(aState, aStatus);
 end;
 
+function TRenameJournalWriter.TryTakeExpiredOverrides(
+  out aExpirations: TCaptionOverrideExpirations): Boolean;
+begin
+  aExpirations := nil;
+  Result := Assigned(fWorker) and
+    TRenameJournalWorker(fWorker).TryTakeExpiredOverrides(aExpirations);
+end;
+
 function RenameJournalWorkerConstructionFailureIsSafeForSelfTest: Boolean;
 var
   lConfig: TRenameJournalConfig;
@@ -841,6 +1235,48 @@ function LoadRenameJournalConfig(const aIniFile: TCustomIniFile): TRenameJournal
 begin
   Result.Enabled := aIniFile.ReadBool(cRenameJournalSettingsSection, 'enabled', False);
   Result.DatabaseFileName := Trim(aIniFile.ReadString(cRenameJournalSettingsSection, 'db-file', ''));
+end;
+
+procedure PrepareCaptionOverrideLifecycleInsert(const aQuery: TFDQuery;
+  const aEvent: TRenameJournalEvent);
+var
+  lIdentity: TCaptionOverrideIdentity;
+  lLifecycle: TCaptionOverrideLifecycleEvent;
+begin
+  lLifecycle := aEvent.Lifecycle;
+  lIdentity := lLifecycle.Identity;
+  aQuery.SQL.Text :=
+    'INSERT INTO window_caption_override_events ' +
+    '(occurred_at, boot_id, process_started_at, pid, hwnd, event_kind, caption, reason) ' +
+    'VALUES (:occurred_at, :boot_id, :process_started_at, :pid, :hwnd, ' +
+    ':event_kind, :caption, :reason);';
+  aQuery.ParamByName('occurred_at').AsLargeInt := lLifecycle.OccurredAt;
+  if lIdentity.HasBootId then
+    aQuery.ParamByName('boot_id').AsLargeInt := lIdentity.BootId
+  else
+  begin
+    aQuery.ParamByName('boot_id').DataType := ftLargeint;
+    aQuery.ParamByName('boot_id').Clear;
+  end;
+  if lIdentity.HasProcessStartedAt then
+    aQuery.ParamByName('process_started_at').AsLargeInt := lIdentity.ProcessStartedAt
+  else
+  begin
+    aQuery.ParamByName('process_started_at').DataType := ftLargeint;
+    aQuery.ParamByName('process_started_at').Clear;
+  end;
+  aQuery.ParamByName('pid').AsLargeInt := lIdentity.ProcessId;
+  aQuery.ParamByName('hwnd').AsLargeInt := Int64(lIdentity.Hwnd);
+  aQuery.ParamByName('event_kind').AsWideString := CaptionOverrideEventKindText(
+    lLifecycle.EventKind);
+  if lLifecycle.EventKind = TCaptionOverrideEventKind.coekRename then
+    aQuery.ParamByName('caption').AsWideString := lLifecycle.Caption
+  else
+  begin
+    aQuery.ParamByName('caption').DataType := ftWideString;
+    aQuery.ParamByName('caption').Clear;
+  end;
+  aQuery.ParamByName('reason').AsWideString := lLifecycle.Reason;
 end;
 
 procedure ConfigureRenameJournalConnection(
@@ -878,13 +1314,7 @@ begin
 
     if not aConnection.Connected then
       aConnection.Connected := True;
-    aQuery.SQL.Text :=
-      'INSERT INTO window_rename_events (renamed_at, hwnd, pid, new_caption) ' +
-      'VALUES (:renamed_at, :hwnd, :pid, :new_caption);';
-    aQuery.ParamByName('renamed_at').AsLargeInt := aEvent.RenamedAt;
-    aQuery.ParamByName('hwnd').AsLargeInt := aEvent.Hwnd;
-    aQuery.ParamByName('pid').AsLargeInt := aEvent.ProcessId;
-    aQuery.ParamByName('new_caption').AsWideString := aEvent.NewCaption;
+    PrepareCaptionOverrideLifecycleInsert(aQuery, aEvent);
     aQuery.ExecSQL;
     Result := rjwrSaved;
   except

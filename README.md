@@ -21,14 +21,15 @@ Accessibility tool for active application / explorer quick selection
 - Set `RefreshIntervalSeconds=0` to disable periodic title polling.
 
 ## Shadow Journal rename history
-- Successful Applications and Console Rename actions can be appended to Shadow Journal's `window_rename_events` table.
+- Successful Applications and Console Rename, Reset, and observed expiration transitions can be appended to Shadow Journal's schema-v5 `window_caption_override_events` table.
 - Configure `[save-renames-to-journal]` in `settings.ini` with `enabled=1` and the exact existing SQLite filename in `db-file`.
-- ActiveAppView sends immutable rename events to one background SQLite writer in FIFO order, with a 64-event non-blocking queue. Queue overflow is logged and leaves the local caption override intact.
-- ActiveAppView does not create or migrate the journal database. Missing databases, missing migration 004, locked-database failures, and other SQLite write failures leave the local caption override intact.
+- ActiveAppView sends immutable lifecycle events to one background SQLite writer in FIFO order, with a 64-event non-blocking queue. Queue overflow is logged and leaves the local caption override intact.
+- ActiveAppView does not create or migrate the journal database. Missing databases, missing migration 005, locked-database failures, and other SQLite write failures leave the local caption override intact.
 - After the Rename dialog closes, ActiveAppView verifies that the HWND still exists and belongs to the captured PID before saving or journaling the new caption.
-- Reset actions are not journaled because they remove an ActiveAppView display override rather than assign a new caption.
+- Reset ends the current label with `user_reset`; the worker also emits `expired` for observed window disappearance, process exit, identity change, or local prune. The retained boot/process identity lets those end events identify a process after its window has gone.
 - Local caption overrides use typed `StateVersion=2` records with boot, process-start, PID, HWND, caption, and lifecycle metadata. The existing caption-only INI is upgraded once when its boot and live process identity can be verified.
-- The same owned background worker prewarms Windows identity, loads/upgrades the state file, coalesces rapid changes to one latest snapshot, and atomically replaces the state file. Rename and Reset handlers perform no filesystem or process-identity queries.
+- The same owned background worker prewarms Windows identity, loads/upgrades the state file, coalesces rapid changes to one latest snapshot, and atomically replaces the state file. Rename and Reset handlers perform no filesystem or process-start identity queries.
+- Windows has no durable HWND generation. The worker expires every observed disappearance or identity change, but same-process HWND reuse between observations remains a documented residual limitation.
 
 ## Scripts folder
 - The Scripts list shows runnable files from `Scripts` next to `ActiveAppView.exe`.
