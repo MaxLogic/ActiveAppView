@@ -27,6 +27,8 @@ Accessibility tool for active application / explorer quick selection
 - ActiveAppView does not create or migrate the journal database. Missing databases, missing migration 004, locked-database failures, and other SQLite write failures leave the local caption override intact.
 - After the Rename dialog closes, ActiveAppView verifies that the HWND still exists and belongs to the captured PID before saving or journaling the new caption.
 - Reset actions are not journaled because they remove an ActiveAppView display override rather than assign a new caption.
+- Local caption overrides use typed `StateVersion=2` records with boot, process-start, PID, HWND, caption, and lifecycle metadata. The existing caption-only INI is upgraded once when its boot and live process identity can be verified.
+- The same owned background worker prewarms Windows identity, loads/upgrades the state file, coalesces rapid changes to one latest snapshot, and atomically replaces the state file. Rename and Reset handlers perform no filesystem or process-identity queries.
 
 ## Scripts folder
 - The Scripts list shows runnable files from `Scripts` next to `ActiveAppView.exe`.

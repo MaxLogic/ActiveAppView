@@ -8,8 +8,8 @@ uses
   Vcl.Buttons, Vcl.Controls, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.Forms, Vcl.Graphics, Vcl.Menus,
   Vcl.StdCtrls,
   CancelToken, maxAsync,
-  ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache, ActiveAppViewCore,
-  ActiveAppView.RenameJournal;
+  ActiveAppView.CaptionOverrideState, ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache,
+  ActiveAppViewCore, ActiveAppView.RenameJournal;
 
 type
   TAppsViewMainFrm = class(TForm)
@@ -137,12 +137,15 @@ type
     fRenameJournalConfig: TRenameJournalConfig;
     fRenameJournalWriter: TRenameJournalWriter;
     fTerminateWindowMenuItem: TMenuItem;
+    fWindowCaptionOverrideRecords: TDictionary<string, TCaptionOverrideRecord>;
     fWindowCaptionOverrides: TDictionary<string, string>;
     fSuppressNextReturnListBox: TListBox;
     fSuppressNextReturnUntilTick: UInt64;
     fShutdownToken: iCancelToken;
     fShuttingDown: Integer;
     procedure AppOnActivate(Sender: TObject);
+    procedure ApplyLoadedWindowCaptionOverrideState;
+    function BuildWindowCaptionOverrideState: TCaptionOverrideState;
     procedure ApplyAuxListsSnapshot(aSnapshotObject: TObject);
     procedure ApplyDesktopSnapshot(const aItems: TNamedValueArray);
     procedure ApplyScriptsSnapshot(const aScripts: TStringArray);
@@ -189,6 +192,7 @@ type
     procedure JournalWindowRename(const aWnd: hWnd; const aProcessId: Cardinal; const aNewCaption: string);
     function PruneWindowCaptionOverrides: Boolean;
     procedure RemoveWindowCaptionOverridesForWnd(const aWnd: hWnd);
+    procedure RemoveStaleWindowCaptionOverrideRecords;
     procedure RestoreFocusAfterWindowCaptionDialog(const aListBox: TListBox);
     procedure SaveWindowCaptionOverrides;
     procedure WindowActionListBoxContextPopup(aSender: TObject; aMousePos: TPoint; var aHandled: Boolean);
@@ -374,21 +378,21 @@ end;
 function TryParseWindowCaptionOverrideKey(const aKey: string; out aWnd: hWnd; out aProcessId: Cardinal): Boolean;
 var
   lDelimiterIndex: Integer;
-  lProcessId: UInt64;
+  lProcessId: Cardinal;
   lWnd: UInt64;
 begin
   aWnd := 0;
   aProcessId := 0;
   lDelimiterIndex := Pos(':', aKey);
   Result := (lDelimiterIndex > 1) and (lDelimiterIndex < Length(aKey))
-    and TryStrToUInt64(Copy(aKey, 1, lDelimiterIndex - 1), lProcessId)
+    and TryStrToUInt(Copy(aKey, 1, lDelimiterIndex - 1), lProcessId)
     and TryStrToUInt64(Copy(aKey, lDelimiterIndex + 1, MaxInt), lWnd)
-    and (lProcessId <= High(Cardinal));
+    and (lProcessId > 0);
   if not Result then
     Exit;
 
   aWnd := hWnd(NativeUInt(lWnd));
-  aProcessId := Cardinal(lProcessId);
+  aProcessId := lProcessId;
 end;
 
 function HasWindowCaptionOverride(const aOverrides: TDictionary<string, string>;
@@ -1436,12 +1440,88 @@ begin
   fSuppressNextReturnUntilTick := GetTickCount64 + cSuppressReturnKeyAfterDialogMs;
 end;
 
-procedure TAppsViewMainFrm.SaveWindowCaptionOverrides;
+function TAppsViewMainFrm.BuildWindowCaptionOverrideState: TCaptionOverrideState;
+var
+  i: Integer;
+  lNow: TDateTime;
+  lNowMilliseconds: Int64;
+  lPair: TPair<string, string>;
+  lProcessId: Cardinal;
+  lRecord: TCaptionOverrideRecord;
+  lWnd: HWND;
 begin
-  SaveWindowCaptionOverridesToFile(
-    CombinePath([GetInstallDir, cWindowCaptionOverridesFileName]),
-    fWindowCaptionOverrides,
-    GetCurrentWindowsBootId);
+  lNow := Now;
+  lNowMilliseconds := (DateTimeToUnix(lNow, False) * 1000) + MilliSecondOf(lNow);
+  SetLength(Result, fWindowCaptionOverrides.Count);
+  i := 0;
+  for lPair in fWindowCaptionOverrides do
+  begin
+    if not TryParseWindowCaptionOverrideKey(lPair.Key, lWnd, lProcessId) then
+      Continue;
+    if not fWindowCaptionOverrideRecords.TryGetValue(lPair.Key, lRecord) then
+      lRecord := Default(TCaptionOverrideRecord);
+    lRecord.Caption := lPair.Value;
+    if lRecord.CreatedAt = 0 then
+      lRecord.CreatedAt := lNowMilliseconds;
+    lRecord.UpdatedAt := lNowMilliseconds;
+    lRecord.Reason := 'user_rename';
+    lRecord.Identity.Hwnd := UInt64(NativeUInt(lWnd));
+    lRecord.Identity.ProcessId := lProcessId;
+    fWindowCaptionOverrideRecords.AddOrSetValue(lPair.Key, lRecord);
+    Result[i] := lRecord;
+    Inc(i);
+  end;
+  SetLength(Result, i);
+end;
+
+procedure TAppsViewMainFrm.RemoveStaleWindowCaptionOverrideRecords;
+var
+  i: Integer;
+  lKeys: TArray<string>;
+begin
+  lKeys := fWindowCaptionOverrideRecords.Keys.ToArray;
+  for i := 0 to High(lKeys) do
+    if not fWindowCaptionOverrides.ContainsKey(lKeys[i]) then
+      fWindowCaptionOverrideRecords.Remove(lKeys[i]);
+end;
+
+procedure TAppsViewMainFrm.SaveWindowCaptionOverrides;
+var
+  lState: TCaptionOverrideState;
+begin
+  if (not Assigned(fRenameJournalWriter)) or
+    (not Assigned(fWindowCaptionOverrideRecords)) or
+    (not Assigned(fWindowCaptionOverrides)) then
+    Exit;
+  RemoveStaleWindowCaptionOverrideRecords;
+  lState := BuildWindowCaptionOverrideState;
+  if not fRenameJournalWriter.SubmitOverrideState(lState) then
+    LogStartupTiming('CaptionOverride.StateRejected', 'state snapshot rejected during shutdown');
+end;
+
+procedure TAppsViewMainFrm.ApplyLoadedWindowCaptionOverrideState;
+var
+  lKey: string;
+  lRecord: TCaptionOverrideRecord;
+  lState: TCaptionOverrideState;
+  lStatus: TCaptionOverrideStateLoadStatus;
+begin
+  if (not Assigned(fRenameJournalWriter)) or
+    (not fRenameJournalWriter.TryTakeLoadedOverrideState(lState, lStatus)) then
+    Exit;
+  for lRecord in lState do
+  begin
+    lKey := BuildWindowCaptionOverrideKey(
+      HWND(NativeUInt(lRecord.Identity.Hwnd)),
+      lRecord.Identity.ProcessId);
+    if not fWindowCaptionOverrides.ContainsKey(lKey) then
+    begin
+      fWindowCaptionOverrides.Add(lKey, lRecord.Caption);
+      fWindowCaptionOverrideRecords.AddOrSetValue(lKey, lRecord);
+    end;
+  end;
+  if lStatus = coslsUpgraded then
+    LogStartupTiming('CaptionOverride.StateUpgraded', Format('count=%d', [Length(lState)]));
 end;
 
 procedure TAppsViewMainFrm.SelectPopupListBoxItemUnderCursor(const aListBox: TListBox);
@@ -2608,6 +2688,7 @@ begin
   if IsShuttingDown then
     Exit;
 
+  ApplyLoadedWindowCaptionOverrideState;
   MarkFormFocused;
   if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
     StartStartupDataLoad
@@ -2671,11 +2752,8 @@ begin
 
   fApps := TAppList.Create;
   fConfigCache := TConfigCache.Create(GetInstallDir);
+  fWindowCaptionOverrideRecords := TDictionary<string, TCaptionOverrideRecord>.Create;
   fWindowCaptionOverrides := TDictionary<string, string>.Create;
-  LoadWindowCaptionOverridesFromFile(CombinePath([GetInstallDir, cWindowCaptionOverridesFileName]),
-    fWindowCaptionOverrides, GetCurrentWindowsBootId);
-  if PruneWindowCaptionOverrides then
-    SaveWindowCaptionOverrides;
   fSuppressNextReturnListBox := nil;
   fSuppressNextReturnUntilTick := 0;
   CreateWindowActionsPopupMenu;
@@ -2696,6 +2774,8 @@ begin
   gc(lIniFile, TMemIniFile.Create(CombinePath([GetInstallDir, cSettingsFileName]), TEncoding.Utf8, False));
   fShutdownToken := TCancelToken.Create;
   fRenameJournalConfig := LoadRenameJournalConfig(lIniFile);
+  fRenameJournalConfig.OverrideStateFileName := CombinePath(
+    [GetInstallDir, cWindowCaptionOverridesFileName]);
   fRenameJournalWriter := TRenameJournalWriter.Create(fRenameJournalConfig, fShutdownToken);
   fChatMonitor := TChatMonitor.Create(lIniFile);
   fChatMonitor.UseConfigCache(fConfigCache);
@@ -2770,6 +2850,7 @@ begin
   ClearListBoxItemData(lbShortCuts);
   FreeAndNil(fChatMonitor);
   FreeAndNil(fConfigCache);
+  FreeAndNil(fWindowCaptionOverrideRecords);
   FreeAndNil(fWindowCaptionOverrides);
   fApps.Free;
   LogStartupTiming('FormDestroy.Flush');
@@ -4072,6 +4153,7 @@ var
   lWindowProcessId: Cardinal;
   lIndex: Integer;
 begin
+  ApplyLoadedWindowCaptionOverrideState;
   if IsShuttingDown then
     Exit;
 
