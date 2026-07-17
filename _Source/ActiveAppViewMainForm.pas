@@ -12,6 +12,12 @@ uses
   ActiveAppViewCore, ActiveAppView.RenameJournal;
 
 type
+  TWindowActionTarget = record
+    DisplayCaption: string;
+    ProcessId: Cardinal;
+    Wnd: hWnd;
+  end;
+
   TAppsViewMainFrm = class(TForm)
     lbApps: TListBox;
     pnlApps: TPanel;
@@ -131,6 +137,8 @@ type
     fStartupProfileStartTick: Int64;
     fStartupProfileWarmupDoneLogged: Integer;
     fWindowTitlePollingIntervalMs: Cardinal;
+    fWindowActionSourceListBox: TListBox;
+    fWindowActionTarget: TWindowActionTarget;
     fWindowActionsPopupMenu: TPopupMenu;
     fCloseWindowMenuItem: TMenuItem;
     fRenameWindowMenuItem: TMenuItem;
@@ -187,7 +195,12 @@ type
       const aProcessId: Cardinal; const aCaption: string);
     procedure ApplyWindowCaptionReset(const aWnd: hWnd;
       const aProcessId: Cardinal);
+    function CaptureWindowActionTarget(const aListBox: TListBox): Boolean;
+    procedure ClearWindowActionTarget;
     function ColumnLayoutAvailableWidth: Integer;
+    function ConsumeWindowActionTarget(out aListBox: TListBox;
+      out aTarget: TWindowActionTarget): Boolean;
+    procedure CloseWindowTarget(const aTarget: TWindowActionTarget);
     function ControlLayoutWidth(const aControl: TControl): Integer;
     procedure CloseSelectedWindow(const aListBox: TListBox);
     procedure CreateWindowActionsPopupMenu;
@@ -198,12 +211,13 @@ type
     function IsProcessActive(const aProcessId: Cardinal): Boolean;
     procedure JournalWindowCaptionOverride(
       const aEvent: TCaptionOverrideLifecycleEvent);
+    function PrepareWindowActionTargetForPopup(
+      const aListBox: TListBox): Boolean;
     function PruneWindowCaptionOverrides: Boolean;
     procedure RemoveStaleWindowCaptionOverrideRecords;
     procedure RestoreFocusAfterWindowCaptionDialog(const aListBox: TListBox);
     procedure SaveWindowCaptionOverrides;
     procedure WindowActionListBoxContextPopup(aSender: TObject; aMousePos: TPoint; var aHandled: Boolean);
-    procedure SelectPopupListBoxItemUnderCursor(const aListBox: TListBox);
     function ShouldConsumeSuppressedReturnKey(const aSender: TObject; const aKey: Word): Boolean;
     procedure SuppressNextReturnKey(const aListBox: TListBox);
     procedure QuickValidateListBoxProcesses(const aListBox: TListBox);
@@ -213,7 +227,7 @@ type
     procedure RemoveWindowFromUiAndCache(const aWnd: hWnd);
     procedure SelectListBoxItemIndex(const aListBox: TListBox; const aItemIndex: Integer);
     procedure ScheduleWindowActionCleanup(const aWnd: hWnd; const aProcessId: Cardinal);
-    procedure TerminateSelectedWindow(const aListBox: TListBox);
+    procedure TerminateWindowTarget(const aTarget: TWindowActionTarget);
     procedure WindowActionsPopupMenuPopup(aSender: TObject);
     procedure WindowCloseMenuItemClick(aSender: TObject);
     procedure WindowRenameMenuItemClick(aSender: TObject);
@@ -364,6 +378,8 @@ begin
     end;
     codReset:
     begin
+      if (not Assigned(aIsCurrent)) or (not aIsCurrent(aWnd, aProcessId)) then
+        Exit(wcdarStale);
       aOverrides.Remove(lKey);
       Result := wcdarReset;
     end;
@@ -468,6 +484,20 @@ begin
   lCurrentProcessId := 0;
   GetWindowThreadProcessId(aWnd, lCurrentProcessId);
   Result := lCurrentProcessId = aProcessId;
+end;
+
+function TryResolveWindowActionTarget(const aTarget: TWindowActionTarget;
+  const aIsCurrent: TWindowCaptionOverrideIsAliveFunc; out aWnd: hWnd;
+  out aProcessId: Cardinal): Boolean;
+begin
+  aWnd := 0;
+  aProcessId := 0;
+  Result := (aTarget.Wnd <> 0) and (aTarget.ProcessId <> 0) and
+    Assigned(aIsCurrent) and aIsCurrent(aTarget.Wnd, aTarget.ProcessId);
+  if not Result then
+    Exit;
+  aWnd := aTarget.Wnd;
+  aProcessId := aTarget.ProcessId;
 end;
 
 function TryParseWindowCaptionOverrideKey(const aKey: string; out aWnd: hWnd; out aProcessId: Cardinal): Boolean;
@@ -1357,22 +1387,79 @@ begin
     fOrgAppOnActivate(Sender);
 end;
 
-procedure TAppsViewMainFrm.CloseSelectedWindow(const aListBox: TListBox);
+function TAppsViewMainFrm.CaptureWindowActionTarget(
+  const aListBox: TListBox): Boolean;
 var
   lProcessId: Cardinal;
   lWnd: hWnd;
 begin
-  if not Assigned(aListBox) then
+  ClearWindowActionTarget;
+  Result := GetSelectedWindowInfo(aListBox, lWnd, lProcessId);
+  if not Result then
     Exit;
 
-  lWnd := GetWnd(aListBox);
-  if lWnd = 0 then
-    Exit;
+  fWindowActionSourceListBox := aListBox;
+  fWindowActionTarget.ProcessId := lProcessId;
+  fWindowActionTarget.Wnd := lWnd;
+  if (aListBox.ItemIndex >= 0) and
+    (aListBox.ItemIndex < aListBox.Items.Count) then
+    fWindowActionTarget.DisplayCaption :=
+      aListBox.Items[aListBox.ItemIndex];
+end;
 
-  lProcessId := 0;
-  GetWindowThreadProcessId(lWnd, lProcessId);
+procedure TAppsViewMainFrm.ClearWindowActionTarget;
+begin
+  fWindowActionSourceListBox := nil;
+  fWindowActionTarget := Default(TWindowActionTarget);
+end;
+
+procedure TAppsViewMainFrm.CloseSelectedWindow(const aListBox: TListBox);
+var
+  lTarget: TWindowActionTarget;
+begin
+  lTarget := Default(TWindowActionTarget);
+  if not GetSelectedWindowInfo(
+    aListBox,
+    lTarget.Wnd,
+    lTarget.ProcessId) then
+    Exit;
+  CloseWindowTarget(lTarget);
+end;
+
+procedure TAppsViewMainFrm.CloseWindowTarget(
+  const aTarget: TWindowActionTarget);
+var
+  lProcessId: Cardinal;
+  lWnd: hWnd;
+begin
+  if not TryResolveWindowActionTarget(
+    aTarget,
+    IsWindowIdentityCurrent,
+    lWnd,
+    lProcessId) then
+    Exit;
   PostMessage(lWnd, WM_CLOSE, 0, 0);
   ScheduleWindowActionCleanup(lWnd, lProcessId);
+end;
+
+function TAppsViewMainFrm.ConsumeWindowActionTarget(
+  out aListBox: TListBox; out aTarget: TWindowActionTarget): Boolean;
+var
+  lProcessId: Cardinal;
+  lWnd: hWnd;
+begin
+  aListBox := fWindowActionSourceListBox;
+  aTarget := fWindowActionTarget;
+  ClearWindowActionTarget;
+  Result := Assigned(aListBox) and TryResolveWindowActionTarget(
+    aTarget,
+    IsWindowIdentityCurrent,
+    lWnd,
+    lProcessId);
+  if not Result then
+    Exit;
+  aTarget.ProcessId := lProcessId;
+  aTarget.Wnd := lWnd;
 end;
 
 procedure TAppsViewMainFrm.CreateWindowActionsPopupMenu;
@@ -1427,7 +1514,7 @@ begin
     Exit;
 
   GetWindowThreadProcessId(aWnd, aProcessId);
-  Result := aProcessId <> 0;
+  Result := IsWindowIdentityCurrent(aWnd, aProcessId);
 end;
 
 function TAppsViewMainFrm.IsCaptionOverrideListBox(const aListBox: TListBox): Boolean;
@@ -1633,21 +1720,6 @@ begin
     LogStartupTiming('CaptionOverride.StateUpgraded', Format('count=%d', [Length(lState)]));
 end;
 
-procedure TAppsViewMainFrm.SelectPopupListBoxItemUnderCursor(const aListBox: TListBox);
-var
-  lCursorPos: TPoint;
-  lItemIndex: Integer;
-begin
-  if not Assigned(aListBox) then
-    Exit;
-  if not GetCursorPos(lCursorPos) then
-    Exit;
-
-  lItemIndex := aListBox.ItemAtPos(aListBox.ScreenToClient(lCursorPos), True);
-  if lItemIndex >= 0 then
-    SelectListBoxItemIndex(aListBox, lItemIndex);
-end;
-
 procedure TAppsViewMainFrm.WindowActionListBoxContextPopup(aSender: TObject; aMousePos: TPoint;
   var aHandled: Boolean);
 var
@@ -1656,13 +1728,21 @@ var
 begin
   if not (aSender is TListBox) then
     Exit;
-  if (aMousePos.X < 0) or (aMousePos.Y < 0) then
-    Exit;
 
   lListBox := TListBox(aSender);
-  lItemIndex := lListBox.ItemAtPos(aMousePos, True);
-  if lItemIndex >= 0 then
+  if (aMousePos.X >= 0) and (aMousePos.Y >= 0) then
+  begin
+    lItemIndex := lListBox.ItemAtPos(aMousePos, True);
+    if lItemIndex < 0 then
+    begin
+      ClearWindowActionTarget;
+      fWindowActionSourceListBox := lListBox;
+      Exit;
+    end;
     SelectListBoxItemIndex(lListBox, lItemIndex);
+  end;
+  if not CaptureWindowActionTarget(lListBox) then
+    fWindowActionSourceListBox := lListBox;
 end;
 
 function TAppsViewMainFrm.IsProcessActive(const aProcessId: Cardinal): Boolean;
@@ -1876,22 +1956,18 @@ begin
     app.SHOW;
 end;
 
-procedure TAppsViewMainFrm.TerminateSelectedWindow(const aListBox: TListBox);
+procedure TAppsViewMainFrm.TerminateWindowTarget(
+  const aTarget: TWindowActionTarget);
 var
   lProcessHandle: THandle;
   lProcessId: Cardinal;
   lWnd: hWnd;
 begin
-  if not Assigned(aListBox) then
-    Exit;
-
-  lWnd := GetWnd(aListBox);
-  if lWnd = 0 then
-    Exit;
-
-  lProcessId := 0;
-  GetWindowThreadProcessId(lWnd, lProcessId);
-  if lProcessId = 0 then
+  if not TryResolveWindowActionTarget(
+    aTarget,
+    IsWindowIdentityCurrent,
+    lWnd,
+    lProcessId) then
     Exit;
 
   lProcessHandle := OpenProcess(PROCESS_TERMINATE, False, lProcessId);
@@ -1912,17 +1988,11 @@ var
   lCanWindowAction: Boolean;
   lHasWindow: Boolean;
   lListBox: TListBox;
-  lProcessId: Cardinal;
-  lWnd: hWnd;
 begin
   lListBox := GetPopupSourceListBox;
-  SelectPopupListBoxItemUnderCursor(lListBox);
-  lHasWindow := Assigned(lListBox) and (GetWnd(lListBox) <> 0);
-  lWnd := 0;
-  lProcessId := 0;
-  lCanCaptionOverride := False;
-  if lHasWindow and IsCaptionOverrideListBox(lListBox) then
-    lCanCaptionOverride := GetSelectedWindowInfo(lListBox, lWnd, lProcessId);
+  lHasWindow := PrepareWindowActionTargetForPopup(lListBox);
+  lCanCaptionOverride := lHasWindow and
+    IsCaptionOverrideListBox(lListBox);
   lCanWindowAction := lHasWindow and IsWindowActionListBox(lListBox, lbApps, lbExplorer, lbConsole);
 
   if Assigned(fCloseWindowMenuItem) then
@@ -1933,9 +2003,38 @@ begin
     fTerminateWindowMenuItem.Enabled := lCanWindowAction;
 end;
 
-procedure TAppsViewMainFrm.WindowCloseMenuItemClick(aSender: TObject);
+function TAppsViewMainFrm.PrepareWindowActionTargetForPopup(
+  const aListBox: TListBox): Boolean;
 begin
-  CloseSelectedWindow(GetPopupSourceListBox);
+  if not Assigned(aListBox) then
+  begin
+    ClearWindowActionTarget;
+    Exit(False);
+  end;
+  if not Assigned(fWindowActionSourceListBox) then
+    Exit(CaptureWindowActionTarget(aListBox));
+  if fWindowActionSourceListBox <> aListBox then
+  begin
+    ClearWindowActionTarget;
+    Exit(False);
+  end;
+
+  Result := (fWindowActionTarget.Wnd <> 0) and
+    IsWindowIdentityCurrent(
+      fWindowActionTarget.Wnd,
+      fWindowActionTarget.ProcessId);
+  if not Result then
+    ClearWindowActionTarget;
+end;
+
+procedure TAppsViewMainFrm.WindowCloseMenuItemClick(aSender: TObject);
+var
+  lListBox: TListBox;
+  lTarget: TWindowActionTarget;
+begin
+  if ConsumeWindowActionTarget(lListBox, lTarget) and
+    Assigned(lListBox) then
+    CloseWindowTarget(lTarget);
 end;
 
 procedure TAppsViewMainFrm.ApplyWindowCaptionRename(const aWnd: hWnd;
@@ -1986,51 +2085,50 @@ end;
 procedure TAppsViewMainFrm.WindowRenameMenuItemClick(aSender: TObject);
 var
   lCaption: string;
-  lDisplayCaption: string;
   lDialogOutcome: TCaptionOverrideDialogOutcome;
   lListBox: TListBox;
-  lProcessId: Cardinal;
-  lWnd: hWnd;
+  lTarget: TWindowActionTarget;
 begin
-  lListBox := GetPopupSourceListBox;
+  if not ConsumeWindowActionTarget(lListBox, lTarget) then
+    Exit;
   if not IsCaptionOverrideListBox(lListBox) then
     Exit;
-  if not GetSelectedWindowInfo(lListBox, lWnd, lProcessId) then
-    Exit;
 
-  lDisplayCaption := '';
-  if (lListBox.ItemIndex >= 0) and (lListBox.ItemIndex < lListBox.Items.Count) then
-    lDisplayCaption := lListBox.Items[lListBox.ItemIndex];
   lCaption := BuildWindowRenameDefaultCaption(
     fWindowCaptionOverrides,
-    lWnd,
-    lProcessId,
-    maxLogic.Windows.Desktop.GetWinCaption(lWnd),
-    lDisplayCaption);
+    lTarget.Wnd,
+    lTarget.ProcessId,
+    maxLogic.Windows.Desktop.GetWinCaption(lTarget.Wnd),
+    lTarget.DisplayCaption);
   lDialogOutcome := Default(TCaptionOverrideDialogOutcome);
   try
     lDialogOutcome := ExecuteCaptionOverrideDialogWithInitialCaption(Self, lCaption, ExecuteCaptionOverrideDialog);
     case ApplyWindowCaptionDialogOutcome(
       fWindowCaptionOverrides,
-      lWnd,
-      lProcessId,
+      lTarget.Wnd,
+      lTarget.ProcessId,
       lDialogOutcome,
       IsWindowIdentityCurrent) of
       wcdarRenamed:
       begin
-        ApplyWindowCaptionRename(lWnd, lProcessId, lDialogOutcome.Caption);
+        ApplyWindowCaptionRename(
+          lTarget.Wnd,
+          lTarget.ProcessId,
+          lDialogOutcome.Caption);
         QueueGuiRefresh;
       end;
       wcdarReset:
       begin
-        ApplyWindowCaptionReset(lWnd, lProcessId);
+        ApplyWindowCaptionReset(lTarget.Wnd, lTarget.ProcessId);
         QueueGuiRefresh;
       end;
       wcdarStale:
       begin
         LogStartupTiming(
           'RenameWindow.StaleIdentity',
-          Format('hwnd=%d pid=%d', [NativeUInt(lWnd), lProcessId]));
+          Format(
+            'hwnd=%d pid=%d',
+            [NativeUInt(lTarget.Wnd), lTarget.ProcessId]));
         QueueGuiRefresh;
       end;
     end;
@@ -2042,8 +2140,13 @@ begin
 end;
 
 procedure TAppsViewMainFrm.WindowTerminateMenuItemClick(aSender: TObject);
+var
+  lListBox: TListBox;
+  lTarget: TWindowActionTarget;
 begin
-  TerminateSelectedWindow(GetPopupSourceListBox);
+  if ConsumeWindowActionTarget(lListBox, lTarget) and
+    Assigned(lListBox) then
+    TerminateWindowTarget(lTarget);
 end;
 
 procedure TAppsViewMainFrm.ClearListBoxItemData(lb: TListBox);
@@ -3052,9 +3155,10 @@ end;
 function TAppsViewMainFrm.GetWnd(lb: TListBox): hwnd;
 begin
   Result := 0;
-  if lb.Items.Count <> 0 then
-    if lb.ItemIndex <> -1 then
-      Result := hwnd(lb.Items.Objects[lb.ItemIndex]);
+  if not Assigned(lb) then
+    Exit;
+  if (lb.ItemIndex >= 0) and (lb.ItemIndex < lb.Items.Count) then
+    Result := hwnd(lb.Items.Objects[lb.ItemIndex]);
 end;
 
 procedure TAppsViewMainFrm.lbAppsClick(Sender: TObject);
@@ -3354,24 +3458,33 @@ function RunMainFormSelfTests(const aArg: string): Integer;
 var
   lApps: TArray<TAppInfo>;
   lApplyResult: TWindowCaptionDialogApplyResult;
+  lActionWnd: hWnd;
+  lActionTarget: TWindowActionTarget;
   lAppsWidth: Integer;
   lCallCount: Integer;
   lCancelToken: iCancelToken;
+  lCapturedListBox: TListBox;
   lConsoleWidth: Integer;
   lDesktopWidth: Integer;
   lDialogOutcome: TCaptionOverrideDialogOutcome;
   lEvent: TCaptionOverrideLifecycleEvent;
   lExplorerWidth: Integer;
+  lHandled: Boolean;
   lItems: TStringList;
   lIdentity: TCaptionOverrideIdentity;
   lObservedIdentity: TCaptionOverrideIdentity;
+  lOtherListBox: TListBox;
   lLoadedOverrides: TDictionary<string, string>;
+  lMousePos: TPoint;
   lOverrideKey: string;
   lOverrides: TDictionary<string, string>;
   lParams: string;
   lPrefixRules: TPrefixRuleArray;
   lRecord: TCaptionOverrideRecord;
+  lReplacementWnd: hWnd;
   lResultIndex: Integer;
+  lResolvedProcessId: Cardinal;
+  lResolvedWnd: hWnd;
   lScripts: TStringArray;
   lScriptsDir: string;
   lScriptNames: TStringList;
@@ -3382,6 +3495,8 @@ var
   lTempDir: string;
   lTitle: string;
   lTargetPath: string;
+  lTestForm: TAppsViewMainFrm;
+  lTestListBox: TListBox;
   lTestOverrideKey: string;
   lTestApp: TAppInfo;
   lTestProcessId: Cardinal;
@@ -3511,6 +3626,215 @@ begin
   if SameText(aArg, cWindowActionProbeSelfTestArg) then
   begin
     Result := 0;
+    lActionTarget := Default(TWindowActionTarget);
+    lActionTarget.ProcessId := 200;
+    lActionTarget.Wnd := hWnd(20);
+    if not TryResolveWindowActionTarget(
+      lActionTarget,
+      function(const aWnd: hWnd; const aProcessId: Cardinal): Boolean
+      begin
+        Result := (aWnd = hWnd(20)) and (aProcessId = 200);
+      end,
+      lResolvedWnd,
+      lResolvedProcessId) or
+      (lResolvedWnd <> hWnd(20)) or (lResolvedProcessId <> 200) then
+    begin
+      Writeln('SELFTEST FAILED: window action did not retain the popup target');
+      Result := 1;
+    end;
+    if TryResolveWindowActionTarget(
+      lActionTarget,
+      function(const aWnd: hWnd; const aProcessId: Cardinal): Boolean
+      begin
+        Result := False;
+      end,
+      lResolvedWnd,
+      lResolvedProcessId) then
+    begin
+      Writeln('SELFTEST FAILED: stale popup target was accepted');
+      Result := 1;
+    end;
+    lActionWnd := CreateWindowEx(
+      0,
+      'STATIC',
+      'Captured action target',
+      WS_POPUP,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      HInstance,
+      nil);
+    lReplacementWnd := CreateWindowEx(
+      0,
+      'STATIC',
+      'Replacement list target',
+      WS_POPUP,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      HInstance,
+      nil);
+    if (lActionWnd = 0) or (lReplacementWnd = 0) then
+    begin
+      Writeln('SELFTEST FAILED: could not create popup target windows');
+      Result := 1;
+    end else begin
+      lTestForm := TAppsViewMainFrm.CreateNew(nil);
+      try
+        lTestListBox := TListBox.Create(lTestForm);
+        lTestListBox.Parent := lTestForm;
+        lTestListBox.Height := 100;
+        lTestListBox.Width := 100;
+        lTestListBox.Items.AddObject(
+          'captured target',
+          TObject(lActionWnd));
+        lTestListBox.ItemIndex := 0;
+        lHandled := False;
+        lMousePos.X := 1;
+        lMousePos.Y := 1;
+        lTestForm.WindowActionListBoxContextPopup(
+          lTestListBox,
+          lMousePos,
+          lHandled);
+        lTestListBox.Items.Clear;
+        lTestListBox.Items.AddObject(
+          'replacement target',
+          TObject(lReplacementWnd));
+        lTestListBox.ItemIndex := 0;
+        lActionTarget := Default(TWindowActionTarget);
+        if not lTestForm.PrepareWindowActionTargetForPopup(lTestListBox) or
+          (not lTestForm.ConsumeWindowActionTarget(
+          lCapturedListBox,
+          lActionTarget)) or
+          (lCapturedListBox <> lTestListBox) or
+          (lActionTarget.Wnd <> lActionWnd) or
+          (lActionTarget.ProcessId <> GetCurrentProcessId) then
+        begin
+          Writeln('SELFTEST FAILED: list refresh replaced the frozen popup target');
+          Result := 1;
+        end;
+
+        lTestListBox.Items.Clear;
+        lTestListBox.Items.AddObject(
+          'captured source target',
+          TObject(lActionWnd));
+        lTestListBox.ItemIndex := 0;
+        lMousePos.X := 1;
+        lMousePos.Y := 1;
+        lTestForm.WindowActionListBoxContextPopup(
+          lTestListBox,
+          lMousePos,
+          lHandled);
+        lOtherListBox := TListBox.Create(lTestForm);
+        lOtherListBox.Parent := lTestForm;
+        lOtherListBox.Items.AddObject(
+          'mismatched source target',
+          TObject(lReplacementWnd));
+        lOtherListBox.ItemIndex := 0;
+        if lTestForm.PrepareWindowActionTargetForPopup(lOtherListBox) then
+        begin
+          Writeln('SELFTEST FAILED: popup source mismatch captured another target');
+          Result := 1;
+        end;
+        if lTestForm.ConsumeWindowActionTarget(
+          lCapturedListBox,
+          lActionTarget) then
+        begin
+          Writeln('SELFTEST FAILED: popup source mismatch remained actionable');
+          Result := 1;
+        end;
+
+        lTestListBox.Items.Clear;
+        lTestListBox.Items.AddObject(
+          'selected target behind blank context area',
+          TObject(lActionWnd));
+        lTestListBox.ItemIndex := 0;
+        lMousePos.X := 1;
+        lMousePos.Y := lTestListBox.ClientHeight + 1;
+        lTestForm.WindowActionListBoxContextPopup(
+          lTestListBox,
+          lMousePos,
+          lHandled);
+        if lTestForm.PrepareWindowActionTargetForPopup(lTestListBox) then
+        begin
+          Writeln('SELFTEST FAILED: blank context area retained the selected target');
+          Result := 1;
+        end;
+        if lTestForm.ConsumeWindowActionTarget(
+          lCapturedListBox,
+          lActionTarget) then
+        begin
+          Writeln('SELFTEST FAILED: blank context area remained actionable');
+          Result := 1;
+        end;
+
+        lTestListBox.Items.Clear;
+        lTestListBox.Items.AddObject(
+          'unselected keyboard context target',
+          TObject(lActionWnd));
+        lTestListBox.ItemIndex := -1;
+        lMousePos.X := -1;
+        lMousePos.Y := -1;
+        lTestForm.WindowActionListBoxContextPopup(
+          lTestListBox,
+          lMousePos,
+          lHandled);
+        lTestListBox.Items.Clear;
+        lTestListBox.Items.AddObject(
+          'replacement after failed keyboard capture',
+          TObject(lReplacementWnd));
+        lTestListBox.ItemIndex := 0;
+        if lTestForm.PrepareWindowActionTargetForPopup(lTestListBox) then
+        begin
+          Writeln('SELFTEST FAILED: failed keyboard context captured a later target');
+          Result := 1;
+        end;
+        if lTestForm.ConsumeWindowActionTarget(
+          lCapturedListBox,
+          lActionTarget) then
+        begin
+          Writeln('SELFTEST FAILED: failed keyboard context remained actionable');
+          Result := 1;
+        end;
+
+        lTestListBox.Items.Clear;
+        lTestListBox.Items.AddObject(
+          'stale captured target',
+          TObject(lActionWnd));
+        lTestListBox.ItemIndex := 0;
+        if not lTestForm.CaptureWindowActionTarget(lTestListBox) then
+        begin
+          Writeln('SELFTEST FAILED: stale popup setup capture failed');
+          Result := 1;
+        end;
+        DestroyWindow(lActionWnd);
+        lActionWnd := 0;
+        lTestListBox.Items.Clear;
+        lTestListBox.Items.AddObject(
+          'live replacement target',
+          TObject(lReplacementWnd));
+        lTestListBox.ItemIndex := 0;
+        if lTestForm.ConsumeWindowActionTarget(
+          lCapturedListBox,
+          lActionTarget) then
+        begin
+          Writeln('SELFTEST FAILED: destroyed popup target switched to the replacement');
+          Result := 1;
+        end;
+      finally
+        lTestForm.Free;
+      end;
+    end;
+    if lActionWnd <> 0 then
+      DestroyWindow(lActionWnd);
+    if lReplacementWnd <> 0 then
+      DestroyWindow(lReplacementWnd);
     if not IsWindowActionListBox(TObject(3), TObject(1), TObject(2), TObject(3)) then
     begin
       Writeln('SELFTEST FAILED: console listbox should support window actions');
@@ -4014,10 +4338,10 @@ begin
           Inc(lCallCount);
           Result := False;
         end);
-      if (lApplyResult <> wcdarReset) or (lCallCount <> 0) or
-        HasWindowCaptionOverride(lOverrides, hWnd(100), 200) then
+      if (lApplyResult <> wcdarStale) or (lCallCount <> 1) or
+        (not HasWindowCaptionOverride(lOverrides, hWnd(100), 200)) then
       begin
-        Writeln('SELFTEST FAILED: window caption reset did not remove exactly its override');
+        Writeln('SELFTEST FAILED: stale window caption reset changed the override');
         Result := 1;
       end;
 
