@@ -141,40 +141,46 @@ begin
   Result := Abs(aLegacyBootId - lExpectedLegacyBootId) <= 5;
 end;
 
+type
+  TVersion2RecordValues = record
+    BootId: Int64;
+    CreatedAt: Int64;
+    HasBootId: Boolean;
+    HasProcessStartedAt: Boolean;
+    Hwnd: UInt64;
+    ProcessId: Cardinal;
+    ProcessStartedAt: Int64;
+    UpdatedAt: Int64;
+  end;
+
 function TryReadVersion2Record(const aIniFile: TCustomIniFile; const aIndex: Integer;
   out aRecord: TCaptionOverrideRecord): Boolean;
 var
-  lBootId: Int64;
-  lCreatedAt: Int64;
-  lHasBootId: Boolean;
-  lHasProcessStartedAt: Boolean;
-  lHwnd: UInt64;
-  lProcessId: Cardinal;
-  lProcessStartedAt: Int64;
   lSection: string;
-  lUpdatedAt: Int64;
+  lValues: TVersion2RecordValues;
 begin
   aRecord := Default(TCaptionOverrideRecord);
   lSection := OverrideSectionName(aIndex);
   aRecord.Caption := aIniFile.ReadString(lSection, 'Caption', '');
   Result := (Trim(aRecord.Caption) <> '') and
-    TryReadRequiredInt64(aIniFile, lSection, 'CreatedAt', lCreatedAt) and
-    TryReadRequiredInt64(aIniFile, lSection, 'UpdatedAt', lUpdatedAt) and
-    TryReadRequiredUInt64(aIniFile, lSection, 'Hwnd', lHwnd) and
-    TryReadRequiredCardinal(aIniFile, lSection, 'Pid', lProcessId) and
-    TryReadOptionalInt64(aIniFile, lSection, 'BootId', lHasBootId, lBootId) and
+    TryReadRequiredInt64(aIniFile, lSection, 'CreatedAt', lValues.CreatedAt) and
+    TryReadRequiredInt64(aIniFile, lSection, 'UpdatedAt', lValues.UpdatedAt) and
+    TryReadRequiredUInt64(aIniFile, lSection, 'Hwnd', lValues.Hwnd) and
+    TryReadRequiredCardinal(aIniFile, lSection, 'Pid', lValues.ProcessId) and
+    TryReadOptionalInt64(aIniFile, lSection, 'BootId',
+      lValues.HasBootId, lValues.BootId) and
     TryReadOptionalInt64(aIniFile, lSection, 'ProcessStartedAt',
-      lHasProcessStartedAt, lProcessStartedAt);
+      lValues.HasProcessStartedAt, lValues.ProcessStartedAt);
   if not Result then
     Exit;
-  aRecord.CreatedAt := lCreatedAt;
-  aRecord.UpdatedAt := lUpdatedAt;
-  aRecord.Identity.BootId := lBootId;
-  aRecord.Identity.HasBootId := lHasBootId;
-  aRecord.Identity.HasProcessStartedAt := lHasProcessStartedAt;
-  aRecord.Identity.Hwnd := lHwnd;
-  aRecord.Identity.ProcessId := lProcessId;
-  aRecord.Identity.ProcessStartedAt := lProcessStartedAt;
+  aRecord.CreatedAt := lValues.CreatedAt;
+  aRecord.UpdatedAt := lValues.UpdatedAt;
+  aRecord.Identity.BootId := lValues.BootId;
+  aRecord.Identity.HasBootId := lValues.HasBootId;
+  aRecord.Identity.HasProcessStartedAt := lValues.HasProcessStartedAt;
+  aRecord.Identity.Hwnd := lValues.Hwnd;
+  aRecord.Identity.ProcessId := lValues.ProcessId;
+  aRecord.Identity.ProcessStartedAt := lValues.ProcessStartedAt;
   aRecord.Reason := aIniFile.ReadString(lSection, 'Reason', '');
   if aRecord.Reason = '' then
     aRecord.Reason := 'user_rename';
@@ -248,22 +254,45 @@ begin
   Result := True;
 end;
 
+function TryCreateLegacyRecord(const aValues: TStrings; const aIndex: Integer;
+  const aCurrentBootId: Int64; const aProcessResolver: TCaptionOverrideProcessResolver;
+  out aRecord: TCaptionOverrideRecord): Boolean;
+var
+  lProcessId: Cardinal;
+  lResolved: TCaptionOverrideResolvedProcess;
+  lWnd: HWND;
+begin
+  aRecord := Default(TCaptionOverrideRecord);
+  Result := (Trim(aValues.ValueFromIndex[aIndex]) <> '') and
+    TryParseLegacyKey(aValues.Names[aIndex], lWnd, lProcessId);
+  if not Result then
+    Exit;
+  lResolved := aProcessResolver(lWnd, lProcessId);
+  Result := lResolved.Current and lResolved.HasProcessStartedAt;
+  if not Result then
+    Exit;
+
+  aRecord.Caption := aValues.ValueFromIndex[aIndex];
+  aRecord.Reason := 'user_rename';
+  aRecord.Identity.HasBootId := True;
+  aRecord.Identity.BootId := aCurrentBootId;
+  aRecord.Identity.HasProcessStartedAt := True;
+  aRecord.Identity.ProcessStartedAt := lResolved.ProcessStartedAt;
+  aRecord.Identity.ProcessId := lProcessId;
+  aRecord.Identity.Hwnd := UInt64(NativeUInt(lWnd));
+end;
+
 function TryLoadLegacy(const aFileName: string; const aIniFile: TCustomIniFile;
   const aCurrentBootId: Int64; const aHasCurrentBootId: Boolean;
   const aProcessResolver: TCaptionOverrideProcessResolver; out aState: TCaptionOverrideState;
   out aErrorMessage: string): Boolean;
 var
-  g: TGarbos;
   i: Integer;
   lAcceptedCount: Integer;
-  lProcessId: Cardinal;
   lRecord: TCaptionOverrideRecord;
-  lResolved: TCaptionOverrideResolvedProcess;
   lStoredBootId: Int64;
   lValues: TStringList;
-  lWnd: HWND;
 begin
-  g := Default(TGarbos);
   aState := nil;
   aErrorMessage := '';
   if (not aHasCurrentBootId) or (not Assigned(aProcessResolver)) or
@@ -271,33 +300,27 @@ begin
     (not LegacyBootMatches(lStoredBootId, aCurrentBootId)) then
     Exit(TrySaveCaptionOverrideStateAtomic(aFileName, aState, aErrorMessage));
 
-  lValues := nil;
-  GC(lValues, TStringList.Create, g);
-  aIniFile.ReadSectionValues('Overrides', lValues);
-  SetLength(aState, lValues.Count);
-  lAcceptedCount := 0;
-  for i := 0 to lValues.Count - 1 do
-  begin
-    lRecord := Default(TCaptionOverrideRecord);
-    if (Trim(lValues.ValueFromIndex[i]) = '') or
-      (not TryParseLegacyKey(lValues.Names[i], lWnd, lProcessId)) then
-      Continue;
-    lResolved := aProcessResolver(lWnd, lProcessId);
-    if (not lResolved.Current) or (not lResolved.HasProcessStartedAt) then
-      Continue;
-
-    lRecord.Caption := lValues.ValueFromIndex[i];
-    lRecord.Reason := 'user_rename';
-    lRecord.Identity.HasBootId := True;
-    lRecord.Identity.BootId := aCurrentBootId;
-    lRecord.Identity.HasProcessStartedAt := True;
-    lRecord.Identity.ProcessStartedAt := lResolved.ProcessStartedAt;
-    lRecord.Identity.ProcessId := lProcessId;
-    lRecord.Identity.Hwnd := UInt64(NativeUInt(lWnd));
-    aState[lAcceptedCount] := lRecord;
-    Inc(lAcceptedCount);
+  lValues := TStringList.Create;
+  try
+    aIniFile.ReadSectionValues('Overrides', lValues);
+    SetLength(aState, lValues.Count);
+    lAcceptedCount := 0;
+    for i := 0 to lValues.Count - 1 do
+    begin
+      if not TryCreateLegacyRecord(
+        lValues,
+        i,
+        aCurrentBootId,
+        aProcessResolver,
+        lRecord) then
+        Continue;
+      aState[lAcceptedCount] := lRecord;
+      Inc(lAcceptedCount);
+    end;
+    SetLength(aState, lAcceptedCount);
+  finally
+    lValues.Free;
   end;
-  SetLength(aState, lAcceptedCount);
   Result := TrySaveCaptionOverrideStateAtomic(aFileName, aState, aErrorMessage);
 end;
 

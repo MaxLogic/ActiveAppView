@@ -1417,7 +1417,6 @@ procedure TAppsViewMainFrm.CloseSelectedWindow(const aListBox: TListBox);
 var
   lTarget: TWindowActionTarget;
 begin
-  lTarget := Default(TWindowActionTarget);
   if not GetSelectedWindowInfo(
     aListBox,
     lTarget.Wnd,
@@ -3702,6 +3701,11 @@ begin
           lTestListBox,
           lMousePos,
           lHandled);
+        if lHandled then
+        begin
+          Writeln('SELFTEST FAILED: context target capture unexpectedly handled the popup');
+          Result := 1;
+        end;
         lTestListBox.Items.Clear;
         lTestListBox.Items.AddObject(
           'replacement target',

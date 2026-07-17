@@ -835,8 +835,14 @@ begin
     Exit(True);
   end;
 
-  lCurrentProcessId := 0;
-  GetWindowThreadProcessId(lWnd, lCurrentProcessId);
+  if GetWindowThreadProcessId(lWnd, lCurrentProcessId) = 0 then
+  begin
+    if ProcessHasExited(aRecord.Identity.ProcessId) then
+      aReason := 'process_exited'
+    else
+      aReason := 'window_missing';
+    Exit(True);
+  end;
   if lCurrentProcessId <> aRecord.Identity.ProcessId then
   begin
     aReason := 'identity_changed';
