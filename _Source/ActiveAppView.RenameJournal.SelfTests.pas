@@ -469,7 +469,6 @@ begin
   g := Default(TGarbos);
   Result := False;
   aErrorMessage := '';
-  lTestWnd := 0;
   try
     if not TryCreateWindowMissingState(lState, lTestWnd, aErrorMessage) then
       Exit;
@@ -503,19 +502,121 @@ begin
   end;
 end;
 
+function TryCreateObservedExpirationState(const aExpectedReason: string;
+  out aState: TCaptionOverrideState; out aTestWnd: HWND;
+  out aErrorMessage: string): Boolean;
+var
+  lBootIdentity: TWindowsBootIdentity;
+begin
+  Result := False;
+  aState := nil;
+  aTestWnd := 0;
+  aErrorMessage := '';
+  if not TryGetWindowsBootIdentity(1000, False, lBootIdentity) then
+  begin
+    aErrorMessage := 'observed expiration self-test could not obtain boot identity';
+    Exit;
+  end;
+
+  SetLength(aState, 1);
+  aState[0].Caption := 'Observed expiration';
+  aState[0].CreatedAt := 1783900800400;
+  aState[0].UpdatedAt := 1783900800400;
+  aState[0].Reason := 'user_rename';
+  aState[0].Identity.HasBootId := True;
+  aState[0].Identity.BootId := lBootIdentity.UtcMilliseconds;
+  aState[0].Identity.ProcessId := High(Cardinal);
+  if aExpectedReason = 'identity_changed' then
+  begin
+    aTestWnd := CreateWindowEx(0, 'STATIC', 'IdentityChangedSelfTest', 0,
+      0, 0, 0, 0, 0, 0, HInstance, nil);
+    if aTestWnd = 0 then
+    begin
+      aErrorMessage := 'identity-change self-test could not create a real window';
+      Exit;
+    end;
+    aState[0].Identity.Hwnd := UInt64(NativeUInt(aTestWnd));
+  end else
+    aState[0].Identity.Hwnd := High(UInt64);
+  Result := True;
+end;
+
+function ApplyObservedExpirationMigration(const aDatabaseFileName: string;
+  const aMigrationDirectory: string; const aConnection: TFDConnection;
+  out aErrorMessage: string): Boolean;
+var
+  lDriverLink: TFDPhysSQLiteDriverLink;
+begin
+  lDriverLink := TFDPhysSQLiteDriverLink.Create(aConnection);
+  lDriverLink.DriverID := 'SQLite';
+  ConfigureTestConnection(aDatabaseFileName, aConnection);
+  Result := ApplyCanonicalShadowJournalMigrations(
+    aConnection,
+    aMigrationDirectory,
+    1,
+    5,
+    aErrorMessage);
+  if Result then
+    aConnection.Connected := False;
+end;
+
+function VerifyWriterExpiration(const aWriter: TRenameJournalWriter;
+  const aState: TCaptionOverrideState; const aExpectedReason: string;
+  out aErrorMessage: string): Boolean;
+var
+  lExpirations: TCaptionOverrideExpirations;
+begin
+  Result := False;
+  aErrorMessage := '';
+  if (not aWriter.SubmitOverrideState(aState)) or
+    (not aWriter.WaitForOverrideStatePersistence(5000)) or
+    (not WaitForWriterProgress(aWriter, 1, 0, 1)) then
+  begin
+    aErrorMessage := aExpectedReason + ' expiration was not persisted';
+    Exit;
+  end;
+  if (not aWriter.TryTakeExpiredOverrides(lExpirations)) or
+    (Length(lExpirations) <> 1) or
+    (lExpirations[0].Reason <> aExpectedReason) then
+  begin
+    aErrorMessage := aExpectedReason + ' expiration notification mismatch';
+    Exit;
+  end;
+  aWriter.StopAndWait;
+  Result := True;
+end;
+
+function VerifyStoredExpirationReason(const aConnection: TFDConnection;
+  const aExpectedReason: string; out aErrorMessage: string): Boolean;
+var
+  g: TGarbos;
+  lQuery: TFDQuery;
+begin
+  g := Default(TGarbos);
+  aErrorMessage := '';
+  try
+    aConnection.Connected := True;
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := aConnection;
+    lQuery.SQL.Text :=
+      'SELECT reason FROM window_caption_override_events ORDER BY id;';
+    lQuery.Open;
+    Result := (lQuery.RecordCount = 1) and
+      (lQuery.FieldByName('reason').AsWideString = aExpectedReason);
+    if not Result then
+      aErrorMessage := aExpectedReason + ' expiration database mismatch';
+  finally
+    g.Clear;
+  end;
+end;
+
 function VerifyObservedExpirationReason(const aRoot: string;
   const aMigrationDirectory: string; const aExpectedReason: string;
   out aErrorMessage: string): Boolean;
 var
   g: TGarbos;
-  lBootIdentity: TWindowsBootIdentity;
-  lCancelToken: iCancelToken;
   lConfig: TRenameJournalConfig;
   lConnection: TFDConnection;
-  lDatabaseFileName: string;
-  lDriverLink: TFDPhysSQLiteDriverLink;
-  lExpirations: TCaptionOverrideExpirations;
-  lQuery: TFDQuery;
   lState: TCaptionOverrideState;
   lTestWnd: HWND;
   lWriter: TRenameJournalWriter;
@@ -523,84 +624,40 @@ begin
   g := Default(TGarbos);
   Result := False;
   aErrorMessage := '';
-  lTestWnd := 0;
   try
-    if not TryGetWindowsBootIdentity(1000, False, lBootIdentity) then
-    begin
-      aErrorMessage := 'observed expiration self-test could not obtain boot identity';
-      Exit;
-    end;
-    lDatabaseFileName := TPath.Combine(aRoot, aExpectedReason + '-v5.db');
-    GC(lConnection, TFDConnection.Create(nil), g);
-    lDriverLink := TFDPhysSQLiteDriverLink.Create(lConnection);
-    lDriverLink.DriverID := 'SQLite';
-    ConfigureTestConnection(lDatabaseFileName, lConnection);
-    if not ApplyCanonicalShadowJournalMigrations(
-      lConnection,
-      aMigrationDirectory,
-      1,
-      5,
+    if not TryCreateObservedExpirationState(
+      aExpectedReason,
+      lState,
+      lTestWnd,
       aErrorMessage) then
       Exit;
-    lConnection.Connected := False;
-
-    SetLength(lState, 1);
-    lState[0].Caption := 'Observed expiration';
-    lState[0].CreatedAt := 1783900800400;
-    lState[0].UpdatedAt := 1783900800400;
-    lState[0].Reason := 'user_rename';
-    lState[0].Identity.HasBootId := True;
-    lState[0].Identity.BootId := lBootIdentity.UtcMilliseconds;
-    lState[0].Identity.ProcessId := High(Cardinal);
-    if aExpectedReason = 'identity_changed' then
-    begin
-      lTestWnd := CreateWindowEx(0, 'STATIC', 'IdentityChangedSelfTest', 0,
-        0, 0, 0, 0, 0, 0, HInstance, nil);
-      if lTestWnd = 0 then
-      begin
-        aErrorMessage := 'identity-change self-test could not create a real window';
-        Exit;
-      end;
-      lState[0].Identity.Hwnd := UInt64(NativeUInt(lTestWnd));
-    end else
-      lState[0].Identity.Hwnd := High(UInt64);
 
     lConfig := Default(TRenameJournalConfig);
     lConfig.Enabled := True;
-    lConfig.DatabaseFileName := lDatabaseFileName;
+    lConfig.DatabaseFileName := TPath.Combine(aRoot, aExpectedReason + '-v5.db');
     lConfig.OverrideStateFileName := TPath.Combine(
       aRoot,
       aExpectedReason + '-state.ini');
-    lCancelToken := TCancelToken.Create;
-    GC(lWriter, TRenameJournalWriter.Create(lConfig, lCancelToken), g);
-    if (not lWriter.SubmitOverrideState(lState)) or
-      (not lWriter.WaitForOverrideStatePersistence(5000)) or
-      (not WaitForWriterProgress(lWriter, 1, 0, 1)) then
-    begin
-      aErrorMessage := aExpectedReason + ' expiration was not persisted';
+    GC(lConnection, TFDConnection.Create(nil), g);
+    if not ApplyObservedExpirationMigration(
+      lConfig.DatabaseFileName,
+      aMigrationDirectory,
+      lConnection,
+      aErrorMessage) then
       Exit;
-    end;
-    if (not lWriter.TryTakeExpiredOverrides(lExpirations)) or
-      (Length(lExpirations) <> 1) or
-      (lExpirations[0].Reason <> aExpectedReason) then
-    begin
-      aErrorMessage := aExpectedReason + ' expiration notification mismatch';
-      Exit;
-    end;
-    lWriter.StopAndWait;
 
-    lConnection.Connected := True;
-    GC(lQuery, TFDQuery.Create(nil), g);
-    lQuery.Connection := lConnection;
-    lQuery.SQL.Text :=
-      'SELECT reason FROM window_caption_override_events ORDER BY id;';
-    lQuery.Open;
-    if (lQuery.RecordCount <> 1) or
-      (lQuery.FieldByName('reason').AsWideString <> aExpectedReason) then
-    begin
-      aErrorMessage := aExpectedReason + ' expiration database mismatch';
+    GC(lWriter, TRenameJournalWriter.Create(lConfig, TCancelToken.Create), g);
+    if not VerifyWriterExpiration(
+      lWriter,
+      lState,
+      aExpectedReason,
+      aErrorMessage) then
       Exit;
-    end;
+    if not VerifyStoredExpirationReason(
+      lConnection,
+      aExpectedReason,
+      aErrorMessage) then
+      Exit;
     Result := True;
   finally
     if lTestWnd <> 0 then
