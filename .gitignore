@@ -40,3 +40,9 @@ _analysis/
 /_build_verify
 /assets/
 .dak/
+.codex/
+.claude/
+.cursor/
+.gemini/
+.copilot/
+.windsurf/
