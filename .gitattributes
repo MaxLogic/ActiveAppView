@@ -12,6 +12,7 @@
 # Project config files should not store CRLF in Git; git diff --check treats it as trailing whitespace.
 .gitattributes text eol=lf
 *.ini      text eol=lf
+MachineOverviewHelp.txt text eol=crlf
 
 
 # Then normalize:

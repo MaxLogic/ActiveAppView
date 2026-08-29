@@ -18,6 +18,13 @@ All notable changes to this project are documented in this file.
 - Console window title polling now refreshes existing Console entries without forcing a full app scan on every timer tick.
 
 ### Added
+- Machine Overview can now capture an opt-in 15-second WPR incident trace with General and GPU profiles, unique-session cleanup, explicit requested/captured/failed/unavailable history state, and oldest-first 10-file/2-GB retention without blocking monitoring.
+- Machine Overview now reports WDDM busiest-engine GPU load, rolling averages and peaks, dedicated GPU memory, and optional age-stamped NVIDIA temperature/power and conservatively identified CPU package temperature with bounded provider failure handling.
+- Machine Overview's incident row now opens a keyboard-accessible 24-hour, 7-day, or complete history view with stable selection, full incident details, and explicit busy-database degradation.
+- Machine Overview now detects sustained CPU, logical-processor, DPC/interrupt, foreground-response, DWM, memory, disk, GPU, thermal, provider-health, and pipeline incidents with bounded context, deduplication, recovery, restart-safe history, user-marked points, and latest-incident summaries.
+- Machine Overview now keeps bounded executable-local SQLite history for system, disk, and ranked process samples, with 10-second/one-minute rollups, transactional migration backup, retention, storage caps, and fail-open diagnostics for locked or corrupt databases.
+- Machine Overview includes executable-local plain-text help in a keyboard-accessible modal dialog, with an explicit missing-file fallback and Debug/Release Win64 packaging.
+- A default-enabled Machine Overview panel now presents live machine health, CPU and memory context, responsiveness, disk status, and ranked processes in a named keyboard-accessible list with complete row and diagnostic copy commands plus display freeze/resume.
 - Successful window-caption Rename actions can now be written to Shadow Journal with their UTC timestamp, PID, HWND, and Unicode caption through the opt-in `[save-renames-to-journal]` settings.
 - Chat monitor now supports a PrefixMask-style review filter file (`ChatReviewMask.txt`), configured by `[ChatMonitor] ReviewMaskFile` in `settings.ini`.
 - Main form now includes a `Play chat notification sounds` checkbox that toggles chat sounds at runtime and persists to `[ChatMonitor] SoundEnabled`.
@@ -26,6 +33,9 @@ All notable changes to this project are documented in this file.
 - Scripts can now be hidden from the F3 Scripts list with a `Scripts\.ignore` file, one filename per line.
 
 ### Changed
+- Machine Overview now reports real 5/15/60-second and 15-minute rolling values for system and ranked-process metrics, labels process I/O with byte-correct rates, marks insufficient window coverage stale, ages cached provider state, and includes per-provider collection latency in diagnostic copies.
+- Machine Overview now packages the official Win64 SQLite 3.53.4 runtime and uses FireDAC dynamic linkage, satisfying the maintained-runtime requirement for WAL history.
+- Machine Overview now restores its DPI-scaled panel width across restarts and offers a layout-preserving Full View that returns every prior panel and splitter exactly.
 - Desktop recovery launchers now delegate to PowerShell scripts that discover NVDA, MouseBeam, and Logi Options+ paths at runtime instead of relying on fixed local paths.
 - Applications and Explorer lists now support window actions via context menu (`Close`, `Terminate`) and `Ctrl+W` on focused list items for normal close.
 - Post-close/post-terminate cleanup now retries process/window validation with increasing delays for up to 5 seconds, removing entries only after the target is actually gone; refocus still performs a quick stale-entry prune before full refresh.

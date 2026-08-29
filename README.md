@@ -8,7 +8,15 @@ Accessibility tool for active application / explorer quick selection
 - F4: Console instances
 - F6: Desktop
 - F7: ShortCuts
+- F8: Machine Overview
 - F5: Refresh all lists
+
+## Machine Overview
+
+- The rightmost panel shows current CPU, memory, GPU, responsiveness, disk, process, and incident signals. It is enabled by default and can be disabled with `[MachineOverview] Enabled=0` in `settings.ini`.
+- `F8` focuses the row list, `Ctrl+E` freezes or resumes display updates, and `Shift+F8` toggles Full View without changing the saved layout.
+- `Ctrl+C` copies the complete selected row. `Ctrl+Shift+C` copies a timestamped diagnostic snapshot. Enter on Incidents opens history, and `Alt+H` opens the shipped help.
+- Collection, incident detection, and bounded SQLite history run in the background. Freeze affects only visible updates; provider and history failures degrade to explicit stale/unavailable status without stopping live monitoring.
 
 ## TerminalPatterns.txt (next to ActiveAppView.exe)
 - One wildcard pattern per line (`*` and `?`), case-insensitive.

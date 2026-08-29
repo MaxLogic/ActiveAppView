@@ -5,10 +5,16 @@ interface
 uses
   System.Classes, System.Generics.Collections, System.SyncObjs, System.SysUtils, System.Variants,
   Winapi.Messages, Winapi.Windows,
-  Vcl.Buttons, Vcl.Controls, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.Forms, Vcl.Graphics, Vcl.Menus,
-  Vcl.StdCtrls,
+  Vcl.Buttons, Vcl.ComCtrls, Vcl.Controls, Vcl.Dialogs, Vcl.ExtCtrls, Vcl.Forms,
+  Vcl.Graphics, Vcl.Menus, Vcl.StdCtrls,
   CancelToken, maxAsync,
   ActiveAppView.CaptionOverrideState, ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache,
+  ActiveAppView.MachineOverview.Commands, ActiveAppView.MachineOverview.HelpForm,
+  ActiveAppView.MachineOverview.History, ActiveAppView.MachineOverview.HistoryForm,
+  ActiveAppView.MachineOverview.Layout,
+  ActiveAppView.MachineOverview.Service,
+  ActiveAppView.MachineOverview.Settings, ActiveAppView.MachineOverview.Types,
+  ActiveAppView.MachineOverview.View,
   ActiveAppViewCore, ActiveAppView.RenameJournal;
 
 type
@@ -47,6 +53,7 @@ type
     Splitter4: TSplitter;
     Splitter5: TSplitter;
     Splitter6: TSplitter;
+    splMachineOverview: TSplitter;
     pnlConsole: TPanel;
     labConsoleTitle: TStaticText;
     lbConsole: TListBox;
@@ -75,6 +82,13 @@ type
     edRelaunchCommand: TEdit;
     labRelaunchCommand: TStaticText;
     chkChatNotificationSound: TCheckBox;
+    pnlMachineOverview: TPanel;
+    labMachineOverviewTitle: TStaticText;
+    lvMachineOverview: TListView;
+    pnlMachineOverviewButtons: TPanel;
+    btnMachineOverviewFreeze: TButton;
+    btnMachineOverviewFullView: TButton;
+    btnMachineOverviewHelp: TButton;
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure FormActivate(Sender: TObject);
@@ -97,6 +111,9 @@ type
     procedure tmrChatMonitorTimer(Sender: TObject);
     procedure chkChatNotificationSoundClick(aSender: TObject);
     procedure FormResize(Sender: TObject);
+    procedure btnMachineOverviewFreezeClick(aSender: TObject);
+    procedure btnMachineOverviewFullViewClick(aSender: TObject);
+    procedure btnMachineOverviewHelpClick(aSender: TObject);
   private
 
     fApps: TAppList;
@@ -119,6 +136,15 @@ type
     fLastFormFocusTick: UInt64;
     fLastChatMonitorTick: UInt64;
     fLastWindowTitlePollingTick: UInt64;
+    fMachineOverviewEnabled: Boolean;
+    fMachineOverviewController: TMachineOverviewDisplayController;
+    fMachineOverviewDisplayRefreshIntervalMs: Cardinal;
+    fMachineOverviewHistoryDatabaseFileName: string;
+    fMachineOverviewLayout: TMachineOverviewLayoutController;
+    fLastMachineOverviewPublishedSequence: UInt64;
+    fLastMachineOverviewRefreshTick: UInt64;
+    fMachineOverviewService: IMachineOverviewService;
+    fMachineOverviewView: IMachineOverviewView;
     fPendingAuxSnapshot: TObject;
     fChatMonitorSnapshot: TArray<TChatAppSnapshot>;
     fSharedAppsSnapshot: TArray<TChatAppSnapshot>;
@@ -163,6 +189,15 @@ type
     procedure ApplyShortCutsSnapshot(const aItems: TNamedValueArray);
     function BuildAuxListsSnapshot: TObject;
     procedure MarkFormFocused;
+    procedure CopyMachineOverviewDiagnostics;
+    procedure CopyMachineOverviewSelectedRow;
+    function HandleMachineOverviewCommand(
+      const aCommand: TMachineOverviewCommand): Boolean;
+    procedure OpenMachineOverviewIncidentHistory;
+    procedure RefreshMachineOverview;
+    procedure SaveMachineOverviewLayout;
+    procedure SetMachineOverviewFullView(const aValue: Boolean);
+    procedure SetMachineOverviewFrozen(const aValue: Boolean);
     procedure OnAuxListsRefreshDone;
     procedure OnChatMonitorDone;
     procedure OnDeepPrefixLoadDone;
@@ -264,6 +299,7 @@ implementation
 uses
   System.DateUtils, System.Diagnostics, System.IniFiles, System.IOUtils, System.StrUtils, System.Threading,
   Winapi.ActiveX, Winapi.KnownFolders, Winapi.MMSystem, Winapi.ShellAPI, Winapi.ShlObj,
+  Vcl.Clipbrd,
   AutoFree, maxCallMeLater, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils, maxLogic.Windows.Desktop,
   MaxLogic.Windows.Identity,
   ActiveAppView.Launcher;
@@ -337,6 +373,10 @@ resourcestring
   rsDialogCancel = 'Cancel';
   rsDialogOk = 'OK';
   rsLaunchFailed = 'Failed to launch item: %s';
+  rsMachineOverviewFreeze = 'Freeze display (Ctrl+E)';
+  rsMachineOverviewFullView = 'Full View (Shift+F8)';
+  rsMachineOverviewResume = 'Resume display (Ctrl+E)';
+  rsMachineOverviewRestoreView = 'Restore View (Shift+F8)';
   rsWindowActionClose = 'Close';
   rsWindowActionRename = 'Rename';
   rsWindowActionReset = 'Reset';
@@ -1205,6 +1245,15 @@ begin
 
   if (Result = 0) or (aChatMonitorIntervalMs < Result) then
     Result := aChatMonitorIntervalMs;
+end;
+
+function ShouldEnableSharedTimer(const aWindowTitlePollingIntervalMs: Cardinal;
+  const aChatMonitorEnabled: Boolean; const aChatMonitorIntervalMs: Cardinal;
+  const aMachineOverviewEnabled: Boolean): Boolean;
+begin
+  Result := aMachineOverviewEnabled or
+    (CalculateSharedTimerIntervalMs(aWindowTitlePollingIntervalMs,
+      aChatMonitorEnabled, aChatMonitorIntervalMs) <> 0);
 end;
 
 function IsTimedActionDue(const aNowTick: UInt64; const aLastTick: UInt64;
@@ -2472,10 +2521,11 @@ begin
           LogStartupTiming('Warmup.SynchronizeUi');
           if TInterlocked.CompareExchange(fStartupProfileWarmupDoneLogged, 1, 0) = 0 then
             LogStartupTiming('Warmup.Done');
-          tmrChatMonitor.Enabled := CalculateSharedTimerIntervalMs(
+          tmrChatMonitor.Enabled := ShouldEnableSharedTimer(
             fWindowTitlePollingIntervalMs,
             fChatMonitorConfiguredEnabled,
-            fChatMonitorIntervalMs) <> 0;
+            fChatMonitorIntervalMs,
+            fMachineOverviewEnabled);
           StartDeepPrefixLoad;
           UpdateGui;
         end);
@@ -2617,10 +2667,11 @@ begin
   if TInterlocked.CompareExchange(fStartupProfileWarmupDoneLogged, 1, 0) = 0 then
     LogStartupTiming('Warmup.Done');
 
-  tmrChatMonitor.Enabled := CalculateSharedTimerIntervalMs(
+  tmrChatMonitor.Enabled := ShouldEnableSharedTimer(
     fWindowTitlePollingIntervalMs,
     fChatMonitorConfiguredEnabled,
-    fChatMonitorIntervalMs) <> 0;
+    fChatMonitorIntervalMs,
+    fMachineOverviewEnabled);
   StartDeepPrefixLoad;
   QueueGuiRefresh;
 end;
@@ -2969,6 +3020,9 @@ function TAppsViewMainFrm.ColumnLayoutAvailableWidth: Integer;
 begin
   Result := ClientWidth - ControlLayoutWidth(Splitter1) - ControlLayoutWidth(Splitter3) -
     ControlLayoutWidth(Splitter4) - ControlLayoutWidth(Splitter5) - ControlLayoutWidth(Splitter6);
+  if pnlMachineOverview.Visible then
+    Dec(Result, ControlLayoutWidth(splMachineOverview) +
+      ControlLayoutWidth(pnlMachineOverview));
   if Result < 0 then
     Result := 0;
 end;
@@ -2980,10 +3034,144 @@ begin
     Inc(Result, aControl.Margins.Left + aControl.Margins.Right);
 end;
 
+procedure TAppsViewMainFrm.btnMachineOverviewFreezeClick(aSender: TObject);
+begin
+  if Assigned(fMachineOverviewController) then
+    SetMachineOverviewFrozen(not fMachineOverviewController.Frozen);
+end;
+
+procedure TAppsViewMainFrm.btnMachineOverviewFullViewClick(aSender: TObject);
+begin
+  if Assigned(fMachineOverviewLayout) then
+    SetMachineOverviewFullView(not fMachineOverviewLayout.FullView);
+end;
+
+procedure TAppsViewMainFrm.btnMachineOverviewHelpClick(aSender: TObject);
+begin
+  ShowMachineOverviewHelp(Self, GetInstallDir);
+end;
+
+procedure TAppsViewMainFrm.CopyMachineOverviewDiagnostics;
+var
+  lText: string;
+begin
+  if not Assigned(fMachineOverviewController) then
+    Exit;
+  lText := fMachineOverviewController.FullDiagnosticCopyText;
+  if not lText.IsEmpty then
+    Clipboard.AsText := lText;
+end;
+
+procedure TAppsViewMainFrm.CopyMachineOverviewSelectedRow;
+var
+  lText: string;
+begin
+  if not Assigned(fMachineOverviewController) then
+    Exit;
+  lText := fMachineOverviewController.SelectedRowCopyText;
+  if not lText.IsEmpty then
+    Clipboard.AsText := lText;
+end;
+
+procedure TAppsViewMainFrm.OpenMachineOverviewIncidentHistory;
+begin
+  ShowMachineOverviewIncidentHistory(Self,
+    fMachineOverviewHistoryDatabaseFileName);
+  if lvMachineOverview.CanFocus then
+    lvMachineOverview.SetFocus;
+end;
+
+function TAppsViewMainFrm.HandleMachineOverviewCommand(
+  const aCommand: TMachineOverviewCommand): Boolean;
+begin
+  Result := fMachineOverviewEnabled and Assigned(fMachineOverviewController) and
+    Assigned(fMachineOverviewLayout);
+  if not Result then
+    Exit;
+  case aCommand of
+    TMachineOverviewCommand.FocusPanel:
+      lvMachineOverview.SetFocus;
+    TMachineOverviewCommand.ToggleFullView:
+      SetMachineOverviewFullView(not fMachineOverviewLayout.FullView);
+    TMachineOverviewCommand.ToggleDisplayFrozen:
+      SetMachineOverviewFrozen(not fMachineOverviewController.Frozen);
+    TMachineOverviewCommand.CopySelectedRow:
+    begin
+      Result := pnlMachineOverview.ContainsControl(ActiveControl);
+      if Result then
+        CopyMachineOverviewSelectedRow;
+    end;
+    TMachineOverviewCommand.CopyFullDiagnostics:
+    begin
+      Result := pnlMachineOverview.ContainsControl(ActiveControl);
+      if Result then
+        CopyMachineOverviewDiagnostics;
+    end;
+  else
+    Result := False;
+  end;
+end;
+
+procedure TAppsViewMainFrm.RefreshMachineOverview;
+var
+  lPresentation: TMachineOverviewPresentation;
+begin
+  if (not fMachineOverviewEnabled) or
+    (not Assigned(fMachineOverviewController)) or
+    (not Assigned(fMachineOverviewService)) then
+    Exit;
+  if fMachineOverviewService.TryReadLatestPresentation(
+    fLastMachineOverviewPublishedSequence, lPresentation) then
+  begin
+    fLastMachineOverviewPublishedSequence := lPresentation.Sequence;
+    fMachineOverviewController.Publish(lPresentation);
+  end;
+end;
+
+procedure TAppsViewMainFrm.SetMachineOverviewFrozen(const aValue: Boolean);
+begin
+  if not Assigned(fMachineOverviewController) then
+    Exit;
+  fMachineOverviewController.SetFrozen(aValue);
+  if aValue then
+    btnMachineOverviewFreeze.Caption := rsMachineOverviewResume
+  else
+    btnMachineOverviewFreeze.Caption := rsMachineOverviewFreeze;
+end;
+
+procedure TAppsViewMainFrm.SaveMachineOverviewLayout;
+begin
+  if (not fMachineOverviewEnabled) or
+    (not Assigned(fMachineOverviewLayout)) then
+    Exit;
+  try
+    SaveMachineOverviewPanelWidthToFile(CombinePath(
+      [GetInstallDir, cSettingsFileName]),
+      fMachineOverviewLayout.PanelWidthForPersistence, CurrentPPI);
+  except
+    on lException: Exception do
+      LogStartupTiming('MachineOverview.LayoutSaveFailed',
+        lException.ClassName + ': ' + lException.Message);
+  end;
+end;
+
+procedure TAppsViewMainFrm.SetMachineOverviewFullView(const aValue: Boolean);
+begin
+  if not Assigned(fMachineOverviewLayout) then
+    Exit;
+  if aValue <> fMachineOverviewLayout.FullView then
+    fMachineOverviewLayout.ToggleFullView;
+  if aValue then
+    btnMachineOverviewFullView.Caption := rsMachineOverviewRestoreView
+  else
+    btnMachineOverviewFullView.Caption := rsMachineOverviewFullView;
+end;
+
 procedure TAppsViewMainFrm.FormCreate(Sender: TObject);
 var
   lChatMonitorCheckSeconds: Integer;
   lIniFile: TMemIniFile;
+  lMachineOverviewSettings: TMachineOverviewSettings;
   lTimerIntervalMs: Cardinal;
   lWindowTitlePollingSeconds: Integer;
 begin
@@ -3015,6 +3203,7 @@ begin
   labConsoleTitle.Height := labTemplateActiv.Height;
   labDesktopTitle.Height := labTemplateActiv.Height;
   labShortCutsTitle.Height := labTemplateActiv.Height;
+  labMachineOverviewTitle.Height := labTemplateActiv.Height;
   ActiveControlChanged(nil);
   ApplyProportionalColumnWidths;
   lbConsole.Sorted := False;
@@ -3023,6 +3212,29 @@ begin
 
   gc(lIniFile, TMemIniFile.Create(CombinePath([GetInstallDir, cSettingsFileName]), TEncoding.Utf8, False));
   fShutdownToken := TCancelToken.Create;
+  lMachineOverviewSettings := LoadMachineOverviewSettings(lIniFile);
+  lMachineOverviewSettings.HistoryDatabaseFileName :=
+    MachineOverviewHistoryDatabasePath(GetInstallDir);
+  fMachineOverviewHistoryDatabaseFileName :=
+    lMachineOverviewSettings.HistoryDatabaseFileName;
+  fMachineOverviewEnabled := lMachineOverviewSettings.Enabled;
+  fMachineOverviewDisplayRefreshIntervalMs := Cardinal(
+    lMachineOverviewSettings.DisplayRefreshIntervalMs);
+  fLastMachineOverviewPublishedSequence := 0;
+  fLastMachineOverviewRefreshTick := 0;
+  pnlMachineOverview.Width := ScaleMachineOverviewPanelWidth(
+    lMachineOverviewSettings.PanelWidth, CurrentPPI);
+  pnlMachineOverview.Visible := fMachineOverviewEnabled;
+  splMachineOverview.Visible := fMachineOverviewEnabled;
+  fMachineOverviewView := CreateMachineOverviewView(lvMachineOverview);
+  fMachineOverviewController := TMachineOverviewDisplayController.Create(
+    fMachineOverviewView);
+  fMachineOverviewLayout := TMachineOverviewLayoutController.Create(
+    [pnlApps, Splitter1, pnlExplorer, Splitter3, pnlScripts, Splitter4,
+     pnlConsole, Splitter5, pnlDesktop, Splitter6, pnlShortCuts],
+    pnlMachineOverview, splMachineOverview, lvMachineOverview);
+  fMachineOverviewService := CreateMachineOverviewService(lMachineOverviewSettings);
+  fMachineOverviewService.Start;
   fRenameJournalConfig := LoadRenameJournalConfig(lIniFile);
   fRenameJournalConfig.OverrideStateFileName := CombinePath(
     [GetInstallDir, cWindowCaptionOverridesFileName]);
@@ -3047,6 +3259,10 @@ begin
     fWindowTitlePollingIntervalMs,
     fChatMonitorConfiguredEnabled,
     fChatMonitorIntervalMs);
+  if fMachineOverviewEnabled and
+    ((lTimerIntervalMs = 0) or
+     (fMachineOverviewDisplayRefreshIntervalMs < lTimerIntervalMs)) then
+    lTimerIntervalMs := fMachineOverviewDisplayRefreshIntervalMs;
   if lTimerIntervalMs <> 0 then
     tmrChatMonitor.Interval := lTimerIntervalMs;
   tmrChatMonitor.Enabled := False;
@@ -3068,8 +3284,11 @@ begin
 end;
 
 procedure TAppsViewMainFrm.FormDestroy(Sender: TObject);
+var
+  lShutdownResult: TMachineOverviewShutdownResult;
 begin
   LogStartupTiming('FormDestroy.Start');
+  SaveMachineOverviewLayout;
   TInterlocked.Exchange(fShuttingDown, 1);
   if Assigned(fShutdownToken) then
     fShutdownToken.Cancel;
@@ -3083,6 +3302,12 @@ begin
   RequestAsyncStop(fChatMonitorTask);
   RequestAsyncStop(fDeepPrefixLoadTask);
   RequestAsyncStop(fStartupDataLoadTask);
+  if Assigned(fMachineOverviewService) then
+  begin
+    lShutdownResult := fMachineOverviewService.Stop(cShutdownTaskWaitTimeoutMs);
+    if lShutdownResult = TMachineOverviewShutdownResult.TimedOut then
+      LogStartupTiming('MachineOverview.Shutdown', 'bounded shutdown timed out');
+  end;
   FreeAndNil(fRenameJournalWriter);
 
   WaitAsyncWithShutdown(fAuxListRefresh, cShutdownTaskWaitTimeoutMs);
@@ -3095,6 +3320,10 @@ begin
   fChatMonitorTask := nil;
   fDeepPrefixLoadTask := nil;
   fStartupDataLoadTask := nil;
+  fMachineOverviewService := nil;
+  FreeAndNil(fMachineOverviewLayout);
+  FreeAndNil(fMachineOverviewController);
+  fMachineOverviewView := nil;
   fShutdownToken := nil;
   ClearListBoxItemData(lbDesktop);
   ClearListBoxItemData(lbShortCuts);
@@ -3111,9 +3340,29 @@ end;
 
 procedure TAppsViewMainFrm.FormKeyUp(Sender: TObject; var Key: Word;
   Shift: TShiftState);
+var
+  lMachineOverviewCommand: TMachineOverviewCommand;
 begin
   if (Key = VK_F4) and ((GetTickCount64 - fLastFormFocusTick) < cIgnoreF4AfterFocusMs) then
   begin
+    Key := 0;
+    Exit;
+  end;
+
+  lMachineOverviewCommand := ResolveMachineOverviewCommand(Key, Shift);
+  if (lMachineOverviewCommand <> TMachineOverviewCommand.None) and
+    HandleMachineOverviewCommand(lMachineOverviewCommand) then
+  begin
+    Key := 0;
+    Exit;
+  end;
+
+  if (Key = VK_RETURN) and (Shift = []) and fMachineOverviewEnabled and
+    (ActiveControl = lvMachineOverview) and Assigned(fMachineOverviewView) and
+    ShouldOpenMachineOverviewIncidentHistory(
+      fMachineOverviewView.SelectedRowId) then
+  begin
+    OpenMachineOverviewIncidentHistory;
     Key := 0;
     Exit;
   end;
@@ -3136,6 +3385,8 @@ end;
 
 procedure TAppsViewMainFrm.FormResize(Sender: TObject);
 begin
+  if Assigned(fMachineOverviewLayout) and fMachineOverviewLayout.FullView then
+    Exit;
   ApplyProportionalColumnWidths;
 end;
 
@@ -3146,6 +3397,7 @@ begin
 
   LogStartupTiming('FormShow');
   ApplyProportionalColumnWidths;
+  RefreshMachineOverview;
   StartAuxListsRefresh;
   StartStartupDataLoad;
   QueueGuiRefresh;
@@ -3977,6 +4229,11 @@ begin
       Writeln('SELFTEST FAILED: shared timer should be disabled when no timed feature is active');
       Result := 1;
     end;
+    if not ShouldEnableSharedTimer(0, False, 30000, True) then
+    begin
+      Writeln('SELFTEST FAILED: Machine Overview should keep the shared timer enabled');
+      Result := 1;
+    end;
     if not IsTimedActionDue(10000, 4000, 5000) then
     begin
       Writeln('SELFTEST FAILED: timed action should be due after elapsed interval');
@@ -4549,6 +4806,13 @@ begin
     Exit;
 
   lNowTick := GetTickCount64;
+  if fMachineOverviewEnabled and IsTimedActionDue(lNowTick,
+    fLastMachineOverviewRefreshTick,
+    fMachineOverviewDisplayRefreshIntervalMs) then
+  begin
+    fLastMachineOverviewRefreshTick := lNowTick;
+    RefreshMachineOverview;
+  end;
   if IsTimedActionDue(lNowTick, fLastWindowTitlePollingTick, fWindowTitlePollingIntervalMs) then
   begin
     fLastWindowTitlePollingTick := lNowTick;

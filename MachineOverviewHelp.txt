@@ -1,0 +1,77 @@
+MACHINE OVERVIEW HELP
+
+Purpose
+
+Machine Overview provides a lightweight, always-available view of current Windows machine health. It combines CPU, memory, GPU, responsiveness, disk, process, and incident signals so we can see likely pressure without opening several diagnostic tools.
+
+Its purpose is triage, not exact root-cause analysis. Lightweight counters have limitations: they can show that a stall, queue, interrupt, or DPC load is suspicious, but they cannot always identify the responsible driver or operation. Missing providers are reported as unavailable rather than treated as machine failure. False positives remain possible when a short workload crosses an automatic incident threshold.
+
+Sampling and display refresh
+
+Collection and display refresh run at different frequencies. System samples are normally collected every 1 second, process samples every 2 seconds, and optional temperature samples every 3 seconds. The panel normally replaces its visible snapshot every 10 seconds. History commits are batched at roughly 10-second intervals, so no synchronous disk write occurs for every sample.
+
+Changing DisplayRefreshIntervalMs changes only how often the panel renders the newest immutable snapshot. It does not change collection frequency. Display refresh is clamped to 2 through 60 seconds.
+
+Controls and shortcuts
+
+F8 focuses the Machine Overview row list.
+
+Ctrl+E toggles Freeze display and Resume display. Freeze holds the visible rows only. Sampling, aggregation, incident detection, and history continue. Resume jumps directly to the newest snapshot.
+
+Shift+F8 toggles Full View and Restore View. Full View hides the other panels and splitters and gives the client area to Machine Overview. Restore View returns their exact prior visibility and widths. Full View is not saved across restart.
+
+Alt+H or the Help button opens this dialog. The help text is selectable. Ctrl+C copies the selected help text, Escape closes the dialog, and Tab moves between the text and Close button.
+
+Up and Down move through rows. Enter on the Incidents row opens incident history. Enter on other rows has no special action.
+
+Ctrl+C in the Machine Overview panel copies the selected row's complete label and value, including text clipped on screen. Ctrl+Shift+C copies a timestamped full diagnostic snapshot with all rows, provider state and age, provider collection latency, logical-processor values, queue and drop counters, SQLite status, monitor overhead, incidents, and process path status.
+
+Time values
+
+Now is the newest accepted sample. Average is the arithmetic average over the named covered window. Peak is the highest one-second sample in that window. CPU and GPU summaries use 5, 15, and 60 seconds. A value is marked stale when its provider has not supplied a sufficiently recent sample or rolling-window coverage is below 80 percent. A value is unavailable when the provider, permission, counter, or hardware support is absent.
+
+CPU
+
+Total CPU is normalized to the whole machine and remains between 0 and 100 percent. Per-process CPU is also normalized to the whole machine; it is not multiplied by the logical-processor count. A hot logical processor is one whose covered 5-second average is at least 80 percent. The row reports the current total, hot logical processors, averages, one-second peaks, and package temperature when an optional provider is available.
+
+Memory
+
+Physical memory is installed RAM currently in use. Available memory is RAM Windows can provide without first paging occupied data. Commit is virtual memory committed against RAM and page files. Paging is the current and peak transfer rate caused by paging activity. Process RAM ranking uses private working set, which is memory currently resident and private to that process.
+
+GPU
+
+GPU engine load is the busiest WDDM engine percentage, not a sum of engines that could exceed 100 percent. The row includes now, 5/15/60-second average and peak values, dedicated memory use, and provider age. GPU temperature and power are optional. Provider availability is explicit when WDDM, NVIDIA, temperature, or permission support is missing.
+
+Disks and volumes
+
+Disk active time is the percentage of time a physical disk is servicing requests. Throughput is read and write MB/s. Latency is request time in milliseconds. Queue length is outstanding work. The disk summary chooses the worst current physical disk using latency, queue length, active time, and supporting throughput instead of calling high throughput unhealthy by itself. Each physical-disk row also reports capacity for every mapped volume, including volumes without drive letters when Windows exposes them.
+
+Responsiveness
+
+Foreground reply time is the bounded response time of the current foreground window. A timeout is reported without blocking ActiveAppView. DPC and interrupts are processor time spent servicing deferred procedure calls and hardware interrupts. DWM missed frames indicate desktop-composition delivery gaps. Processor queue is work waiting for CPU service. These signals provide context; they do not by themselves name the faulty driver or application.
+
+Process rankings
+
+The five CPU, RAM, and I/O ranks use stable rank rows. CPU is whole-machine percent now, 15-second average, and 60-second peak. RAM uses private working set and its recent peak. I/O is combined read/write MB/s now, 15-second average, and 60-second peak. PID and process name are included. Executable paths are best effort and use least-privilege process access; a denied or unavailable path is omitted from the visible row and recorded as path status in the diagnostic copy.
+
+Incidents
+
+Automatic incident detection uses named thresholds, hysteresis, and recovery periods so one sustained condition creates one incident. Severity words appear in text and are not conveyed by color alone. Incidents retain UTC and local time, the threshold explanation, provider freshness, peaks, related processes or disks, up to 5 minutes of available pre-context, and 10 minutes of post-context.
+
+The Incidents row shows the last-24-hour count and the three newest summaries. Enter opens the history view. Its filters are Last 24 hours, Last 7 days, and All, ordered newest first. Freeze display does not freeze incident detection or history.
+
+History and storage
+
+HistoryEnabled controls persistence. Raw one-second system and disk samples are retained for 48 hours, 10-second rollups for 30 days, and one-minute rollups for 365 days. Ranked process snapshots and incident context are stored; every process is not written every second. The default approximate database cap is 2,048 MB.
+
+The history database is MachineOverviewHistory.db next to ActiveAppView.exe. It uses the packaged Win64 SQLite 3.53.4 runtime, one background writer, WAL mode, synchronous=NORMAL, prepared batched transactions, bounded retry/backlog behavior, and small retention batches. If the database is busy, corrupt, or unavailable, live monitoring continues and the diagnostics report the failure. The active path does not run periodic VACUUM.
+
+DetailedTraceEnabled is off by default. When enabled, a DPC/ISR incident or a critical automatic incident can request one 15-second WPR trace. ActiveAppView combines the Windows General and GPU profiles so the trace contains CPU scheduling, context switches, DPC/ISR, disk, process/thread, and supported GPU events and stacks. Windows must grant the Profile system performance right; otherwise the incident records Trace: Unavailable without requiring ActiveAppView to elevate. WPA-compatible ETL files are saved under the MachineOverviewTraces directory next to ActiveAppView.exe. They can contain sensitive system activity. Retention keeps at most 10 ETL traces and 2 GB total, deleting the oldest trace files first.
+
+Privacy and information not stored
+
+Normal Machine Overview history does not store window titles, command-line arguments, typed text, clipboard contents, or keystrokes. It may store executable name, PID, process creation time, best-effort executable path, ranked values, incident context, and provider errors. Copied diagnostics use the same privacy boundary and sanitize unrelated error text.
+
+Settings
+
+Machine Overview is enabled by default and uses the [MachineOverview] section in settings.ini next to ActiveAppView.exe. Set Enabled=0 to disable its panel and workers. The supported keys are Enabled, DisplayRefreshIntervalMs, PanelWidth, SystemSampleIntervalMs, ProcessSampleIntervalMs, TemperatureSampleIntervalMs, HistoryCommitIntervalMs, HistoryEnabled, RawRetentionHours, Rollup10sRetentionDays, Rollup1mRetentionDays, MaxDatabaseSizeMB, and DetailedTraceEnabled. DisplayFrozen and FullView are deliberately not persisted. PanelWidth is saved as a logical 96-DPI width and scaled for the current monitor.

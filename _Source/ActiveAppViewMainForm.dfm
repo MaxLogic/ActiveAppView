@@ -55,6 +55,15 @@ object AppsViewMainFrm: TAppsViewMainFrm
     Height = 847
     Align = alRight
   end
+  object splMachineOverview: TSplitter
+    AlignWithMargins = True
+    Left = 2497
+    Top = 3
+    Height = 847
+    Align = alRight
+    MinSize = 240
+    Visible = False
+  end
   object pnlApps: TPanel
     Left = 0
     Top = 0
@@ -669,6 +678,98 @@ object AppsViewMainFrm: TAppsViewMainFrm
       ParentBackground = False
       ShowCaption = False
       TabOrder = 3
+    end
+  end
+  object pnlMachineOverview: TPanel
+    Left = 2500
+    Top = 0
+    Width = 420
+    Height = 853
+    Align = alRight
+    BevelOuter = bvNone
+    Caption = 'Machine Overview'
+    Color = clWindow
+    Constraints.MinWidth = 240
+    ParentBackground = False
+    ShowCaption = False
+    TabOrder = 6
+    Visible = False
+    object labMachineOverviewTitle: TStaticText
+      AlignWithMargins = True
+      Left = 3
+      Top = 3
+      Width = 414
+      Height = 34
+      Align = alTop
+      AutoSize = False
+      Caption = 'Machine Overview (F8)'
+      TabOrder = 0
+    end
+    object lvMachineOverview: TListView
+      AlignWithMargins = True
+      Left = 3
+      Top = 43
+      Width = 414
+      Height = 758
+      Align = alClient
+      Columns = <
+        item
+          Caption = 'Machine status'
+          Width = 390
+        end>
+      ColumnClick = False
+      HideSelection = False
+      ReadOnly = True
+      RowSelect = True
+      TabOrder = 1
+      ViewStyle = vsReport
+    end
+    object pnlMachineOverviewButtons: TPanel
+      AlignWithMargins = True
+      Left = 3
+      Top = 807
+      Width = 414
+      Height = 43
+      Align = alBottom
+      BevelOuter = bvNone
+      Caption = 'Machine Overview commands'
+      Color = clWindow
+      ParentBackground = False
+      ShowCaption = False
+      TabOrder = 2
+      object btnMachineOverviewFreeze: TButton
+        AlignWithMargins = True
+        Left = 3
+        Top = 3
+        Width = 140
+        Height = 37
+        Align = alLeft
+        Caption = 'Freeze display (Ctrl+E)'
+        TabOrder = 0
+        OnClick = btnMachineOverviewFreezeClick
+      end
+      object btnMachineOverviewFullView: TButton
+        AlignWithMargins = True
+        Left = 149
+        Top = 3
+        Width = 170
+        Height = 37
+        Align = alLeft
+        Caption = 'Full View (Shift+F8)'
+        TabOrder = 1
+        OnClick = btnMachineOverviewFullViewClick
+      end
+      object btnMachineOverviewHelp: TButton
+        AlignWithMargins = True
+        Left = 325
+        Top = 3
+        Width = 86
+        Height = 37
+        Align = alClient
+        Caption = '&Help'
+        TabOrder = 2
+        OnClick = btnMachineOverviewHelpClick
+      end
     end
   end
   object tmrChatMonitor: TTimer
