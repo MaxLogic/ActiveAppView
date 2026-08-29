@@ -139,20 +139,57 @@
         <DelphiCompile Include="$(MainSource)">
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
+        <DCCReference Include="ActiveAppView.CaptionOverrideState.pas"/>
+        <DCCReference Include="ActiveAppView.CaptionOverrideState.SelfTests.pas"/>
+        <DCCReference Include="ActiveAppView.ChatMonitor.pas"/>
+        <DCCReference Include="ActiveAppView.ConfigCache.pas"/>
+        <DCCReference Include="ActiveAppView.Launcher.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.BoundedProcess.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Commands.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.DiskProvider.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Domain.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.GpuProvider.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.HelpForm.pas">
+            <Form>MachineOverviewHelpFrm</Form>
+            <FormType>dfm</FormType>
+        </DCCReference>
+        <DCCReference Include="ActiveAppView.MachineOverview.History.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.History.SelfTests.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.HistoryForm.pas">
+            <Form>MachineOverviewHistoryFrm</Form>
+            <FormType>dfm</FormType>
+        </DCCReference>
+        <DCCReference Include="ActiveAppView.MachineOverview.HistoryForm.SelfTests.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Incidents.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Incidents.SelfTests.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Layout.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.OptionalProviders.SelfTests.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Pipeline.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Presentation.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.ProcessProvider.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Providers.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.SelfTests.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Service.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Settings.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.SystemCollector.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.TemperatureProvider.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Trace.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Trace.SelfTests.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Types.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.View.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.WindowsProviders.pas"/>
+        <DCCReference Include="ActiveAppView.RenameJournal.pas"/>
+        <DCCReference Include="ActiveAppView.RenameJournal.SelfTests.pas"/>
+        <DCCReference Include="ActiveAppView.SelfTests.pas"/>
+        <DCCReference Include="ActiveAppViewCore.pas"/>
         <DCCReference Include="ActiveAppViewMainForm.pas">
             <Form>AppsViewMainFrm</Form>
             <FormType>dfm</FormType>
         </DCCReference>
-        <DCCReference Include="ActiveAppViewCore.pas"/>
-        <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\maxLogic.Windows.Desktop.pas"/>
-        <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\MaxLogic.StrUtils.pas"/>
-        <DCCReference Include="ActiveAppView.ChatMonitor.pas"/>
-        <DCCReference Include="ActiveAppView.RenameJournal.pas"/>
-        <DCCReference Include="ActiveAppView.RenameJournal.SelfTests.pas"/>
-        <DCCReference Include="ActiveAppView.CaptionOverrideState.pas"/>
-        <DCCReference Include="ActiveAppView.CaptionOverrideState.SelfTests.pas"/>
-        <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\MaxLogic.Windows.Identity.pas"/>
         <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\MaxLogic.MadExcept.AiRunner.pas"/>
+        <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\MaxLogic.StrUtils.pas"/>
+        <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\maxLogic.Windows.Desktop.pas"/>
+        <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\MaxLogic.Windows.Identity.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
             <DependentOn>..\..\MaxLogic\MaxLogicFoundation\MaxLogicDefault.optset</DependentOn>
@@ -186,6 +223,30 @@
                 <DeployFile LocalName="..\ActiveAppView.exe" Configuration="Debug" Class="ProjectOutput">
                     <Platform Name="Win32">
                         <RemoteName>ActiveAppView.exe</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="..\MachineOverviewHelp.txt" Configuration="Debug" Class="File">
+                    <Platform Name="Win64">
+                        <RemoteName>MachineOverviewHelp.txt</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="..\MachineOverviewHelp.txt" Configuration="Release" Class="File">
+                    <Platform Name="Win64">
+                        <RemoteName>MachineOverviewHelp.txt</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="ThirdParty\SQLite\Win64\sqlite3.dll" Configuration="Debug" Class="File">
+                    <Platform Name="Win64">
+                        <RemoteName>sqlite3.dll</RemoteName>
+                        <Overwrite>true</Overwrite>
+                    </Platform>
+                </DeployFile>
+                <DeployFile LocalName="ThirdParty\SQLite\Win64\sqlite3.dll" Configuration="Release" Class="File">
+                    <Platform Name="Win64">
+                        <RemoteName>sqlite3.dll</RemoteName>
                         <Overwrite>true</Overwrite>
                     </Platform>
                 </DeployFile>
@@ -1141,4 +1202,10 @@
     <Import Project="$(BDS)\Bin\CodeGear.Delphi.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Delphi.Targets')"/>
     <Import Project="$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj" Condition="Exists('$(APPDATA)\Embarcadero\$(BDSAPPDATABASEDIR)\$(PRODUCTVERSION)\UserTools.proj')"/>
     <Import Project="$(MSBuildProjectName).deployproj" Condition="Exists('$(MSBuildProjectName).deployproj')"/>
+    <Target Name="CopyMachineOverviewHelp" AfterTargets="Build" Condition="'$(DCC_ExeOutput)' != '..\' and Exists('$(MSBuildProjectDirectory)\..\MachineOverviewHelp.txt')">
+        <Copy SourceFiles="$(MSBuildProjectDirectory)\..\MachineOverviewHelp.txt" DestinationFolder="$(DCC_ExeOutput)" SkipUnchangedFiles="true"/>
+    </Target>
+    <Target Name="CopyMachineOverviewSQLite" AfterTargets="Build" Condition="Exists('$(MSBuildProjectDirectory)\ThirdParty\SQLite\Win64\sqlite3.dll')">
+        <Copy SourceFiles="$(MSBuildProjectDirectory)\ThirdParty\SQLite\Win64\sqlite3.dll" DestinationFolder="$(DCC_ExeOutput)" SkipUnchangedFiles="true"/>
+    </Target>
 </Project>

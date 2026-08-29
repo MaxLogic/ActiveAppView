@@ -10,7 +10,8 @@ uses
   System.Classes, System.Diagnostics, System.IniFiles, System.IOUtils, System.SysUtils,
   Winapi.Windows,
   ActiveAppView.CaptionOverrideState.SelfTests, ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache,
-  ActiveAppViewCore, ActiveAppView.Launcher, ActiveAppView.RenameJournal.SelfTests,
+  ActiveAppView.MachineOverview.SelfTests, ActiveAppViewCore, ActiveAppView.Launcher,
+  ActiveAppView.RenameJournal.SelfTests,
   ActiveAppViewMainForm, maxLogic.Windows.Desktop;
 
 const
@@ -281,6 +282,10 @@ end;
 
 function RunSelfTests: Integer;
 begin
+  Result := RunMachineOverviewSelfTests(ParamStr(1));
+  if Result <> -1 then
+    Exit;
+
   Result := RunCaptionOverrideStateSelfTests(ParamStr(1));
   if Result <> -1 then
   begin

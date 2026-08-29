@@ -34,6 +34,9 @@ __recovery
 /ShortCuts.txt
 /PrefixMask.txt
 /WindowCaptionOverrides.ini
+/MachineOverviewHistory.db*
+/MachineOverviewTraces/
+!/_Source/ThirdParty/SQLite/Win64/sqlite3.dll
 _analysis/
 .agent/
 .agents/
