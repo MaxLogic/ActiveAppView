@@ -10,7 +10,7 @@ uses
   System.Classes, System.Diagnostics, System.IniFiles, System.IOUtils, System.SysUtils,
   Winapi.Windows,
   ActiveAppView.CaptionOverrideState.SelfTests, ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache,
-  ActiveAppView.MachineOverview.SelfTests, ActiveAppViewCore, ActiveAppView.Launcher,
+  ActiveAppView.FocusSound, ActiveAppView.MachineOverview.SelfTests, ActiveAppViewCore, ActiveAppView.Launcher,
   ActiveAppView.RenameJournal.SelfTests,
   ActiveAppViewMainForm, maxLogic.Windows.Desktop;
 
@@ -299,6 +299,10 @@ begin
     Exit;
 
   Result := RunLauncherSelfTests(ParamStr(1));
+  if Result <> -1 then
+    Exit;
+
+  Result := RunFocusSoundSelfTests(ParamStr(1));
   if Result <> -1 then
     Exit;
 

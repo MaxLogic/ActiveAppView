@@ -28,6 +28,10 @@ Accessibility tool for active application / explorer quick selection
 - Configure the interval in `settings.ini` under `[WindowTitlePolling] RefreshIntervalSeconds`.
 - Set `RefreshIntervalSeconds=0` to disable periodic title polling.
 
+## Focus sound
+- ActiveAppView plays the WAV file configured by `[FocusSound] File` when its main form gains focus.
+- Relative paths start from the executable directory. An absent, blank, or missing file stays silent.
+
 ## Shadow Journal rename history
 - Successful Applications and Console Rename, Reset, and observed expiration transitions can be appended to Shadow Journal's schema-v5 `window_caption_override_events` table.
 - Configure `[save-renames-to-journal]` in `settings.ini` with `enabled=1` and the exact existing SQLite filename in `db-file`.
