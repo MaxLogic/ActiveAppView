@@ -304,7 +304,11 @@ begin
 
   Result := RunFocusSoundSelfTests(ParamStr(1));
   if Result <> -1 then
+  begin
+    if Result = 0 then
+      Result := RunMainFormSelfTests(ParamStr(1));
     Exit;
+  end;
 
   Result := RunMainFormSelfTests(ParamStr(1));
   if Result <> -1 then

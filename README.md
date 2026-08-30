@@ -29,7 +29,7 @@ Accessibility tool for active application / explorer quick selection
 - Set `RefreshIntervalSeconds=0` to disable periodic title polling.
 
 ## Focus sound
-- ActiveAppView plays the WAV file configured by `[FocusSound] File` when its main form gains focus.
+- ActiveAppView plays the WAV file configured by `[FocusSound] File` when the application gains foreground focus.
 - Relative paths start from the executable directory. An absent, blank, or missing file stays silent.
 
 ## Shadow Journal rename history

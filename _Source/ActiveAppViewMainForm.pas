@@ -127,6 +127,7 @@ type
     fChatMonitorTask: iAsync;
     fConfigCache: TConfigCache;
     fFocusSoundFileName: string;
+    fFocusSoundPlayer: TProc<string>;
     fDeepPrefixEdgeReady: Integer;
     fDeepPrefixLoadBusy: Integer;
     fDeepPrefixLoadTask: iAsync;
@@ -184,6 +185,7 @@ type
     fShutdownToken: iCancelToken;
     fShuttingDown: Integer;
     procedure AppOnActivate(Sender: TObject);
+    procedure PlayConfiguredFocusSound;
     function ApplyExpiredWindowCaptionOverrides: Boolean;
     procedure ApplyLoadedWindowCaptionOverrideState;
     function BuildWindowCaptionOverrideIdentity(const aWnd: hWnd;
@@ -355,6 +357,7 @@ const
   cWindowCaptionOverridesSelfTestArg = '--self-test-window-caption-overrides';
   cConsoleTitleSortSelfTestArg = '--self-test-console-title-sort';
   cConsolePollAppPurgeSelfTestArg = '--self-test-console-poll-app-purge';
+  cFocusSoundSelfTestArg = '--self-test-focus-sound';
   cWindowActionCopySelfTestArg = '--self-test-window-action-copy';
   cWindowActionProbeSelfTestArg = '--self-test-window-action-probe';
   cWindowTitlePollingSelfTestArg = '--self-test-window-title-polling';
@@ -1443,6 +1446,7 @@ begin
   if IsShuttingDown then
     Exit;
 
+  PlayConfiguredFocusSound;
   MarkFormFocused;
   QuickValidateProcessesOnRefocus;
   if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
@@ -1451,6 +1455,14 @@ begin
     QueueGuiRefresh;
   if assigned(fOrgAppOnActivate) then
     fOrgAppOnActivate(Sender);
+end;
+
+procedure TAppsViewMainFrm.PlayConfiguredFocusSound;
+begin
+  if Assigned(fFocusSoundPlayer) then
+    fFocusSoundPlayer(fFocusSoundFileName)
+  else
+    PlayFocusSound(fFocusSoundFileName);
 end;
 
 function TAppsViewMainFrm.CaptureWindowActionTarget(
@@ -3099,7 +3111,6 @@ begin
   if IsShuttingDown then
     Exit;
 
-  PlayFocusSound(fFocusSoundFileName);
   ApplyLoadedWindowCaptionOverrideState;
   MarkFormFocused;
   if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
@@ -3885,6 +3896,40 @@ begin
       Writeln(Format('SELFTEST FAILED: resize column widths expected=253,250,201,175,175,176 actual=%d,%d,%d,%d,%d,%d',
         [lAppsWidth, lExplorerWidth, lScriptsWidth, lConsoleWidth, lDesktopWidth, lShortCutsWidth]));
       Result := 1;
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cFocusSoundSelfTestArg) then
+  begin
+    Result := 0;
+    lActualValue := '';
+    lTestForm := TAppsViewMainFrm.CreateNew(nil);
+    try
+      lTestForm.fApps := TAppList.Create;
+      lTestForm.lbApps := TListBox.Create(lTestForm);
+      lTestForm.lbApps.Parent := lTestForm;
+      lTestForm.pnlAppDetails := TPanel.Create(lTestForm);
+      lTestForm.pnlAppDetails.Parent := lTestForm;
+      lTestForm.fStartupDataReady := 1;
+      lTestForm.fGuiRefreshQueued := 1;
+      lTestForm.fFocusSoundFileName := 'activation-focus.wav';
+      lTestForm.fFocusSoundPlayer :=
+        procedure(aFileName: string)
+        begin
+          lActualValue := aFileName;
+        end;
+
+      lTestForm.AppOnActivate(lTestForm);
+      if lActualValue <> lTestForm.fFocusSoundFileName then
+      begin
+        Writeln('SELFTEST FAILED: application activation did not request the configured focus sound');
+        Result := 1;
+      end;
+    finally
+      lTestForm.fFocusSoundPlayer := nil;
+      FreeAndNil(lTestForm.fApps);
+      lTestForm.Free;
     end;
     Exit;
   end;
