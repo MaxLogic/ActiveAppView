@@ -9,7 +9,7 @@ uses
   Vcl.Graphics, Vcl.Menus, Vcl.StdCtrls,
   CancelToken, maxAsync,
   ActiveAppView.CaptionOverrideState, ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache,
-  ActiveAppView.MachineOverview.Commands, ActiveAppView.MachineOverview.HelpForm,
+  ActiveAppView.FocusSound, ActiveAppView.MachineOverview.Commands, ActiveAppView.MachineOverview.HelpForm,
   ActiveAppView.MachineOverview.History, ActiveAppView.MachineOverview.HistoryForm,
   ActiveAppView.MachineOverview.Layout,
   ActiveAppView.MachineOverview.Service,
@@ -126,6 +126,7 @@ type
     fChatMonitorPending: Integer;
     fChatMonitorTask: iAsync;
     fConfigCache: TConfigCache;
+    fFocusSoundFileName: string;
     fDeepPrefixEdgeReady: Integer;
     fDeepPrefixLoadBusy: Integer;
     fDeepPrefixLoadTask: iAsync;
@@ -167,10 +168,15 @@ type
     fWindowActionTarget: TWindowActionTarget;
     fWindowActionsPopupMenu: TPopupMenu;
     fCloseWindowMenuItem: TMenuItem;
+    fCopyFullExeCommandLineMenuItem: TMenuItem;
+    fCopyFullExeFileNameMenuItem: TMenuItem;
+    fCopyHwndMenuItem: TMenuItem;
+    fCopyPidMenuItem: TMenuItem;
     fRenameWindowMenuItem: TMenuItem;
     fRenameJournalConfig: TRenameJournalConfig;
     fRenameJournalWriter: TRenameJournalWriter;
     fTerminateWindowMenuItem: TMenuItem;
+    fWindowActionClipboardWriter: TProc<string>;
     fWindowCaptionOverrideRecords: TDictionary<string, TCaptionOverrideRecord>;
     fWindowCaptionOverrides: TDictionary<string, string>;
     fSuppressNextReturnListBox: TListBox;
@@ -236,6 +242,7 @@ type
     function ConsumeWindowActionTarget(out aListBox: TListBox;
       out aTarget: TWindowActionTarget): Boolean;
     procedure CloseWindowTarget(const aTarget: TWindowActionTarget);
+    procedure CopyTextToWindowActionClipboard(const aText: string);
     function ControlLayoutWidth(const aControl: TControl): Integer;
     procedure CloseSelectedWindow(const aListBox: TListBox);
     procedure CreateWindowActionsPopupMenu;
@@ -265,6 +272,7 @@ type
     procedure TerminateWindowTarget(const aTarget: TWindowActionTarget);
     procedure WindowActionsPopupMenuPopup(aSender: TObject);
     procedure WindowCloseMenuItemClick(aSender: TObject);
+    procedure WindowCopyMenuItemClick(aSender: TObject);
     procedure WindowRenameMenuItemClick(aSender: TObject);
     procedure WindowTerminateMenuItemClick(aSender: TObject);
 
@@ -347,6 +355,7 @@ const
   cWindowCaptionOverridesSelfTestArg = '--self-test-window-caption-overrides';
   cConsoleTitleSortSelfTestArg = '--self-test-console-title-sort';
   cConsolePollAppPurgeSelfTestArg = '--self-test-console-poll-app-purge';
+  cWindowActionCopySelfTestArg = '--self-test-window-action-copy';
   cWindowActionProbeSelfTestArg = '--self-test-window-action-probe';
   cWindowTitlePollingSelfTestArg = '--self-test-window-title-polling';
   cScriptsIgnoreSelfTestArg = '--self-test-scripts-ignore';
@@ -367,6 +376,10 @@ const
   cShutdownTaskWaitTimeoutMs = 10000;
   cWindowActionProbeIntervalMs = 300;
   cWindowActionProbeMaxDurationMs = 15000;
+  cWindowActionCopyExecutableFileNameTag = 1;
+  cWindowActionCopyCommandLineTag = 2;
+  cWindowActionCopyProcessIdTag = 3;
+  cWindowActionCopyWindowHandleTag = 4;
   cSuppressReturnKeyAfterDialogMs = 1000;
 
 resourcestring
@@ -378,6 +391,10 @@ resourcestring
   rsMachineOverviewResume = 'Resume display (Ctrl+E)';
   rsMachineOverviewRestoreView = 'Restore View (Shift+F8)';
   rsWindowActionClose = 'Close';
+  rsWindowActionCopyCommandLine = 'Copy full EXE filename including command line switches';
+  rsWindowActionCopyExecutableFileName = 'Copy full EXE filename';
+  rsWindowActionCopyHwnd = 'Copy HWND';
+  rsWindowActionCopyPid = 'Copy PID';
   rsWindowActionRename = 'Rename';
   rsWindowActionReset = 'Reset';
   rsWindowActionTerminate = 'Terminate';
@@ -1520,6 +1537,30 @@ begin
   fRenameWindowMenuItem.OnClick := WindowRenameMenuItemClick;
   fWindowActionsPopupMenu.Items.Add(fRenameWindowMenuItem);
 
+  fCopyFullExeFileNameMenuItem := TMenuItem.Create(fWindowActionsPopupMenu);
+  fCopyFullExeFileNameMenuItem.Caption := rsWindowActionCopyExecutableFileName;
+  fCopyFullExeFileNameMenuItem.Tag := cWindowActionCopyExecutableFileNameTag;
+  fCopyFullExeFileNameMenuItem.OnClick := WindowCopyMenuItemClick;
+  fWindowActionsPopupMenu.Items.Add(fCopyFullExeFileNameMenuItem);
+
+  fCopyFullExeCommandLineMenuItem := TMenuItem.Create(fWindowActionsPopupMenu);
+  fCopyFullExeCommandLineMenuItem.Caption := rsWindowActionCopyCommandLine;
+  fCopyFullExeCommandLineMenuItem.Tag := cWindowActionCopyCommandLineTag;
+  fCopyFullExeCommandLineMenuItem.OnClick := WindowCopyMenuItemClick;
+  fWindowActionsPopupMenu.Items.Add(fCopyFullExeCommandLineMenuItem);
+
+  fCopyPidMenuItem := TMenuItem.Create(fWindowActionsPopupMenu);
+  fCopyPidMenuItem.Caption := rsWindowActionCopyPid;
+  fCopyPidMenuItem.Tag := cWindowActionCopyProcessIdTag;
+  fCopyPidMenuItem.OnClick := WindowCopyMenuItemClick;
+  fWindowActionsPopupMenu.Items.Add(fCopyPidMenuItem);
+
+  fCopyHwndMenuItem := TMenuItem.Create(fWindowActionsPopupMenu);
+  fCopyHwndMenuItem.Caption := rsWindowActionCopyHwnd;
+  fCopyHwndMenuItem.Tag := cWindowActionCopyWindowHandleTag;
+  fCopyHwndMenuItem.OnClick := WindowCopyMenuItemClick;
+  fWindowActionsPopupMenu.Items.Add(fCopyHwndMenuItem);
+
   fCloseWindowMenuItem := TMenuItem.Create(fWindowActionsPopupMenu);
   fCloseWindowMenuItem.Caption := rsWindowActionClose;
   fCloseWindowMenuItem.OnClick := WindowCloseMenuItemClick;
@@ -2045,6 +2086,14 @@ begin
 
   if Assigned(fCloseWindowMenuItem) then
     fCloseWindowMenuItem.Enabled := lCanWindowAction;
+  if Assigned(fCopyFullExeCommandLineMenuItem) then
+    fCopyFullExeCommandLineMenuItem.Enabled := lCanWindowAction;
+  if Assigned(fCopyFullExeFileNameMenuItem) then
+    fCopyFullExeFileNameMenuItem.Enabled := lCanWindowAction;
+  if Assigned(fCopyHwndMenuItem) then
+    fCopyHwndMenuItem.Enabled := lCanWindowAction;
+  if Assigned(fCopyPidMenuItem) then
+    fCopyPidMenuItem.Enabled := lCanWindowAction;
   if Assigned(fRenameWindowMenuItem) then
     fRenameWindowMenuItem.Enabled := lCanCaptionOverride;
   if Assigned(fTerminateWindowMenuItem) then
@@ -2083,6 +2132,67 @@ begin
   if ConsumeWindowActionTarget(lListBox, lTarget) and
     Assigned(lListBox) then
     CloseWindowTarget(lTarget);
+end;
+
+procedure TAppsViewMainFrm.CopyTextToWindowActionClipboard(
+  const aText: string);
+begin
+  if Assigned(fWindowActionClipboardWriter) then
+    fWindowActionClipboardWriter(aText)
+  else
+    Clipboard.AsText := aText;
+end;
+
+procedure TAppsViewMainFrm.WindowCopyMenuItemClick(aSender: TObject);
+var
+  lApp: TAppInfo;
+  lHasApp: Boolean;
+  lListBox: TListBox;
+  lOwnsApp: Boolean;
+  lTarget: TWindowActionTarget;
+  lText: string;
+begin
+  if not (aSender is TMenuItem) then
+    Exit;
+  if not ConsumeWindowActionTarget(lListBox, lTarget) then
+    Exit;
+  if not Assigned(lListBox) then
+    Exit;
+
+  lText := '';
+  case TMenuItem(aSender).Tag of
+    cWindowActionCopyProcessIdTag:
+      lText := lTarget.ProcessId.ToString;
+    cWindowActionCopyWindowHandleTag:
+      lText := UIntToStr(NativeUInt(lTarget.Wnd));
+    cWindowActionCopyExecutableFileNameTag,
+    cWindowActionCopyCommandLineTag:
+    begin
+      lApp := nil;
+      lOwnsApp := False;
+      lHasApp := False;
+      if Assigned(fApps) then
+        lHasApp := fApps.TryGetApp(lTarget.Wnd, lApp);
+      if not lHasApp then
+      begin
+        lApp := TAppInfo.Create(lTarget.Wnd);
+        lOwnsApp := True;
+      end;
+      try
+        if TMenuItem(aSender).Tag = cWindowActionCopyExecutableFileNameTag then
+          lText := lApp.FileName
+        else
+          lText := lApp.CommandLine;
+      finally
+        if lOwnsApp then
+          lApp.Free;
+      end;
+    end;
+  else
+    Exit;
+  end;
+  if lText <> '' then
+    CopyTextToWindowActionClipboard(lText);
 end;
 
 procedure TAppsViewMainFrm.ApplyWindowCaptionRename(const aWnd: hWnd;
@@ -2989,6 +3099,7 @@ begin
   if IsShuttingDown then
     Exit;
 
+  PlayFocusSound(fFocusSoundFileName);
   ApplyLoadedWindowCaptionOverrideState;
   MarkFormFocused;
   if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
@@ -3211,6 +3322,7 @@ begin
   application.OnActivate := AppOnActivate;
 
   gc(lIniFile, TMemIniFile.Create(CombinePath([GetInstallDir, cSettingsFileName]), TEncoding.Utf8, False));
+  fFocusSoundFileName := LoadFocusSoundFileName(GetInstallDir, lIniFile);
   fShutdownToken := TCancelToken.Create;
   lMachineOverviewSettings := LoadMachineOverviewSettings(lIniFile);
   lMachineOverviewSettings.HistoryDatabaseFileName :=
@@ -3707,6 +3819,7 @@ end;
 
 function RunMainFormSelfTests(const aArg: string): Integer;
 var
+  lActualValue: string;
   lApps: TArray<TAppInfo>;
   lApplyResult: TWindowCaptionDialogApplyResult;
   lActionWnd: hWnd;
@@ -3716,16 +3829,22 @@ var
   lCancelToken: iCancelToken;
   lCapturedListBox: TListBox;
   lConsoleWidth: Integer;
+  lCopyPidMenuItem: TMenuItem;
   lDesktopWidth: Integer;
   lDialogOutcome: TCaptionOverrideDialogOutcome;
   lEvent: TCaptionOverrideLifecycleEvent;
   lExplorerWidth: Integer;
+  lExpectedCaptions: TArray<string>;
+  lExpectedValues: TArray<string>;
   lHandled: Boolean;
+  lIndex: Integer;
   lItems: TStringList;
   lIdentity: TCaptionOverrideIdentity;
   lObservedIdentity: TCaptionOverrideIdentity;
   lOtherListBox: TListBox;
   lLoadedOverrides: TDictionary<string, string>;
+  lMenuIndex: Integer;
+  lMenuItem: TMenuItem;
   lMousePos: TPoint;
   lOverrideKey: string;
   lOverrides: TDictionary<string, string>;
@@ -3870,6 +3989,135 @@ begin
       end;
     finally
       lItems.Free;
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cWindowActionCopySelfTestArg) then
+  begin
+    Result := 0;
+    lActionWnd := CreateWindowEx(
+      0,
+      'STATIC',
+      'Window action copy target',
+      WS_POPUP or WS_VISIBLE,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      HInstance,
+      nil);
+    if lActionWnd = 0 then
+    begin
+      Writeln('SELFTEST FAILED: could not create the window action copy target');
+      Exit(1);
+    end;
+    try
+      lTestForm := TAppsViewMainFrm.CreateNew(nil);
+      try
+        lTestForm.lbApps := TListBox.Create(lTestForm);
+        lTestForm.lbApps.Parent := lTestForm;
+        lTestForm.lbExplorer := TListBox.Create(lTestForm);
+        lTestForm.lbExplorer.Parent := lTestForm;
+        lTestForm.lbConsole := TListBox.Create(lTestForm);
+        lTestForm.lbConsole.Parent := lTestForm;
+        lTestForm.CreateWindowActionsPopupMenu;
+        // The real clipboard is user-owned and may contain non-text data that this self-test cannot safely replace.
+        lTestForm.fWindowActionClipboardWriter :=
+          procedure(aText: string)
+          begin
+            lActualValue := aText;
+          end;
+        lTestForm.lbApps.Items.AddObject(
+          'window action copy target',
+          TObject(lActionWnd));
+        lTestForm.lbApps.ItemIndex := 0;
+
+        lExpectedCaptions := TArray<string>.Create(
+          'Copy full EXE filename',
+          'Copy full EXE filename including command line switches',
+          'Copy PID',
+          'Copy HWND');
+        lExpectedValues := TArray<string>.Create(
+          ParamStr(0),
+          string(Winapi.Windows.GetCommandLine),
+          GetCurrentProcessId.ToString,
+          UIntToStr(NativeUInt(lActionWnd)));
+        lCopyPidMenuItem := nil;
+        for lIndex := 0 to High(lExpectedCaptions) do
+        begin
+          lMenuItem := nil;
+          for lMenuIndex := 0 to lTestForm.fWindowActionsPopupMenu.Items.Count - 1 do
+            if SameText(
+              lTestForm.fWindowActionsPopupMenu.Items[lMenuIndex].Caption,
+              lExpectedCaptions[lIndex]) then
+            begin
+              lMenuItem := lTestForm.fWindowActionsPopupMenu.Items[lMenuIndex];
+              Break;
+            end;
+          if not Assigned(lMenuItem) then
+          begin
+            Writeln(Format(
+              'SELFTEST FAILED: missing window action menu item "%s"',
+              [lExpectedCaptions[lIndex]]));
+            Result := 1;
+            Continue;
+          end;
+          if not Assigned(lMenuItem.OnClick) then
+          begin
+            Writeln(Format(
+              'SELFTEST FAILED: window action menu item "%s" has no handler',
+              [lExpectedCaptions[lIndex]]));
+            Result := 1;
+            Continue;
+          end;
+          if lIndex = 2 then
+            lCopyPidMenuItem := lMenuItem;
+          if not lTestForm.CaptureWindowActionTarget(lTestForm.lbApps) then
+          begin
+            Writeln(Format(
+              'SELFTEST FAILED: could not capture target for "%s"',
+              [lExpectedCaptions[lIndex]]));
+            Result := 1;
+            Continue;
+          end;
+          lActualValue := 'window-action-copy-not-set';
+          lMenuItem.Click;
+          if ((lIndex = 0) and
+            (not SameText(lActualValue, lExpectedValues[lIndex]))) or
+            ((lIndex <> 0) and (lActualValue <> lExpectedValues[lIndex])) then
+          begin
+            Writeln(Format(
+              'SELFTEST FAILED: "%s" expected="%s" actual="%s"',
+              [lExpectedCaptions[lIndex], lExpectedValues[lIndex], lActualValue]));
+            Result := 1;
+          end;
+        end;
+
+        if Assigned(lCopyPidMenuItem) and
+          lTestForm.CaptureWindowActionTarget(lTestForm.lbApps) then
+        begin
+          lActualValue := 'stale-window-action-target';
+          DestroyWindow(lActionWnd);
+          lActionWnd := 0;
+          lCopyPidMenuItem.Click;
+          if lActualValue <> 'stale-window-action-target' then
+          begin
+            Writeln('SELFTEST FAILED: stale copy target changed the clipboard');
+            Result := 1;
+          end;
+        end else begin
+          Writeln('SELFTEST FAILED: could not prepare the stale copy target check');
+          Result := 1;
+        end;
+      finally
+        lTestForm.Free;
+      end;
+    finally
+      if lActionWnd <> 0 then
+        DestroyWindow(lActionWnd);
     end;
     Exit;
   end;

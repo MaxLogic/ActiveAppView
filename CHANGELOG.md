@@ -18,6 +18,8 @@ All notable changes to this project are documented in this file.
 - Console window title polling now refreshes existing Console entries without forcing a full app scan on every timer tick.
 
 ### Added
+- ActiveAppView can now play the WAV file configured by `[FocusSound] File` when its main form gains focus; an absent, blank, or missing file stays silent.
+- Applications, Explorer, and Console context menus can now copy the selected window's full executable path, full command line, PID, or HWND.
 - Machine Overview can now capture an opt-in 15-second WPR incident trace with General and GPU profiles, unique-session cleanup, explicit requested/captured/failed/unavailable history state, and oldest-first 10-file/2-GB retention without blocking monitoring.
 - Machine Overview now reports WDDM busiest-engine GPU load, rolling averages and peaks, dedicated GPU memory, and optional age-stamped NVIDIA temperature/power and conservatively identified CPU package temperature with bounded provider failure handling.
 - Machine Overview's incident row now opens a keyboard-accessible 24-hour, 7-day, or complete history view with stable selection, full incident details, and explicit busy-database degradation.

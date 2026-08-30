@@ -17,6 +17,7 @@ uses
   ActiveAppView.CaptionOverrideState.SelfTests in 'ActiveAppView.CaptionOverrideState.SelfTests.pas',
   ActiveAppView.ChatMonitor in 'ActiveAppView.ChatMonitor.pas',
   ActiveAppView.ConfigCache in 'ActiveAppView.ConfigCache.pas',
+  ActiveAppView.FocusSound in 'ActiveAppView.FocusSound.pas',
   ActiveAppView.Launcher in 'ActiveAppView.Launcher.pas',
   ActiveAppView.MachineOverview.BoundedProcess in 'ActiveAppView.MachineOverview.BoundedProcess.pas',
   ActiveAppView.MachineOverview.Commands in 'ActiveAppView.MachineOverview.Commands.pas',
