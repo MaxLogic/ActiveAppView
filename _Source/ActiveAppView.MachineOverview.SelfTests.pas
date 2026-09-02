@@ -741,6 +741,9 @@ begin
     '1234:99', 'cl.exe', '', 'Stale; coverage 50%', 12, 'percent', True);
   AddPresentationMeasurement(lSource.Measurements, 'process_cpu_peak_60s:1',
     '1234:99', 'cl.exe', '', '', 44, 'percent', True);
+  AddPresentationMeasurement(lSource.Measurements, 'process_cpu_pids:1',
+    '1234:99', '1234, 2345, 3456, 4567, 5678, 6789, 7890, 8901', '', '', 8,
+    'process_ids', True);
   AddPresentationMeasurement(lSource.Measurements, 'process_cpu_rank:2', '5678:100',
     'protected.exe', 'C:\Secret\protected.exe', 'Permission denied', 9,
     'percent', True);
@@ -847,9 +850,12 @@ begin
     Exit;
   end;
   if (not TryFindMachineOverviewRow(lPresentation, 'top-cpu:1', lRow)) or
+    (not SameText(lRow.Category, 'Applications')) or
     (not PresentationContains(lRow.ValueText,
-      ['cl.exe', '18%', '12%', 'coverage 50%', '44%', 'PID 1234',
+      ['cl.exe', '18%', '12%', 'coverage 50%', '44%',
+       'PIDs 1234, 2345, 3456, 4567, 5678 (3 more)',
        'C:\Tools\cl.exe'])) or
+    ContainsText(lRow.ValueText, '6789') or
     (MachineOverviewSelectedRowCopy(lRow) <> lRow.LabelText + ': ' +
       lRow.ValueText) or
     (not TryFindMachineOverviewRow(lPresentation, 'top-cpu:2', lRow)) or
@@ -876,6 +882,7 @@ begin
      'SQLite commit: 17 ms; error=database is locked',
      'monitor CPU=0.21%', 'private memory=42 MB', 'write rate=4 KB/s',
      'latency=132 ms; queue=3.4',
+     'process_cpu_rank:1 PIDs=1234, 2345, 3456, 4567, 5678, 6789, 7890, 8901',
      'process_cpu_rank:2 path status=Permission denied',
      'collector_interval_ms=1000']) or
     ContainsText(lPresentation.DiagnosticText, 'Secret Caption') or
@@ -1120,7 +1127,7 @@ begin
   if (lCpuCount < 1) or (lCpuCount > 5) or (lRamCount < 1) or
     (lRamCount > 5) or (lIoCount < 1) or (lIoCount > 5) then
   begin
-    Writeln('SELFTEST FAILED: process provider did not produce bounded top-five rankings');
+    Writeln('SELFTEST FAILED: process provider did not produce bounded top-five application rankings');
     Exit;
   end;
   if (CountSystemProviderMeasurements(lSample,
@@ -1128,13 +1135,19 @@ begin
     (CountSystemProviderMeasurements(lSample,
       'process_cpu_peak_60s:') <> lCpuCount) or
     (CountSystemProviderMeasurements(lSample,
+      'process_cpu_pids:') <> lCpuCount) or
+    (CountSystemProviderMeasurements(lSample,
       'process_ram_peak_60s:') <> lRamCount) or
+    (CountSystemProviderMeasurements(lSample,
+      'process_ram_pids:') <> lRamCount) or
     (CountSystemProviderMeasurements(lSample,
       'process_io_average_15s:') <> lIoCount) or
     (CountSystemProviderMeasurements(lSample,
-      'process_io_peak_60s:') <> lIoCount) then
+      'process_io_peak_60s:') <> lIoCount) or
+    (CountSystemProviderMeasurements(lSample,
+      'process_io_pids:') <> lIoCount) then
   begin
-    Writeln('SELFTEST FAILED: ranked process rolling averages or peaks are missing');
+    Writeln('SELFTEST FAILED: ranked application rolling metrics or PID lists are missing');
     Exit;
   end;
   if (not TryFindSystemProviderMeasurement(lSample,
@@ -1152,7 +1165,7 @@ begin
         lMeasurement.EntityId.IsEmpty or lMeasurement.DisplayText.IsEmpty or
         lMeasurement.StatusText.IsEmpty then
       begin
-        Writeln('SELFTEST FAILED: ranked process omitted identity, name, path status, or metric');
+        Writeln('SELFTEST FAILED: ranked application omitted identity, name, path status, or metric');
         Exit;
       end;
   if (not TryFindSystemProviderMeasurement(lSample, 'process_enumerated_count',
@@ -2900,6 +2913,49 @@ begin
     (lRanked[2].Metric.Identity.ProcessId <> 20) then
   begin
     Writeln('SELFTEST FAILED: process ranking was unstable for ties or included missing metrics');
+    Exit;
+  end;
+
+  SetLength(lMetrics, 5);
+  lMetrics[0] := Default(TMachineOverviewProcessMetric);
+  lMetrics[0].Identity.ProcessId := 30;
+  lMetrics[0].DisplayName := 'firefox.exe';
+  lMetrics[0].MetricAvailable := True;
+  lMetrics[0].MetricValue := 10;
+  lMetrics[1] := Default(TMachineOverviewProcessMetric);
+  lMetrics[1].Identity.ProcessId := 10;
+  lMetrics[1].DisplayName := 'FIREFOX.EXE';
+  lMetrics[1].MetricAvailable := True;
+  lMetrics[1].MetricValue := 20;
+  lMetrics[2] := Default(TMachineOverviewProcessMetric);
+  lMetrics[2].Identity.ProcessId := 20;
+  lMetrics[2].DisplayName := 'taskmgr.exe';
+  lMetrics[2].MetricAvailable := True;
+  lMetrics[2].MetricValue := 25;
+  lMetrics[3] := Default(TMachineOverviewProcessMetric);
+  lMetrics[3].Identity.ProcessId := 40;
+  lMetrics[3].DisplayName := 'firefox.exe';
+  lMetrics[3].MetricAvailable := True;
+  lMetrics[3].MetricValue := 5;
+  lMetrics[4] := Default(TMachineOverviewProcessMetric);
+  lMetrics[4].Identity.ProcessId := 50;
+  lMetrics[4].DisplayName := 'firefox.exe';
+  lMetrics[4].MetricAvailable := False;
+  lMetrics[4].MetricValue := 1000;
+  lRanked := RankMachineOverviewProcesses(lMetrics, 5);
+  if (Length(lRanked) <> 2) or
+    (not SameText(lRanked[0].Metric.DisplayName, 'firefox.exe')) or
+    (Abs(lRanked[0].Metric.MetricValue - 35) > 0.0001) or
+    (lRanked[0].Metric.Identity.ProcessId <> 10) or
+    (Length(lRanked[0].Metric.Identities) <> 4) or
+    (lRanked[0].Metric.Identities[0].ProcessId <> 10) or
+    (lRanked[0].Metric.Identities[1].ProcessId <> 30) or
+    (lRanked[0].Metric.Identities[2].ProcessId <> 40) or
+    (lRanked[0].Metric.Identities[3].ProcessId <> 50) or
+    (not SameText(lRanked[1].Metric.DisplayName, 'taskmgr.exe')) or
+    (Abs(lRanked[1].Metric.MetricValue - 25) > 0.0001) then
+  begin
+    Writeln('SELFTEST FAILED: application ranking did not group names, sum valid metrics, or retain all PIDs');
     Exit;
   end;
 

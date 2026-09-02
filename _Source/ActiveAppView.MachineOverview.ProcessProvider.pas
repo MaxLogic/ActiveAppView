@@ -40,7 +40,7 @@ implementation
 
 uses
   System.DateUtils, System.Generics.Collections, System.SysUtils,
-  Winapi.PsAPI, Winapi.Windows,
+  Winapi.PsAPI, Winapi.TlHelp32, Winapi.Windows,
   AutoFree,
   ActiveAppView.MachineOverview.Domain;
 
@@ -74,6 +74,11 @@ type
     LastSeenMonotonicMs: UInt64;
     Path: string;
     Status: TMachineOverviewProcessPathStatus;
+  end;
+
+  TMachineOverviewProcessEntry = record
+    DisplayName: string;
+    ProcessId: Cardinal;
   end;
 
   TMachineOverviewCollectedProcess = record
@@ -112,6 +117,7 @@ type
       const aNowMonotonicMs, aElapsedMs: UInt64;
       const aLogicalProcessorCount: Cardinal;
       const aSeenIdentities: TDictionary<string, Boolean>;
+      const aDisplayName: string;
       out aProcess: TMachineOverviewCollectedProcess;
       out aAccessDenied: Boolean): Boolean;
     procedure ExpireMissingProcesses(
@@ -122,7 +128,8 @@ type
       const aNowMonotonicMs: UInt64;
       const aResolved: TDictionary<string, Boolean>);
     procedure UpdateRollingMeasurements(
-      const aProcesses: TList<TMachineOverviewCollectedProcess>;
+      const aCpuRanked, aRamRanked,
+      aIoRanked: TArray<TMachineOverviewRankedProcess>;
       const aNowMonotonicMs: UInt64);
     function ResolveProcessPath(const aProcessHandle: THandle;
       const aIdentity: TMachineOverviewProcessIdentity;
@@ -198,36 +205,62 @@ begin
   end;
 end;
 
-function TryEnumerateProcessIds(out aProcessIds: TArray<Cardinal>;
+function TryEnumerateProcesses(
+  out aProcesses: TArray<TMachineOverviewProcessEntry>;
   out aErrorCode: Cardinal): Boolean;
 var
-  lBufferBytes: Cardinal;
-  lNeededBytes: Cardinal;
+  lEntry: TProcessEntry32W;
+  lProcess: TMachineOverviewProcessEntry;
+  lProcesses: TList<TMachineOverviewProcessEntry>;
+  lSnapshot: THandle;
 begin
-  aProcessIds := nil;
+  aProcesses := nil;
   aErrorCode := 0;
-  SetLength(aProcessIds, 1024);
-  repeat
-    lBufferBytes := Cardinal(Length(aProcessIds) * SizeOf(Cardinal));
-    lNeededBytes := 0;
-    Result := EnumProcesses(@aProcessIds[0], lBufferBytes, lNeededBytes);
-    if not Result then
+  lSnapshot := CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if lSnapshot = INVALID_HANDLE_VALUE then
+  begin
+    aErrorCode := GetLastError;
+    Exit(False);
+  end;
+  lProcesses := TList<TMachineOverviewProcessEntry>.Create;
+  try
+    lEntry := Default(TProcessEntry32W);
+    lEntry.dwSize := SizeOf(lEntry);
+    SetLastError(ERROR_SUCCESS);
+    if not Process32FirstW(lSnapshot, lEntry) then
     begin
       aErrorCode := GetLastError;
-      aProcessIds := nil;
-      Exit;
+      Exit(aErrorCode = ERROR_NO_MORE_FILES);
     end;
-    if lNeededBytes < lBufferBytes then
-      Break;
-    if Length(aProcessIds) >= cMachineOverviewMaximumProcessCount then
+    repeat
     begin
-      aErrorCode := ERROR_INSUFFICIENT_BUFFER;
-      aProcessIds := nil;
-      Exit(False);
+      if lEntry.th32ProcessID <> 0 then
+      begin
+        if lProcesses.Count >= cMachineOverviewMaximumProcessCount then
+        begin
+          aErrorCode := ERROR_INSUFFICIENT_BUFFER;
+          Exit(False);
+        end;
+        lProcess := Default(TMachineOverviewProcessEntry);
+        lProcess.ProcessId := lEntry.th32ProcessID;
+        lProcess.DisplayName := PWideChar(@lEntry.szExeFile[0]);
+        lProcesses.Add(lProcess);
+      end;
+      lEntry.dwSize := SizeOf(lEntry);
+      SetLastError(ERROR_SUCCESS);
     end;
-    SetLength(aProcessIds, Length(aProcessIds) * 2);
-  until False;
-  SetLength(aProcessIds, lNeededBytes div SizeOf(Cardinal));
+    until not Process32NextW(lSnapshot, lEntry);
+    aErrorCode := GetLastError;
+    Result := aErrorCode = ERROR_NO_MORE_FILES;
+    if Result then
+    begin
+      aProcesses := lProcesses.ToArray;
+      aErrorCode := ERROR_SUCCESS;
+    end;
+  finally
+    lProcesses.Free;
+    CloseHandle(lSnapshot);
+  end;
 end;
 
 function TryCalculateMachineOverviewProcessDelta(
@@ -310,6 +343,33 @@ begin
   Result := False;
 end;
 
+function MachineOverviewApplicationKey(const aDisplayName: string): string;
+begin
+  Result := 'application:' + LowerCase(Trim(aDisplayName));
+end;
+
+function MachineOverviewProcessIdsText(
+  const aIdentities: TArray<TMachineOverviewProcessIdentity>): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(aIdentities) do
+  begin
+    if not Result.IsEmpty then
+      Result := Result + ', ';
+    Result := Result + UIntToStr(aIdentities[i].ProcessId);
+  end;
+end;
+
+procedure LimitRankedProcesses(
+  var aRanked: TArray<TMachineOverviewRankedProcess>;
+  const aMaximumCount: Integer);
+begin
+  if Length(aRanked) > aMaximumCount then
+    SetLength(aRanked, aMaximumCount);
+end;
+
 procedure TMachineOverviewProcessProvider.AddRankedMeasurements(
   const aMeasurements: TList<TMachineOverviewMeasurement>;
   const aPrefix, aUnitText: string;
@@ -317,8 +377,10 @@ procedure TMachineOverviewProcessProvider.AddRankedMeasurements(
   const aProcesses: TList<TMachineOverviewCollectedProcess>;
   const aNowMonotonicMs: UInt64);
 var
+  lApplicationKey: string;
   lIdentityKey: string;
   lMeasurement: TMachineOverviewMeasurement;
+  lPidMeasurement: TMachineOverviewMeasurement;
   lProcess: TMachineOverviewCollectedProcess;
   lRankedProcess: TMachineOverviewRankedProcess;
   lRolling: TMachineOverviewRollingMeasurements;
@@ -333,17 +395,29 @@ begin
     lMeasurement := Default(TMachineOverviewMeasurement);
     lMeasurement.Name := aPrefix + ':' + IntToStr(lRankedProcess.Rank);
     lIdentityKey := MachineOverviewProcessIdentityKey(lProcess.Identity);
+    lApplicationKey := MachineOverviewApplicationKey(
+      lRankedProcess.Metric.DisplayName);
     lMeasurement.EntityId := lIdentityKey;
-    lMeasurement.DisplayText := lProcess.DisplayName;
+    lMeasurement.DisplayText := lRankedProcess.Metric.DisplayName;
     lMeasurement.DetailText := lProcess.Path;
     lMeasurement.StatusText := ProcessPathStatusText(lProcess.PathStatus);
     lMeasurement.UnitText := aUnitText;
     lMeasurement.Available := True;
     lMeasurement.Value := lRankedProcess.Metric.MetricValue;
     aMeasurements.Add(lMeasurement);
+    lPidMeasurement := Default(TMachineOverviewMeasurement);
+    lPidMeasurement.Name := StringReplace(aPrefix, '_rank', '_pids', []) + ':' +
+      IntToStr(lRankedProcess.Rank);
+    lPidMeasurement.EntityId := lIdentityKey;
+    lPidMeasurement.DisplayText := MachineOverviewProcessIdsText(
+      lRankedProcess.Metric.Identities);
+    lPidMeasurement.UnitText := 'process_ids';
+    lPidMeasurement.Available := True;
+    lPidMeasurement.Value := Length(lRankedProcess.Metric.Identities);
+    aMeasurements.Add(lPidMeasurement);
     if aPrefix = 'process_cpu_rank' then
     begin
-      lStatistics := lRolling.Statistics('cpu:' + lIdentityKey,
+      lStatistics := lRolling.Statistics('cpu:' + lApplicationKey,
         aNowMonotonicMs, 15000, cMachineOverviewProcessExpectedIntervalMs,
         cMachineOverviewMinimumCoveragePercent);
       lMeasurement.Name := 'process_cpu_average_15s:' +
@@ -353,7 +427,7 @@ begin
       lMeasurement.Value := lStatistics.Average;
       lMeasurement.StatusText := MachineOverviewWindowStatusText(lStatistics);
       aMeasurements.Add(lMeasurement);
-      lStatistics := lRolling.Statistics('cpu:' + lIdentityKey,
+      lStatistics := lRolling.Statistics('cpu:' + lApplicationKey,
         aNowMonotonicMs, 60000, cMachineOverviewProcessExpectedIntervalMs,
         cMachineOverviewMinimumCoveragePercent);
       lMeasurement.Name := 'process_cpu_peak_60s:' +
@@ -384,7 +458,7 @@ begin
       end;
     end else if aPrefix = 'process_ram_rank' then
     begin
-      lStatistics := lRolling.Statistics('ram:' + lIdentityKey,
+      lStatistics := lRolling.Statistics('ram:' + lApplicationKey,
         aNowMonotonicMs, 60000, cMachineOverviewProcessExpectedIntervalMs,
         cMachineOverviewMinimumCoveragePercent);
       lMeasurement.Name := 'process_ram_peak_60s:' +
@@ -396,7 +470,7 @@ begin
       aMeasurements.Add(lMeasurement);
     end else if aPrefix = 'process_io_rank' then
     begin
-      lStatistics := lRolling.Statistics('io:' + lIdentityKey,
+      lStatistics := lRolling.Statistics('io:' + lApplicationKey,
         aNowMonotonicMs, 15000, cMachineOverviewProcessExpectedIntervalMs,
         cMachineOverviewMinimumCoveragePercent);
       lMeasurement.Name := 'process_io_average_15s:' +
@@ -406,7 +480,7 @@ begin
       lMeasurement.Value := lStatistics.Average;
       lMeasurement.StatusText := MachineOverviewWindowStatusText(lStatistics);
       aMeasurements.Add(lMeasurement);
-      lStatistics := lRolling.Statistics('io:' + lIdentityKey,
+      lStatistics := lRolling.Statistics('io:' + lApplicationKey,
         aNowMonotonicMs, 60000, cMachineOverviewProcessExpectedIntervalMs,
         cMachineOverviewMinimumCoveragePercent);
       lMeasurement.Name := 'process_io_peak_60s:' +
@@ -420,28 +494,38 @@ begin
 end;
 
 procedure TMachineOverviewProcessProvider.UpdateRollingMeasurements(
-  const aProcesses: TList<TMachineOverviewCollectedProcess>;
+  const aCpuRanked, aRamRanked,
+  aIoRanked: TArray<TMachineOverviewRankedProcess>;
   const aNowMonotonicMs: UInt64);
 var
-  lIdentityKey: string;
   lOptional: TMachineOverviewOptionalDouble;
-  lProcess: TMachineOverviewCollectedProcess;
+  lRankedProcess: TMachineOverviewRankedProcess;
   lRolling: TMachineOverviewRollingMeasurements;
 begin
   lRolling := fRolling as TMachineOverviewRollingMeasurements;
-  for lProcess in aProcesses do
+  for lRankedProcess in aCpuRanked do
   begin
-    lIdentityKey := MachineOverviewProcessIdentityKey(lProcess.Identity);
     lOptional := Default(TMachineOverviewOptionalDouble);
-    lOptional.Available := lProcess.Delta.CpuAvailable;
-    lOptional.Value := lProcess.Delta.CpuPercent;
-    lRolling.Observe('cpu:' + lIdentityKey, aNowMonotonicMs, lOptional);
-    lOptional.Available := lProcess.PrivateBytesAvailable;
-    lOptional.Value := lProcess.PrivateBytes;
-    lRolling.Observe('ram:' + lIdentityKey, aNowMonotonicMs, lOptional);
-    lOptional.Available := lProcess.Delta.IoAvailable;
-    lOptional.Value := lProcess.Delta.IoBytesPerSecond;
-    lRolling.Observe('io:' + lIdentityKey, aNowMonotonicMs, lOptional);
+    lOptional.Available := True;
+    lOptional.Value := lRankedProcess.Metric.MetricValue;
+    lRolling.Observe('cpu:' + MachineOverviewApplicationKey(
+      lRankedProcess.Metric.DisplayName), aNowMonotonicMs, lOptional);
+  end;
+  for lRankedProcess in aRamRanked do
+  begin
+    lOptional := Default(TMachineOverviewOptionalDouble);
+    lOptional.Available := True;
+    lOptional.Value := lRankedProcess.Metric.MetricValue;
+    lRolling.Observe('ram:' + MachineOverviewApplicationKey(
+      lRankedProcess.Metric.DisplayName), aNowMonotonicMs, lOptional);
+  end;
+  for lRankedProcess in aIoRanked do
+  begin
+    lOptional := Default(TMachineOverviewOptionalDouble);
+    lOptional.Available := True;
+    lOptional.Value := lRankedProcess.Metric.MetricValue;
+    lRolling.Observe('io:' + MachineOverviewApplicationKey(
+      lRankedProcess.Metric.DisplayName), aNowMonotonicMs, lOptional);
   end;
   lRolling.Prune(aNowMonotonicMs);
 end;
@@ -504,6 +588,7 @@ function TMachineOverviewProcessProvider.CollectProcess(
   const aProcessId: Cardinal; const aNowMonotonicMs, aElapsedMs: UInt64;
   const aLogicalProcessorCount: Cardinal;
   const aSeenIdentities: TDictionary<string, Boolean>;
+  const aDisplayName: string;
   out aProcess: TMachineOverviewCollectedProcess;
   out aAccessDenied: Boolean): Boolean;
 var
@@ -603,7 +688,9 @@ begin
     aProcess.HandleCountAvailable := GetProcessHandleCount(lHandle, lHandleCount);
     if aProcess.HandleCountAvailable then
       aProcess.HandleCount := lHandleCount;
-    aProcess.DisplayName := 'PID ' + UIntToStr(aProcessId);
+    aProcess.DisplayName := Trim(aDisplayName);
+    if aProcess.DisplayName.IsEmpty then
+      aProcess.DisplayName := 'PID ' + UIntToStr(aProcessId);
     aProcess.PathStatus := TMachineOverviewProcessPathStatus.Unavailable;
     Result := True;
   finally
@@ -724,7 +811,7 @@ var
   lMeasurementList: TList<TMachineOverviewMeasurement>;
   lNowMonotonicMs: UInt64;
   lProcess: TMachineOverviewCollectedProcess;
-  lProcessIds: TArray<Cardinal>;
+  lProcessEntries: TArray<TMachineOverviewProcessEntry>;
   lProcessList: TList<TMachineOverviewCollectedProcess>;
   lRamMetrics: TArray<TMachineOverviewProcessMetric>;
   lRamRanked: TArray<TMachineOverviewRankedProcess>;
@@ -738,7 +825,7 @@ begin
   aSample.State.CapturedAtUtc := TTimeZone.Local.ToUniversalTime(Now);
   lNowMonotonicMs := GetTickCount64;
   aSample.State.CapturedAtMonotonicMs := lNowMonotonicMs;
-  if not TryEnumerateProcessIds(lProcessIds, lErrorCode) then
+  if not TryEnumerateProcesses(lProcessEntries, lErrorCode) then
   begin
     aSample.State.Status := TMachineOverviewProviderStatus.Unavailable;
     aSample.State.ErrorText := Format(
@@ -756,13 +843,12 @@ begin
     lElapsedMs := 0;
   lLogicalProcessorCount := GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
   lAccessDeniedCount := 0;
-  for i := 0 to Length(lProcessIds) - 1 do
+  for i := 0 to Length(lProcessEntries) - 1 do
   begin
-    if lProcessIds[i] = 0 then
-      Continue;
     lAccessDenied := False;
-    if CollectProcess(lProcessIds[i], lNowMonotonicMs, lElapsedMs,
-      lLogicalProcessorCount, lSeenIdentities, lProcess, lAccessDenied) then
+    if CollectProcess(lProcessEntries[i].ProcessId, lNowMonotonicMs, lElapsedMs,
+      lLogicalProcessorCount, lSeenIdentities,
+      lProcessEntries[i].DisplayName, lProcess, lAccessDenied) then
       lProcessList.Add(lProcess)
     else if lAccessDenied then
       Inc(lAccessDeniedCount);
@@ -789,10 +875,14 @@ begin
     lIoMetrics[i].MetricAvailable := lProcess.Delta.IoAvailable;
     lIoMetrics[i].MetricValue := lProcess.Delta.IoBytesPerSecond;
   end;
-  UpdateRollingMeasurements(lProcessList, lNowMonotonicMs);
-  lCpuRanked := RankMachineOverviewProcesses(lCpuMetrics, 5);
-  lRamRanked := RankMachineOverviewProcesses(lRamMetrics, 5);
-  lIoRanked := RankMachineOverviewProcesses(lIoMetrics, 5);
+  lCpuRanked := RankMachineOverviewProcesses(lCpuMetrics, lProcessList.Count);
+  lRamRanked := RankMachineOverviewProcesses(lRamMetrics, lProcessList.Count);
+  lIoRanked := RankMachineOverviewProcesses(lIoMetrics, lProcessList.Count);
+  UpdateRollingMeasurements(lCpuRanked, lRamRanked, lIoRanked,
+    lNowMonotonicMs);
+  LimitRankedProcesses(lCpuRanked, 5);
+  LimitRankedProcesses(lRamRanked, 5);
+  LimitRankedProcesses(lIoRanked, 5);
   PopulateProcessPathsForRanking(lProcessList, lCpuRanked,
     lNowMonotonicMs, lResolvedPaths);
   PopulateProcessPathsForRanking(lProcessList, lRamRanked,

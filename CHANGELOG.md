@@ -36,6 +36,7 @@ All notable changes to this project are documented in this file.
 - Scripts can now be hidden from the F3 Scripts list with a `Scripts\.ignore` file, one filename per line.
 
 ### Changed
+- Machine Overview now ranks applications instead of individual processes by aggregating CPU, RAM, and I/O for matching executable names. Rows show up to five member PIDs plus the remaining count, while Ctrl+Shift+C diagnostics include every member PID.
 - Machine Overview now reports real 5/15/60-second and 15-minute rolling values for system and ranked-process metrics, labels process I/O with byte-correct rates, marks insufficient window coverage stale, ages cached provider state, and includes per-provider collection latency in diagnostic copies.
 - Machine Overview now packages the official Win64 SQLite 3.53.4 runtime and uses FireDAC dynamic linkage, satisfying the maintained-runtime requirement for WAL history.
 - Machine Overview now restores its DPI-scaled panel width across restarts and offers a layout-preserving Full View that returns every prior panel and splitter exactly.

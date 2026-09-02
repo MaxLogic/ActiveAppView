@@ -650,11 +650,42 @@ begin
     aNormalizedPercent := 100;
 end;
 
+function CompareMachineOverviewProcessIdentities(
+  const aLeft, aRight: TMachineOverviewProcessIdentity): Integer;
+begin
+  if aLeft.ProcessId < aRight.ProcessId then
+    Exit(-1);
+  if aLeft.ProcessId > aRight.ProcessId then
+    Exit(1);
+  if aLeft.CreationTime100ns < aRight.CreationTime100ns then
+    Exit(-1);
+  if aLeft.CreationTime100ns > aRight.CreationTime100ns then
+    Exit(1);
+  Result := 0;
+end;
+
+procedure AddMachineOverviewProcessIdentity(
+  var aIdentities: TArray<TMachineOverviewProcessIdentity>;
+  const aIdentity: TMachineOverviewProcessIdentity);
+var
+  lIndex: Integer;
+begin
+  lIndex := Length(aIdentities);
+  SetLength(aIdentities, lIndex + 1);
+  aIdentities[lIndex] := aIdentity;
+end;
+
 function RankMachineOverviewProcesses(const aMetrics: TArray<TMachineOverviewProcessMetric>;
   const aMaximumCount: Integer): TArray<TMachineOverviewRankedProcess>;
 var
   lCount: Integer;
+  lGroupIndex: Integer;
+  lGroupIndexes: TDictionary<string, Integer>;
+  lGroupKey: string;
+  lGroupedMetric: TMachineOverviewProcessMetric;
+  lIdentityComparer: IComparer<TMachineOverviewProcessIdentity>;
   lMetric: TMachineOverviewProcessMetric;
+  lMetricValid: Boolean;
   lSorted: TList<TMachineOverviewProcessMetric>;
   i: Integer;
 begin
@@ -663,12 +694,64 @@ begin
     Exit;
 
   lSorted := TList<TMachineOverviewProcessMetric>.Create;
+  lGroupIndexes := TDictionary<string, Integer>.Create;
   try
     for lMetric in aMetrics do
-      if lMetric.MetricAvailable and (lMetric.MetricValue >= 0) and
+    begin
+      lMetricValid := lMetric.MetricAvailable and (lMetric.MetricValue >= 0) and
         (not IsNan(lMetric.MetricValue)) and
-        (not IsInfinite(lMetric.MetricValue)) then
-        lSorted.Add(lMetric);
+        (not IsInfinite(lMetric.MetricValue));
+      lGroupKey := LowerCase(Trim(lMetric.DisplayName));
+      if lGroupKey.IsEmpty then
+        lGroupKey := 'process:' +
+          MachineOverviewProcessIdentityKey(lMetric.Identity)
+      else
+        lGroupKey := 'application:' + lGroupKey;
+      if lGroupIndexes.TryGetValue(lGroupKey, lGroupIndex) then
+      begin
+        lGroupedMetric := lSorted[lGroupIndex];
+        AddMachineOverviewProcessIdentity(lGroupedMetric.Identities,
+          lMetric.Identity);
+        if lMetricValid then
+        begin
+          if lGroupedMetric.MetricAvailable then
+            lGroupedMetric.MetricValue := lGroupedMetric.MetricValue +
+              lMetric.MetricValue
+          else
+            lGroupedMetric.MetricValue := lMetric.MetricValue;
+          lGroupedMetric.MetricAvailable := True;
+        end;
+        lSorted[lGroupIndex] := lGroupedMetric;
+      end else
+      begin
+        lGroupedMetric := lMetric;
+        SetLength(lGroupedMetric.Identities, 1);
+        lGroupedMetric.Identities[0] := lMetric.Identity;
+        if not lMetricValid then
+        begin
+          lGroupedMetric.MetricAvailable := False;
+          lGroupedMetric.MetricValue := 0;
+        end;
+        lGroupIndexes.Add(lGroupKey, lSorted.Count);
+        lSorted.Add(lGroupedMetric);
+      end;
+    end;
+    for i := lSorted.Count - 1 downto 0 do
+      if not lSorted[i].MetricAvailable then
+        lSorted.Delete(i);
+    lIdentityComparer := TComparer<TMachineOverviewProcessIdentity>.Construct(
+      function(const aLeft, aRight: TMachineOverviewProcessIdentity): Integer
+      begin
+        Result := CompareMachineOverviewProcessIdentities(aLeft, aRight);
+      end);
+    for i := 0 to lSorted.Count - 1 do
+    begin
+      lMetric := lSorted[i];
+      TArray.Sort<TMachineOverviewProcessIdentity>(lMetric.Identities,
+        lIdentityComparer);
+      lMetric.Identity := lMetric.Identities[0];
+      lSorted[i] := lMetric;
+    end;
     lSorted.Sort(TComparer<TMachineOverviewProcessMetric>.Construct(
       function(const aLeft, aRight: TMachineOverviewProcessMetric): Integer
       begin
@@ -697,6 +780,7 @@ begin
       Result[i].Metric := lSorted[i];
     end;
   finally
+    lGroupIndexes.Free;
     lSorted.Free;
   end;
 end;

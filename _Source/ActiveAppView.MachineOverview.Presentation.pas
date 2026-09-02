@@ -630,6 +630,64 @@ begin
     Result := 'Unavailable';
 end;
 
+function AbbreviateProcessIds(const aProcessIds: string;
+  const aProcessCount, aMaximumCount: Integer): string;
+var
+  lDelimiter: Integer;
+  lRemaining: Integer;
+  lSearchFrom: Integer;
+  lShown: Integer;
+  lValue: string;
+begin
+  Result := '';
+  lSearchFrom := 1;
+  lShown := 0;
+  while (lSearchFrom <= Length(aProcessIds)) and
+    (lShown < aMaximumCount) do
+  begin
+    lDelimiter := PosEx(',', aProcessIds, lSearchFrom);
+    if lDelimiter = 0 then
+      lDelimiter := Length(aProcessIds) + 1;
+    lValue := Trim(Copy(aProcessIds, lSearchFrom,
+      lDelimiter - lSearchFrom));
+    if not lValue.IsEmpty then
+    begin
+      if not Result.IsEmpty then
+        Result := Result + ', ';
+      Result := Result + lValue;
+      Inc(lShown);
+    end;
+    lSearchFrom := lDelimiter + 1;
+  end;
+  lRemaining := aProcessCount - lShown;
+  if lRemaining > 0 then
+    Result := Result + Format(' (%d more)', [lRemaining]);
+end;
+
+function RankedProcessIdsText(
+  const aSource: TMachineOverviewPresentationSource;
+  const aMetricPrefix: string; const aRank: Integer;
+  const aFallbackIdentity: string): string;
+var
+  lMeasurement: TMachineOverviewMeasurement;
+  lProcessCount: Integer;
+  lProcessIds: string;
+begin
+  if TryFindMeasurement(aSource.Measurements,
+      StringReplace(aMetricPrefix, '_rank', '_pids', []) + ':' +
+      IntToStr(aRank), lMeasurement) and lMeasurement.Available and
+    (not lMeasurement.DisplayText.IsEmpty) then
+  begin
+    lProcessCount := Trunc(lMeasurement.Value);
+    lProcessIds := AbbreviateProcessIds(lMeasurement.DisplayText,
+      lProcessCount, 5);
+    if lProcessCount = 1 then
+      Exit('PID ' + lProcessIds);
+    Exit('PIDs ' + lProcessIds);
+  end;
+  Result := 'PID ' + ProcessIdText(aFallbackIdentity);
+end;
+
 function RankedMetricText(const aSource: TMachineOverviewPresentationSource;
   const aName: string; const aKind: string): string;
 var
@@ -662,19 +720,21 @@ begin
   lName := aMetricPrefix + ':' + lRankText;
   if not (TryFindMeasurement(aSource.Measurements, lName, lMeasurement) and
       lMeasurement.Available) then
-    Exit('Unavailable; no ranked process');
+    Exit('Unavailable; no ranked application');
   if aKind = 'bytes' then
-    Result := Format('%s; %s private working set; %s recent peak; PID %s',
+    Result := Format('%s; %s private working set; %s recent peak; %s',
       [lMeasurement.DisplayText, FormatBytes(lMeasurement.Value),
        RankedMetricText(aSource, aPeakPrefix + ':' + lRankText, aKind),
-       ProcessIdText(lMeasurement.EntityId)])
+       RankedProcessIdsText(aSource, aMetricPrefix, aRank,
+         lMeasurement.EntityId)])
   else
     Result := Format('%s; %s now; %s average over 15 seconds; '+
-      '%s peak over 60 seconds; PID %s', [lMeasurement.DisplayText,
+      '%s peak over 60 seconds; %s', [lMeasurement.DisplayText,
        RankedMetricText(aSource, lName, aKind),
        RankedMetricText(aSource, aAveragePrefix + ':' + lRankText, aKind),
        RankedMetricText(aSource, aPeakPrefix + ':' + lRankText, aKind),
-       ProcessIdText(lMeasurement.EntityId)]);
+       RankedProcessIdsText(aSource, aMetricPrefix, aRank,
+         lMeasurement.EntityId)]);
   if SameText(lMeasurement.StatusText, 'Available') and
     (not lMeasurement.DetailText.IsEmpty) then
     Result := Result + '; ' + lMeasurement.DetailText;
@@ -728,6 +788,8 @@ var
   lIncident: TMachineOverviewIncidentPresentation;
   lIndex: Integer;
   lMeasurement: TMachineOverviewMeasurement;
+  lPidMeasurement: TMachineOverviewMeasurement;
+  lPidName: string;
   lProvider: TMachineOverviewProviderState;
   lRow: TMachineOverviewRow;
 begin
@@ -778,12 +840,20 @@ begin
       lIncident.OccurredAtLocal) + '; ' + SeverityText(lIncident.Severity) +
       '; ' + OneLine(lIncident.Summary) + '; ' +
       SanitizedError(lIncident.DiagnosticText) + sLineBreak;
-  Result := Result + sLineBreak + 'Process path availability' + sLineBreak;
+  Result := Result + sLineBreak + 'Application path availability' + sLineBreak;
   for lMeasurement in aSource.Measurements do
     if StartsText('process_', lMeasurement.Name) and
       ContainsText(lMeasurement.Name, '_rank:') then
-      Result := Result + lMeasurement.Name + ' path status=' +
+    begin
+      Result := Result + lMeasurement.Name;
+      lPidName := StringReplace(lMeasurement.Name, '_rank:', '_pids:', []);
+      if TryFindMeasurement(aSource.Measurements, lPidName, lPidMeasurement) and
+        lPidMeasurement.Available and
+        (not lPidMeasurement.DisplayText.IsEmpty) then
+        Result := Result + ' PIDs=' + OneLine(lPidMeasurement.DisplayText) + ';';
+      Result := Result + ' path status=' +
         OneLine(lMeasurement.StatusText) + sLineBreak;
+    end;
   Result := Result + sLineBreak + 'Provider collection latency' + sLineBreak;
   for lMeasurement in aSource.Measurements do
     if StartsText('collector_duration_ms:', lMeasurement.Name) and
@@ -878,7 +948,7 @@ begin
       lSeverity := TMachineOverviewSeverity.Normal
     else
       lSeverity := TMachineOverviewSeverity.Unavailable;
-    AddRow(Result, 'top-cpu:' + IntToStr(i), 'Processes',
+    AddRow(Result, 'top-cpu:' + IntToStr(i), 'Applications',
       'CPU ' + IntToStr(i), BuildRankedProcessText(aSource,
         'process_cpu_rank', 'process_cpu_average_15s',
         'process_cpu_peak_60s', 'percent', i), lSeverity,
@@ -892,7 +962,7 @@ begin
       lSeverity := TMachineOverviewSeverity.Normal
     else
       lSeverity := TMachineOverviewSeverity.Unavailable;
-    AddRow(Result, 'top-ram:' + IntToStr(i), 'Processes',
+    AddRow(Result, 'top-ram:' + IntToStr(i), 'Applications',
       'RAM ' + IntToStr(i), BuildRankedProcessText(aSource,
         'process_ram_rank', '', 'process_ram_peak_60s', 'bytes', i),
       lSeverity, TMachineOverviewAction.None);
@@ -905,7 +975,7 @@ begin
       lSeverity := TMachineOverviewSeverity.Normal
     else
       lSeverity := TMachineOverviewSeverity.Unavailable;
-    AddRow(Result, 'top-io:' + IntToStr(i), 'Processes',
+    AddRow(Result, 'top-io:' + IntToStr(i), 'Applications',
       'I/O ' + IntToStr(i), BuildRankedProcessText(aSource,
         'process_io_rank', 'process_io_average_15s',
         'process_io_peak_60s', 'bytes_per_second', i), lSeverity,
