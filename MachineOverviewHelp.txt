@@ -2,7 +2,7 @@ MACHINE OVERVIEW HELP
 
 Purpose
 
-Machine Overview provides a lightweight, always-available view of current Windows machine health. It combines CPU, memory, GPU, responsiveness, disk, process, and incident signals so we can see likely pressure without opening several diagnostic tools.
+Machine Overview provides a lightweight, always-available view of current Windows machine health. It combines CPU, memory, GPU, responsiveness, disk, application, and incident signals so we can see likely pressure without opening several diagnostic tools.
 
 Its purpose is triage, not exact root-cause analysis. Lightweight counters have limitations: they can show that a stall, queue, interrupt, or DPC load is suspicious, but they cannot always identify the responsible driver or operation. Missing providers are reported as unavailable rather than treated as machine failure. False positives remain possible when a short workload crosses an automatic incident threshold.
 
@@ -24,7 +24,7 @@ Alt+H or the Help button opens this dialog. The help text is selectable. Ctrl+C 
 
 Up and Down move through rows. Enter on the Incidents row opens incident history. Enter on other rows has no special action.
 
-Ctrl+C in the Machine Overview panel copies the selected row's complete label and value, including text clipped on screen. Ctrl+Shift+C copies a timestamped full diagnostic snapshot with all rows, provider state and age, provider collection latency, logical-processor values, queue and drop counters, SQLite status, monitor overhead, incidents, and process path status.
+Ctrl+C in the Machine Overview panel copies the selected row's complete label and value, including text clipped on screen. Ctrl+Shift+C copies a timestamped full diagnostic snapshot with all rows, complete ranked-application PID lists, provider state and age, provider collection latency, logical-processor values, queue and drop counters, SQLite status, monitor overhead, incidents, and application path status.
 
 Time values
 
@@ -32,11 +32,11 @@ Now is the newest accepted sample. Average is the arithmetic average over the na
 
 CPU
 
-Total CPU is normalized to the whole machine and remains between 0 and 100 percent. Per-process CPU is also normalized to the whole machine; it is not multiplied by the logical-processor count. A hot logical processor is one whose covered 5-second average is at least 80 percent. The row reports the current total, hot logical processors, averages, one-second peaks, and package temperature when an optional provider is available.
+Total CPU is normalized to the whole machine and remains between 0 and 100 percent. Each process is normalized to the whole machine before matching executable names are summed for the application rankings. A hot logical processor is one whose covered 5-second average is at least 80 percent. The row reports the current total, hot logical processors, averages, one-second peaks, and package temperature when an optional provider is available.
 
 Memory
 
-Physical memory is installed RAM currently in use. Available memory is RAM Windows can provide without first paging occupied data. Commit is virtual memory committed against RAM and page files. Paging is the current and peak transfer rate caused by paging activity. Process RAM ranking uses private working set, which is memory currently resident and private to that process.
+Physical memory is installed RAM currently in use. Available memory is RAM Windows can provide without first paging occupied data. Commit is virtual memory committed against RAM and page files. Paging is the current and peak transfer rate caused by paging activity. Application RAM ranking sums the private working sets of processes with the same executable name.
 
 GPU
 
@@ -50,9 +50,9 @@ Responsiveness
 
 Foreground reply time is the bounded response time of the current foreground window. A timeout is reported without blocking ActiveAppView. DPC and interrupts are processor time spent servicing deferred procedure calls and hardware interrupts. DWM missed frames indicate desktop-composition delivery gaps. Processor queue is work waiting for CPU service. These signals provide context; they do not by themselves name the faulty driver or application.
 
-Process rankings
+Application rankings
 
-The five CPU, RAM, and I/O ranks use stable rank rows. CPU is whole-machine percent now, 15-second average, and 60-second peak. RAM uses private working set and its recent peak. I/O is combined read/write MB/s now, 15-second average, and 60-second peak. PID and process name are included. Executable paths are best effort and use least-privilege process access; a denied or unavailable path is omitted from the visible row and recorded as path status in the diagnostic copy.
+The five CPU, RAM, and I/O ranks group processes case-insensitively by executable name. CPU is aggregate whole-machine percent now, 15-second average, and 60-second peak. RAM is aggregate private working set and its recent peak. I/O is aggregate combined read/write MB/s now, 15-second average, and 60-second peak. A row lists up to five numerically sorted member PIDs and adds `(<count> more)` when needed. Ctrl+Shift+C diagnostics include every member PID. Executable paths are best effort and use least-privilege process access; a denied or unavailable path is omitted from the visible row and recorded as path status in the diagnostic copy.
 
 Incidents
 
@@ -62,7 +62,7 @@ The Incidents row shows the last-24-hour count and the three newest summaries. E
 
 History and storage
 
-HistoryEnabled controls persistence. Raw one-second system and disk samples are retained for 48 hours, 10-second rollups for 30 days, and one-minute rollups for 365 days. Ranked process snapshots and incident context are stored; every process is not written every second. The default approximate database cap is 2,048 MB.
+HistoryEnabled controls persistence. Raw one-second system and disk samples are retained for 48 hours, 10-second rollups for 30 days, and one-minute rollups for 365 days. Ranked application snapshots and incident context are stored; every process is not written every second. The default approximate database cap is 2,048 MB.
 
 The history database is MachineOverviewHistory.db next to ActiveAppView.exe. It uses the packaged Win64 SQLite 3.53.4 runtime, one background writer, WAL mode, synchronous=NORMAL, prepared batched transactions, bounded retry/backlog behavior, and small retention batches. If the database is busy, corrupt, or unavailable, live monitoring continues and the diagnostics report the failure. The active path does not run periodic VACUUM.
 
@@ -70,7 +70,7 @@ DetailedTraceEnabled is off by default. When enabled, a DPC/ISR incident or a cr
 
 Privacy and information not stored
 
-Normal Machine Overview history does not store window titles, command-line arguments, typed text, clipboard contents, or keystrokes. It may store executable name, PID, process creation time, best-effort executable path, ranked values, incident context, and provider errors. Copied diagnostics use the same privacy boundary and sanitize unrelated error text.
+Normal Machine Overview history does not store window titles, command-line arguments, typed text, clipboard contents, or keystrokes. It may store executable name, member PIDs, process creation times, best-effort executable path, ranked values, incident context, and provider errors. Copied diagnostics use the same privacy boundary and sanitize unrelated error text.
 
 Settings
 

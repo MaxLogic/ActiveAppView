@@ -59,6 +59,7 @@ type
 
   TMachineOverviewProcessMetric = record
     Identity: TMachineOverviewProcessIdentity;
+    Identities: TArray<TMachineOverviewProcessIdentity>;
     DisplayName: string;
     MetricAvailable: Boolean;
     MetricValue: Double;
