@@ -50,6 +50,7 @@ uses
   ActiveAppView.RenameJournal in 'ActiveAppView.RenameJournal.pas',
   ActiveAppView.RenameJournal.SelfTests in 'ActiveAppView.RenameJournal.SelfTests.pas',
   ActiveAppView.SelfTests in 'ActiveAppView.SelfTests.pas',
+  ActiveAppView.WindowSnapshots in 'ActiveAppView.WindowSnapshots.pas',
   ActiveAppViewCore in 'ActiveAppViewCore.pas',
   ActiveAppViewMainForm in 'ActiveAppViewMainForm.pas' {AppsViewMainFrm};
 
@@ -129,11 +130,19 @@ begin
   MaxLogic.MadExcept.AiRunner.ConfigureFromEnvironment;
   {$IFEND}
 
+  lLaunchHelperResult := RunWindowMetadataHelper;
+  if lLaunchHelperResult <> -1 then
+    Halt(lLaunchHelperResult);
+
   lLaunchHelperResult := RunLauncherHelperFromCommandLine;
   if lLaunchHelperResult <> -1 then
   begin
     Halt(lLaunchHelperResult);
   end;
+
+  lSelfTestResult := RunWindowSnapshotSelfTests(ParamStr(1));
+  if lSelfTestResult <> -1 then
+    Halt(lSelfTestResult);
 
   lSelfTestResult := RunSelfTests;
   if lSelfTestResult <> -1 then
