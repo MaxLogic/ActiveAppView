@@ -5,6 +5,10 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Window metadata now arrives by need: selected-window identity and icons can appear before command-line retrieval, and windows from the same process reuse its command line.
+- Foreground refresh now collects window inventories and slow metadata in the background, with coalesced updates and cancellable metadata helpers.
+- Window and auxiliary lists now preserve unchanged rows, selection, and scroll position during synchronization; selected-window details arrive asynchronously.
+- Delayed command-line copy requests retain their window identity and cannot overwrite newer clipboard content.
 - Focus sound playback now runs from application foreground activation, so returning to ActiveAppView triggers the configured WAV.
 - Window-action context menus now freeze and revalidate the exact clicked HWND/PID, fail closed when the list refreshes or the popup source changes, and no longer crash or act on another row.
 - Window-caption overrides now publish schema-v5 Rename, replacement Rename, Reset, and observed expiration lifecycle events with retained boot/process identity; the same bounded worker handles SQLite, process observation, atomic state persistence, and deterministic dropped-event diagnostics.
@@ -19,6 +23,7 @@ All notable changes to this project are documented in this file.
 - Console window title polling now refreshes existing Console entries without forcing a full app scan on every timer tick.
 
 ### Added
+- Foreground and snapshot operations taking at least 50 ms are recorded in a bounded memory buffer and saved to `startup-profile.log` at normal shutdown.
 - ActiveAppView can now play the WAV file configured by `[FocusSound] File` when the application gains foreground focus; an absent, blank, or missing file stays silent.
 - Applications, Explorer, and Console context menus can now copy the selected window's full executable path, full command line, PID, or HWND.
 - Machine Overview can now capture an opt-in 15-second WPR incident trace with General and GPU profiles, unique-session cleanup, explicit requested/captured/failed/unavailable history state, and oldest-first 10-file/2-GB retention without blocking monitoring.

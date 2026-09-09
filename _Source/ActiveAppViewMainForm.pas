@@ -1,4 +1,4 @@
-unit ActiveAppViewMainForm;
+﻿unit ActiveAppViewMainForm;
 
 interface
 
@@ -15,7 +15,7 @@ uses
   ActiveAppView.MachineOverview.Service,
   ActiveAppView.MachineOverview.Settings, ActiveAppView.MachineOverview.Types,
   ActiveAppView.MachineOverview.View,
-  ActiveAppViewCore, ActiveAppView.RenameJournal;
+  ActiveAppViewCore, ActiveAppView.RenameJournal, ActiveAppView.WindowSnapshots;
 
 type
   TWindowActionTarget = record
@@ -116,7 +116,11 @@ type
     procedure btnMachineOverviewHelpClick(aSender: TObject);
   private
 
-    fApps: TAppList;
+    fDisplayedDetail: TWindowSnapshot;
+    fPendingCopy: TWindowSnapshot;
+    fPendingClipboardSequence: DWORD;
+    fWindowService: TWindowSnapshotService;
+    fWindowBatch: TWindowSnapshotBatch;
     fAuxListRefresh: iAsync;
     fAuxListRefreshBusy: Integer;
     fAuxListRefreshPending: Integer;
@@ -128,10 +132,6 @@ type
     fConfigCache: TConfigCache;
     fFocusSoundFileName: string;
     fFocusSoundPlayer: TProc<string>;
-    fDeepPrefixEdgeReady: Integer;
-    fDeepPrefixLoadBusy: Integer;
-    fDeepPrefixLoadTask: iAsync;
-    fDeepPrefixReady: Integer;
     fOrgAppOnActivate: TNotifyEvent;
     fChatMonitor: TChatMonitor;
     fGuiRefreshQueued: Integer;
@@ -151,18 +151,15 @@ type
     fChatMonitorSnapshot: TArray<TChatAppSnapshot>;
     fSharedAppsSnapshot: TArray<TChatAppSnapshot>;
     fSharedAppsSnapshotTick: UInt64;
-    fStartupDataLoadBusy: Integer;
-    fStartupDataLoadTask: iAsync;
     fStartupDataReady: Integer;
-    fStartupSkipSharedRefreshOnce: Integer;
     fStartupProfileAuxReadyLogged: Integer;
-    fStartupProfileFirstGuiLogged: Integer;
     fStartupProfileFullMetadataGuiLogged: Integer;
     fStartupProfileDeepPrefixGuiLogged: Integer;
     fStartupProfileLog: TStringList;
     fStartupProfileLogFileName: string;
     fStartupProfileLogSync: TCriticalSection;
     fStartupProfileStartTick: Int64;
+    fSlowUiSampleCount: Integer;
     fStartupProfileWarmupDoneLogged: Integer;
     fWindowTitlePollingIntervalMs: Cardinal;
     fWindowActionSourceListBox: TListBox;
@@ -184,6 +181,10 @@ type
     fSuppressNextReturnUntilTick: UInt64;
     fShutdownToken: iCancelToken;
     fShuttingDown: Integer;
+    procedure WMWindowRefresh(var aMessage: TMessage); message cWindowRefreshMessage;
+    procedure WMWindowSnapshot(var aMessage: TMessage); message cWindowSnapshotMessage;
+    procedure ResumeChatMonitorAfterSnapshot;
+    function TryGetWindowSnapshot(const aWnd: HWND; out aWindow: TWindowSnapshot): Boolean;
     procedure AppOnActivate(Sender: TObject);
     procedure PlayConfiguredFocusSound;
     function ApplyExpiredWindowCaptionOverrides: Boolean;
@@ -208,28 +209,20 @@ type
     procedure SetMachineOverviewFrozen(const aValue: Boolean);
     procedure OnAuxListsRefreshDone;
     procedure OnChatMonitorDone;
-    procedure OnDeepPrefixLoadDone;
-    procedure OnStartupDataLoadDone;
     procedure QueueGuiRefresh;
     procedure RebuildSharedAppsSnapshot;
     procedure RefreshConsoleList;
     procedure RunAuxListsRefresh;
     procedure RunChatMonitorSnapshot;
-    procedure RunDeepPrefixLoad;
-    procedure RunStartupDataLoad;
     procedure StartAuxListsRefresh;
     procedure StartChatMonitorProcessing;
-    procedure StartDeepPrefixLoad;
     procedure StartStartupDataLoad;
-    procedure EnsureSharedAppsSnapshotFresh(const aMaxAgeMs: UInt64);
     procedure FlushStartupProfileLog;
     function GetStartupElapsedMs: Int64;
-    function IsDeepPrefixAllowedForApp(const aApp: TAppInfo): Boolean;
-    function IsDeepPrefixReady: Boolean;
-    function IsEdgePrefixReady: Boolean;
     function IsStartupDataReady: Boolean;
     function IsShuttingDown: Boolean;
     procedure LogStartupTiming(const aPhase: string; const aDetails: string = '');
+    procedure RecordSlowUiOperation(const aOperation: string; const aElapsedMs: Double);
     procedure RequestAsyncStop(const aAsync: iAsync);
     procedure WaitAsyncWithShutdown(const aAsync: iAsync; const aTimeoutMs: Cardinal);
     procedure UpdateGui;
@@ -265,7 +258,6 @@ type
     function ShouldConsumeSuppressedReturnKey(const aSender: TObject; const aKey: Word): Boolean;
     procedure SuppressNextReturnKey(const aListBox: TListBox);
     procedure QuickValidateListBoxProcesses(const aListBox: TListBox);
-    procedure QuickValidateProcessesOnRefocus;
     procedure RemoveWindowFromSnapshots(const aWnd: hWnd);
     procedure RemoveWindowFromListBox(const aListBox: TListBox; const aWnd: hWnd);
     procedure RemoveWindowFromUiAndCache(const aWnd: hWnd);
@@ -275,14 +267,15 @@ type
     procedure WindowActionsPopupMenuPopup(aSender: TObject);
     procedure WindowCloseMenuItemClick(aSender: TObject);
     procedure WindowCopyMenuItemClick(aSender: TObject);
+    procedure TryPublishPendingWindowCopy;
     procedure WindowRenameMenuItemClick(aSender: TObject);
     procedure WindowTerminateMenuItemClick(aSender: TObject);
 
     procedure BringToFrontFocusedApp(lb: TListBox);
     procedure UpdateAppDetail(const aAllowExtendedMetadata: Boolean = True);
-    procedure CheckPrefixRule(var s: string; app: TAppInfo; const aRules: TPrefixRuleArray;
+    procedure CheckPrefixRule(var s: string; const aApp: TWindowSnapshot; const aRules: TPrefixRuleArray;
       aAllowFileNameMatching: Boolean; aAllowDeepMetadata: Boolean);
-    function ExcludeByMask(app: TAppInfo; const aMasks: TStringArray;
+    function ExcludeByMask(const aApp: TWindowSnapshot; const aMasks: TStringArray;
       aAllowFileNameMatching: Boolean): boolean;
     procedure RestoreItemIndex(lb: TListBox; wnd: hwnd; oldItemIndex: integer; const aOldItemCaption: string);
     function GetWnd(lb: TListBox): hwnd;
@@ -317,6 +310,12 @@ uses
 {$R *.dfm}
 
 type
+  TObservedListBox = class(TListBox)
+  public
+    MutationCount: Integer;
+    procedure WndProc(var aMessage: TMessage); override;
+  end;
+
   TListBoxItemData = class
   public
     Value: string;
@@ -340,7 +339,6 @@ const
   cWindowCaptionOverridesMetadataSectionName = 'Metadata';
   cWindowCaptionOverridesSectionName = 'Overrides';
   cWindowCaptionOverridesBootIdKey = 'BootId';
-  cTerminalPatternsFileName = 'TerminalPatterns.txt';
   cScriptsFolderName = 'Scripts';
   cScriptsIgnoreFileName = '.ignore';
   cHideMaskFileName = 'HideMask.txt';
@@ -1442,19 +1440,27 @@ begin
 end;
 
 procedure TAppsViewMainFrm.AppOnActivate(Sender: TObject);
+var
+  lWatch: TStopwatch;
 begin
-  if IsShuttingDown then
-    Exit;
+  lWatch := TStopwatch.StartNew;
+  try
+    if IsShuttingDown then
+      Exit;
 
-  PlayConfiguredFocusSound;
-  MarkFormFocused;
-  QuickValidateProcessesOnRefocus;
-  if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
-    StartStartupDataLoad
-  else
-    QueueGuiRefresh;
-  if assigned(fOrgAppOnActivate) then
-    fOrgAppOnActivate(Sender);
+    PlayConfiguredFocusSound;
+    MarkFormFocused;
+    StartAuxListsRefresh;
+
+    if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) = 0 then
+      StartStartupDataLoad
+    else
+      QueueGuiRefresh;
+    if assigned(fOrgAppOnActivate) then
+      fOrgAppOnActivate(Sender);
+  finally
+    RecordSlowUiOperation('Foreground', lWatch.Elapsed.TotalMilliseconds);
+  end;
 end;
 
 procedure TAppsViewMainFrm.PlayConfiguredFocusSound;
@@ -1652,10 +1658,9 @@ end;
 function TAppsViewMainFrm.BuildWindowCaptionOverrideIdentity(const aWnd: hWnd;
   const aProcessId: Cardinal): TCaptionOverrideIdentity;
 var
-  lApp: TAppInfo;
+  lApp: TWindowSnapshot;
   lBootIdentity: TWindowsBootIdentity;
   lObserved: TCaptionOverrideIdentity;
-  lProcessStartedAt: Int64;
   lRecord: TCaptionOverrideRecord;
 begin
   lObserved := Default(TCaptionOverrideIdentity);
@@ -1666,11 +1671,11 @@ begin
     lObserved.HasBootId := True;
     lObserved.BootId := lBootIdentity.UtcMilliseconds;
   end;
-  if fApps.TryGetApp(aWnd, lApp) and
-    lApp.TryGetCachedProcessStartedAt(lProcessStartedAt) then
+  if TryGetWindowSnapshot(aWnd, lApp) and
+    (lApp.ProcessStartedAt <> 0) then
   begin
     lObserved.HasProcessStartedAt := True;
-    lObserved.ProcessStartedAt := lProcessStartedAt;
+    lObserved.ProcessStartedAt := lApp.ProcessStartedAt;
   end;
   if fWindowCaptionOverrideRecords.TryGetValue(
     BuildWindowCaptionOverrideKey(aWnd, aProcessId),
@@ -1921,17 +1926,6 @@ begin
     aListBox.ItemIndex := CalculateWindowItemIndexAfterValidation(aListBox.Items, lOldItemIndex, lOldWnd);
 end;
 
-procedure TAppsViewMainFrm.QuickValidateProcessesOnRefocus;
-begin
-  QuickValidateListBoxProcesses(lbApps);
-  QuickValidateListBoxProcesses(lbExplorer);
-  QuickValidateListBoxProcesses(lbConsole);
-  if PruneWindowCaptionOverrides then
-    QueueGuiRefresh;
-  fSharedAppsSnapshotTick := 0;
-  UpdateAppDetail(False);
-end;
-
 procedure TAppsViewMainFrm.RemoveWindowFromListBox(const aListBox: TListBox; const aWnd: hWnd);
 var
   lIndex: Integer;
@@ -2007,6 +2001,8 @@ begin
 
   ActiveAppViewMainForm.RemoveWindowFromSnapshots(fSharedAppsSnapshot, aWnd);
   ActiveAppViewMainForm.RemoveWindowFromSnapshots(fChatMonitorSnapshot, aWnd);
+  if Assigned(fWindowService) then
+    fWindowService.RemoveWindow(aWnd);
 end;
 
 procedure TAppsViewMainFrm.ScheduleWindowActionCleanup(const aWnd: hWnd; const aProcessId: Cardinal);
@@ -2044,17 +2040,16 @@ end;
 
 procedure TAppsViewMainFrm.BringToFrontFocusedApp(lb: TListBox);
 var
-  app: TAppInfo;
-  wnd: hwnd;
+  lTarget: TWindowActionTarget;
 begin
-  wnd := 0;
-  if lb = lbApps then
-    UpdateAppDetail;
-
-  wnd := GetWnd(lb);
-
-  if fApps.TryGetApp(wnd, app) then
-    app.SHOW;
+  if not GetSelectedWindowInfo(lb, lTarget.Wnd, lTarget.ProcessId) then
+    Exit;
+  TThread.CreateAnonymousThread(
+    procedure
+    begin
+      if IsWindowIdentityCurrent(lTarget.Wnd, lTarget.ProcessId) then
+        maxLogic.Windows.Desktop.ForceForegroundWindow(lTarget.Wnd);
+    end).Start;
 end;
 
 procedure TAppsViewMainFrm.TerminateWindowTarget(
@@ -2157,12 +2152,10 @@ end;
 
 procedure TAppsViewMainFrm.WindowCopyMenuItemClick(aSender: TObject);
 var
-  lApp: TAppInfo;
-  lHasApp: Boolean;
   lListBox: TListBox;
-  lOwnsApp: Boolean;
   lTarget: TWindowActionTarget;
   lText: string;
+  lWindow: TWindowSnapshot;
 begin
   if not (aSender is TMenuItem) then
     Exit;
@@ -2170,41 +2163,79 @@ begin
     Exit;
   if not Assigned(lListBox) then
     Exit;
-
+  fPendingCopy := Default(TWindowSnapshot);
   lText := '';
   case TMenuItem(aSender).Tag of
     cWindowActionCopyProcessIdTag:
       lText := lTarget.ProcessId.ToString;
     cWindowActionCopyWindowHandleTag:
       lText := UIntToStr(NativeUInt(lTarget.Wnd));
-    cWindowActionCopyExecutableFileNameTag,
+    cWindowActionCopyExecutableFileNameTag:
+      if TryGetWindowSnapshot(lTarget.Wnd, lWindow) and (lWindow.PID = lTarget.ProcessId) then
+        lText := lWindow.FileName
+      else
+        lText := maxLogic.Windows.Desktop.GetFileName(lTarget.Wnd);
     cWindowActionCopyCommandLineTag:
     begin
-      lApp := nil;
-      lOwnsApp := False;
-      lHasApp := False;
-      if Assigned(fApps) then
-        lHasApp := fApps.TryGetApp(lTarget.Wnd, lApp);
-      if not lHasApp then
+      fPendingCopy.Wnd := lTarget.Wnd;
+      fPendingCopy.PID := lTarget.ProcessId;
+      fPendingClipboardSequence := GetClipboardSequenceNumber;
+      TryGetProcessStartedAtUtcMilliseconds(lTarget.ProcessId, fPendingCopy.ProcessStartedAt);
+      if TryGetWindowSnapshot(lTarget.Wnd, lWindow) then
+        fPendingCopy.CommandLineAttemptedAt := lWindow.CommandLineAttemptedAt;
+      TryPublishPendingWindowCopy;
+      if (fPendingCopy.Wnd <> 0) and Assigned(fWindowService) then
       begin
-        lApp := TAppInfo.Create(lTarget.Wnd);
-        lOwnsApp := True;
+        fWindowService.RequestCopyMetadata(fPendingCopy);
+        QueueGuiRefresh;
       end;
-      try
-        if TMenuItem(aSender).Tag = cWindowActionCopyExecutableFileNameTag then
-          lText := lApp.FileName
-        else
-          lText := lApp.CommandLine;
-      finally
-        if lOwnsApp then
-          lApp.Free;
-      end;
+      Exit;
     end;
   else
     Exit;
   end;
-  if lText <> '' then
+  if (lText <> '') and IsWindowIdentityCurrent(lTarget.Wnd, lTarget.ProcessId) then
     CopyTextToWindowActionClipboard(lText);
+end;
+
+procedure TAppsViewMainFrm.TryPublishPendingWindowCopy;
+var
+  lWindow: TWindowSnapshot;
+  lStartedAt: Int64;
+begin
+  if fPendingCopy.Wnd = 0 then
+    Exit;
+  if GetClipboardSequenceNumber <> fPendingClipboardSequence then
+  begin
+    fPendingCopy := Default(TWindowSnapshot);
+    Exit;
+  end;
+  if not IsWindowIdentityCurrent(fPendingCopy.Wnd, fPendingCopy.PID) then
+  begin
+    fPendingCopy := Default(TWindowSnapshot);
+    Exit;
+  end;
+  if not TryGetWindowSnapshot(fPendingCopy.Wnd, lWindow) then
+    Exit;
+  lStartedAt := 0;
+  TryGetProcessStartedAtUtcMilliseconds(lWindow.PID, lStartedAt);
+  if (not SameWindowSnapshotIdentity(fPendingCopy, lWindow)) or
+    (lStartedAt <> fPendingCopy.ProcessStartedAt) then
+  begin
+    fPendingCopy := Default(TWindowSnapshot);
+    Exit;
+  end;
+  if lWindow.MetadataReady or (wmCommandLine in lWindow.AvailableMetadata) then
+  begin
+    fPendingCopy := Default(TWindowSnapshot);
+    if lWindow.CommandLine <> '' then
+      CopyTextToWindowActionClipboard(lWindow.CommandLine);
+  end else if (lWindow.CommandLineError <> '') and
+    (lWindow.CommandLineAttemptedAt > fPendingCopy.CommandLineAttemptedAt) then
+  begin
+    LogStartupTiming('Clipboard.MetadataFailed', lWindow.CommandLineError);
+    fPendingCopy := Default(TWindowSnapshot);
+  end;
 end;
 
 procedure TAppsViewMainFrm.ApplyWindowCaptionRename(const aWnd: hWnd;
@@ -2451,80 +2482,173 @@ begin
   end;
 end;
 
-procedure TAppsViewMainFrm.ApplyDesktopSnapshot(const aItems: TNamedValueArray);
-var
-  lIndex: Integer;
-  lItem: TListBoxItemData;
-  lPrevCaption: string;
+function ListRowKey(const aItems: TStrings; const aIndex: Integer;
+  const aOwnsData: Boolean): string;
 begin
-  lPrevCaption := '';
-  if lbDesktop.ItemIndex <> -1 then
-    lPrevCaption := lbDesktop.Items[lbDesktop.ItemIndex];
+  if aOwnsData then
+    Result := aItems[aIndex] + #0 + TListBoxItemData(aItems.Objects[aIndex]).Value
+  else if Assigned(aItems.Objects[aIndex]) then
+    Result := UIntToStr(NativeUInt(aItems.Objects[aIndex]))
+  else
+    Result := aItems[aIndex];
+end;
 
-  lbDesktop.Items.BeginUpdate;
+procedure SynchronizeListItems(const aListBox: TListBox; const aDesired: TStrings;
+  const aOwnsData: Boolean = False);
+var
+  lCounts: TDictionary<string, Integer>;
+  lCount: Integer;
+  lData: TObject;
+  lKey: string;
+  lSelectedKey: string;
+  lTopKey: string;
+  lOldIndex: Integer;
+  lOldTop: Integer;
+  lSelectedIndex: Integer;
+  lTopIndex: Integer;
+  lEqual: Boolean;
+  i, j: Integer;
+begin
+  lEqual := aListBox.Items.Count = aDesired.Count;
+  if lEqual then
+    for i := 0 to aDesired.Count - 1 do
+      if (aListBox.Items[i] <> aDesired[i]) or
+        (ListRowKey(aListBox.Items, i, aOwnsData) <> ListRowKey(aDesired, i, aOwnsData)) then
+      begin
+        lEqual := False;
+        Break;
+      end;
+  if lEqual then
+    Exit;
+  lOldIndex := aListBox.ItemIndex;
+  lOldTop := aListBox.TopIndex;
+  lSelectedKey := '';
+  lTopKey := '';
+  if lOldIndex >= 0 then
+    lSelectedKey := ListRowKey(aListBox.Items, lOldIndex, aOwnsData);
+  if (lOldTop >= 0) and (lOldTop < aListBox.Items.Count) then
+    lTopKey := ListRowKey(aListBox.Items, lOldTop, aOwnsData);
+  lCounts := TDictionary<string, Integer>.Create(TFastCaseAwareComparer.Ordinal);
   try
-    ClearListBoxItemData(lbDesktop);
-    for lIndex := 0 to High(aItems) do
+    for i := 0 to aDesired.Count - 1 do
     begin
-      lItem := TListBoxItemData.Create(aItems[lIndex].Value);
-      lbDesktop.Items.AddObject(aItems[lIndex].Name, lItem);
+      lKey := ListRowKey(aDesired, i, aOwnsData);
+      if not lCounts.TryGetValue(lKey, lCount) then
+        lCount := 0;
+      lCounts.AddOrSetValue(lKey, lCount + 1);
+    end;
+    aListBox.Items.BeginUpdate;
+    try
+      for i := aListBox.Items.Count - 1 downto 0 do
+      begin
+        lKey := ListRowKey(aListBox.Items, i, aOwnsData);
+        if lCounts.TryGetValue(lKey, lCount) and (lCount > 0) then
+          lCounts[lKey] := lCount - 1
+        else
+        begin
+          if aOwnsData then
+            aListBox.Items.Objects[i].Free;
+          aListBox.Items.Delete(i);
+        end;
+      end;
+      for i := 0 to aDesired.Count - 1 do
+      begin
+        lKey := ListRowKey(aDesired, i, aOwnsData);
+        j := i;
+        while (j < aListBox.Items.Count) and
+          (ListRowKey(aListBox.Items, j, aOwnsData) <> lKey) do
+          Inc(j);
+        if j < aListBox.Items.Count then
+        begin
+          if j <> i then
+          begin
+            lData := aListBox.Items.Objects[j];
+            aListBox.Items.Delete(j);
+            aListBox.Items.InsertObject(i, aDesired[i], lData);
+          end else if aListBox.Items[i] <> aDesired[i] then
+            aListBox.Items[i] := aDesired[i];
+        end else begin
+          if aOwnsData then
+            lData := TListBoxItemData.Create(TListBoxItemData(aDesired.Objects[i]).Value)
+          else
+            lData := aDesired.Objects[i];
+          aListBox.Items.InsertObject(i, aDesired[i], lData);
+        end;
+      end;
+      lSelectedIndex := -1;
+      lTopIndex := -1;
+      for i := 0 to aListBox.Items.Count - 1 do
+      begin
+        lKey := ListRowKey(aListBox.Items, i, aOwnsData);
+        if (lSelectedIndex < 0) and (lKey = lSelectedKey) then
+          lSelectedIndex := i;
+        if (lTopIndex < 0) and (lKey = lTopKey) then
+          lTopIndex := i;
+      end;
+      if lSelectedIndex < 0 then
+      begin
+        lSelectedIndex := lOldIndex;
+        if lSelectedIndex >= aListBox.Items.Count then
+          lSelectedIndex := aListBox.Items.Count - 1;
+      end;
+      if aListBox.ItemIndex <> lSelectedIndex then
+        aListBox.ItemIndex := lSelectedIndex;
+      if lTopIndex < 0 then
+        lTopIndex := lOldTop;
+      if (lTopIndex >= 0) and (lTopIndex < aListBox.Items.Count) then
+        aListBox.TopIndex := lTopIndex;
+    finally
+      aListBox.Items.EndUpdate;
     end;
   finally
-    lbDesktop.Items.EndUpdate;
+    lCounts.Free;
   end;
+end;
 
-  RestoreSelectedItem(lbDesktop, lPrevCaption);
+procedure ApplyNamedListSnapshot(const aListBox: TListBox; const aItems: TNamedValueArray);
+var
+  lDesired: TStringList;
+  lItem: TNamedValue;
+  i: Integer;
+begin
+  lDesired := TStringList.Create;
+  try
+    lDesired.Sorted := aListBox.Sorted;
+    lDesired.Duplicates := dupAccept;
+    for lItem in aItems do
+      lDesired.AddObject(lItem.Name, TListBoxItemData.Create(lItem.Value));
+    SynchronizeListItems(aListBox, lDesired, True);
+  finally
+    for i := 0 to lDesired.Count - 1 do
+      lDesired.Objects[i].Free;
+    lDesired.Free;
+  end;
+end;
+
+procedure TAppsViewMainFrm.ApplyDesktopSnapshot(const aItems: TNamedValueArray);
+begin
+  ApplyNamedListSnapshot(lbDesktop, aItems);
 end;
 
 procedure TAppsViewMainFrm.ApplyShortCutsSnapshot(const aItems: TNamedValueArray);
-var
-  lIndex: Integer;
-  lItem: TListBoxItemData;
-  lPrevCaption: string;
 begin
-  lPrevCaption := '';
-  if lbShortCuts.ItemIndex <> -1 then
-    lPrevCaption := lbShortCuts.Items[lbShortCuts.ItemIndex];
-
-  lbShortCuts.Items.BeginUpdate;
-  try
-    ClearListBoxItemData(lbShortCuts);
-    for lIndex := 0 to High(aItems) do
-    begin
-      lItem := TListBoxItemData.Create(aItems[lIndex].Value);
-      lbShortCuts.Items.AddObject(aItems[lIndex].Name, lItem);
-    end;
-  finally
-    lbShortCuts.Items.EndUpdate;
-  end;
-
-  RestoreSelectedItem(lbShortCuts, lPrevCaption);
+  ApplyNamedListSnapshot(lbShortCuts, aItems);
 end;
 
 procedure TAppsViewMainFrm.ApplyScriptsSnapshot(const aScripts: TStringArray);
 var
-  lIndex: Integer;
-  lItemIndex: Integer;
-  lScriptName: string;
-  lPrevFocused: string;
+  lDesired: TStringList;
+  lScript: string;
 begin
-  lPrevFocused := '';
-  if lbScripts.ItemIndex <> -1 then
-    lPrevFocused := lbScripts.Items[lbScripts.ItemIndex];
-
-  lbScripts.Items.BeginUpdate;
+  lDesired := TStringList.Create;
   try
-    lbScripts.ItemIndex := -1;
-    lbScripts.Items.Clear;
-    for lIndex := 0 to High(aScripts) do
-    begin
-      lScriptName := aScripts[lIndex];
-      lItemIndex := lbScripts.Items.Add(lScriptName);
-      if (lbScripts.ItemIndex = -1) and SameText(lPrevFocused, lScriptName) then
-        lbScripts.ItemIndex := lItemIndex;
-    end;
+    lDesired.Sorted := lbScripts.Sorted;
+    lDesired.Duplicates := dupAccept;
+    for lScript in aScripts do
+      lDesired.Add(lScript);
+    SynchronizeListItems(lbScripts, lDesired);
   finally
-    lbScripts.Items.EndUpdate;
+    lDesired.Free;
   end;
 end;
 
@@ -2587,253 +2711,89 @@ begin
   fAuxListRefresh := SimpleAsyncCall(RunAuxListsRefresh, 'ActiveAppView.AuxListRefresh', OnAuxListsRefreshDone);
 end;
 
-procedure TAppsViewMainFrm.RunStartupDataLoad;
-var
-  lApps: TArray<TAppInfo>;
-  lIndex: Integer;
-  lParallelPrefetchMs: Int64;
-  lRefreshSnapshotMs: Int64;
-  lWarmupWatch: TStopwatch;
-  lPhaseWatch: TStopwatch;
-begin
-  if IsShuttingDown then
-    Exit;
 
-  lWarmupWatch := TStopwatch.StartNew;
 
-  fConfigCache.GetHideMasks(cHideMaskFileName);
-  fConfigCache.GetPrefixRules(cPrefixMaskFileName);
-  fConfigCache.GetTerminalPatterns(cTerminalPatternsFileName);
 
-  lPhaseWatch := TStopwatch.StartNew;
-  EnsureSharedAppsSnapshotFresh(0);
-  lRefreshSnapshotMs := lPhaseWatch.ElapsedMilliseconds;
-  if IsShuttingDown then
-    Exit;
 
-  SetLength(lApps, fApps.Count);
-  for lIndex := 0 to fApps.Count - 1 do
-    lApps[lIndex] := fApps[lIndex];
-
-  if Length(lApps) = 0 then
-    Exit;
-
-  lPhaseWatch := TStopwatch.StartNew;
-  PrefetchAppFileNamesInParallel(
-    lApps,
-    fShutdownToken);
-  lParallelPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
-
-  if not IsShuttingDown then
-  begin
-    LogStartupTiming(
-      'Warmup.ThreadDone',
-      Format(
-        'apps=%d refreshSnapshot=%dms fileNamePrefetch=%dms total=%dms',
-        [Length(lApps), lRefreshSnapshotMs, lParallelPrefetchMs, lWarmupWatch.ElapsedMilliseconds]));
-    if TInterlocked.CompareExchange(fStartupDataReady, 1, 0) = 0 then
-    begin
-      TInterlocked.Exchange(fStartupSkipSharedRefreshOnce, 1);
-      TThread.Synchronize(nil,
-        procedure
-        begin
-          if IsShuttingDown then
-            Exit;
-
-          LogStartupTiming('Warmup.SynchronizeUi');
-          if TInterlocked.CompareExchange(fStartupProfileWarmupDoneLogged, 1, 0) = 0 then
-            LogStartupTiming('Warmup.Done');
-          tmrChatMonitor.Enabled := ShouldEnableSharedTimer(
-            fWindowTitlePollingIntervalMs,
-            fChatMonitorConfiguredEnabled,
-            fChatMonitorIntervalMs,
-            fMachineOverviewEnabled);
-          StartDeepPrefixLoad;
-          UpdateGui;
-        end);
-    end;
-  end;
-end;
-
-procedure TAppsViewMainFrm.RunDeepPrefixLoad;
-var
-  lApps: TArray<TAppInfo>;
-  lEdgeApps: TArray<TAppInfo>;
-  lEdgeCount: Integer;
-  lEdgePrefixPrefetchMs: Int64;
-  lIndex: Integer;
-  lNeedAppUserModelID: Boolean;
-  lNeedCmdParams: Boolean;
-  lPhaseWatch: TStopwatch;
-  lPrefixPrefetchMs: Int64;
-  lPrefixRules: TPrefixRuleArray;
-  lRule: TPrefixRule;
-begin
-  if IsShuttingDown then
-    Exit;
-
-  lPrefixRules := fConfigCache.GetPrefixRules(cPrefixMaskFileName);
-  lNeedAppUserModelID := False;
-  lNeedCmdParams := False;
-  for lRule in lPrefixRules do
-  begin
-    if lRule.AppUserModelIDMask <> '' then
-      lNeedAppUserModelID := True;
-    if lRule.CmdParamsMask <> '' then
-      lNeedCmdParams := True;
-    if lNeedAppUserModelID and lNeedCmdParams then
-      Break;
-  end;
-
-  if not (lNeedAppUserModelID or lNeedCmdParams) then
-  begin
-    LogStartupTiming('DeepPrefix.ThreadDone', 'skipped no-deep-rules');
-    Exit;
-  end;
-
-  SetLength(lApps, fApps.Count);
-  for lIndex := 0 to fApps.Count - 1 do
-    lApps[lIndex] := fApps[lIndex];
-
-  if Length(lApps) = 0 then
-  begin
-    LogStartupTiming('DeepPrefix.ThreadDone', 'skipped no-apps');
-    Exit;
-  end;
-
-  SetLength(lEdgeApps, Length(lApps));
-  lEdgeCount := 0;
-  for lIndex := 0 to High(lApps) do
-  begin
-    if (lApps[lIndex] <> nil) and IsEdgeBasedAppFileName(lApps[lIndex].FileName) then
-    begin
-      lEdgeApps[lEdgeCount] := lApps[lIndex];
-      Inc(lEdgeCount);
-    end;
-  end;
-  SetLength(lEdgeApps, lEdgeCount);
-
-  if Length(lEdgeApps) <> 0 then
-  begin
-    lPhaseWatch := TStopwatch.StartNew;
-    PrefetchDeepPrefixMetadataForApps(lEdgeApps, lNeedAppUserModelID, lNeedCmdParams, fShutdownToken);
-    lEdgePrefixPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
-
-    if not IsShuttingDown then
-    begin
-      TInterlocked.Exchange(fDeepPrefixEdgeReady, 1);
-      LogStartupTiming(
-        'DeepPrefix.EdgeReady',
-        Format(
-          'apps=%d appUserModelId=%s cmdParams=%s prefetch=%dms',
-          [Length(lEdgeApps), BoolToStr(lNeedAppUserModelID, True), BoolToStr(lNeedCmdParams, True),
-           lEdgePrefixPrefetchMs]));
-      QueueGuiRefresh;
-    end;
-  end;
-
-  lPhaseWatch := TStopwatch.StartNew;
-  PrefetchDeepPrefixMetadataForApps(lApps, lNeedAppUserModelID, lNeedCmdParams, fShutdownToken);
-  lPrefixPrefetchMs := lPhaseWatch.ElapsedMilliseconds;
-
-  if not IsShuttingDown then
-    LogStartupTiming(
-      'DeepPrefix.ThreadDone',
-      Format(
-        'apps=%d appUserModelId=%s cmdParams=%s prefetch=%dms',
-        [Length(lApps), BoolToStr(lNeedAppUserModelID, True), BoolToStr(lNeedCmdParams, True),
-         lPrefixPrefetchMs]));
-end;
-
-procedure TAppsViewMainFrm.OnDeepPrefixLoadDone;
-begin
-  TInterlocked.Exchange(fDeepPrefixLoadBusy, 0);
-  TInterlocked.Exchange(fDeepPrefixEdgeReady, 1);
-  TInterlocked.Exchange(fDeepPrefixReady, 1);
-
-  if IsShuttingDown then
-    Exit;
-
-  LogStartupTiming('DeepPrefix.Done');
-  QueueGuiRefresh;
-end;
-
-procedure TAppsViewMainFrm.StartDeepPrefixLoad;
-begin
-  if IsShuttingDown then
-    Exit;
-
-  if TInterlocked.CompareExchange(fDeepPrefixReady, 0, 0) <> 0 then
-    Exit;
-
-  if TInterlocked.CompareExchange(fDeepPrefixLoadBusy, 1, 0) <> 0 then
-    Exit;
-
-  fDeepPrefixLoadTask := SimpleAsyncCall(
-    RunDeepPrefixLoad,
-    'ActiveAppView.DeepPrefixLoad',
-    OnDeepPrefixLoadDone);
-end;
-
-procedure TAppsViewMainFrm.OnStartupDataLoadDone;
-begin
-  TInterlocked.Exchange(fStartupDataLoadBusy, 0);
-  if TInterlocked.CompareExchange(fStartupDataReady, 1, 0) <> 0 then
-    Exit;
-
-  TInterlocked.Exchange(fStartupSkipSharedRefreshOnce, 1);
-
-  if IsShuttingDown then
-    Exit;
-
-  if TInterlocked.CompareExchange(fStartupProfileWarmupDoneLogged, 1, 0) = 0 then
-    LogStartupTiming('Warmup.Done');
-
-  tmrChatMonitor.Enabled := ShouldEnableSharedTimer(
-    fWindowTitlePollingIntervalMs,
-    fChatMonitorConfiguredEnabled,
-    fChatMonitorIntervalMs,
-    fMachineOverviewEnabled);
-  StartDeepPrefixLoad;
-  QueueGuiRefresh;
-end;
 
 procedure TAppsViewMainFrm.StartStartupDataLoad;
 begin
-  if IsShuttingDown then
-    Exit;
-
-  if TInterlocked.CompareExchange(fStartupDataReady, 0, 0) <> 0 then
-  begin
-    QueueGuiRefresh;
-    Exit;
-  end;
-
-  if TInterlocked.CompareExchange(fStartupDataLoadBusy, 1, 0) <> 0 then
-    Exit;
-
-  fStartupDataLoadTask := SimpleAsyncCall(
-    RunStartupDataLoad,
-    'ActiveAppView.StartupDataLoad',
-    OnStartupDataLoadDone);
+  QueueGuiRefresh;
 end;
 
 procedure TAppsViewMainFrm.QueueGuiRefresh;
 begin
+  if IsShuttingDown or (TInterlocked.CompareExchange(fGuiRefreshQueued, 1, 0) <> 0) then
+    Exit;
+  if not PostMessage(Handle, cWindowRefreshMessage, 0, 0) then
+    TInterlocked.Exchange(fGuiRefreshQueued, 0);
+end;
+
+procedure TAppsViewMainFrm.WMWindowRefresh(var aMessage: TMessage);
+begin
+  TInterlocked.Exchange(fGuiRefreshQueued, 0);
   if IsShuttingDown then
     Exit;
+  if Assigned(fWindowService) then
+    fWindowService.RequestRefresh;
+end;
 
-  if TInterlocked.CompareExchange(fGuiRefreshQueued, 1, 0) <> 0 then
+procedure TAppsViewMainFrm.WMWindowSnapshot(var aMessage: TMessage);
+var
+  lBatch: TWindowSnapshotBatch;
+  lOldWindow: TWindowSnapshot;
+  lWindow: TWindowSnapshot;
+  lWatch: TStopwatch;
+begin
+  lWatch := TStopwatch.StartNew;
+  try
+    if IsShuttingDown or (not Assigned(fWindowService)) then
+      Exit;
+    if not fWindowService.TryTake(lBatch) then
+      Exit;
+    if lBatch.ErrorText <> '' then
+      LogStartupTiming('WindowSnapshot.Error', lBatch.ErrorText);
+    for lWindow in lBatch.Windows do
+      if (lWindow.MetadataError <> '') and
+        ((not TryGetWindowSnapshot(lWindow.Wnd, lOldWindow)) or
+         (lOldWindow.MetadataAttemptedAt <> lWindow.MetadataAttemptedAt)) then
+        LogStartupTiming('WindowMetadata.Error', Format('pid=%d hwnd=%s %s',
+          [lWindow.PID, UIntToStr(NativeUInt(lWindow.Wnd)), lWindow.MetadataError]));
+    fWindowBatch := lBatch;
+    TryPublishPendingWindowCopy;
+    TInterlocked.Exchange(fStartupDataReady, 1);
+    RebuildSharedAppsSnapshot;
+    tmrChatMonitor.Enabled := ShouldEnableSharedTimer(fWindowTitlePollingIntervalMs,
+      fChatMonitorConfiguredEnabled, fChatMonitorIntervalMs, fMachineOverviewEnabled);
+    UpdateGui;
+    ResumeChatMonitorAfterSnapshot;
+  finally
+    RecordSlowUiOperation('WindowSnapshot', lWatch.Elapsed.TotalMilliseconds);
+  end;
+end;
+
+procedure TAppsViewMainFrm.ResumeChatMonitorAfterSnapshot;
+begin
+  if fWindowBatch.ErrorText <> '' then
     Exit;
+  if (TInterlocked.CompareExchange(fChatMonitorPending, 0, 0) <> 0) and
+    (TInterlocked.CompareExchange(fChatMonitorBusy, 0, 0) = 0) then
+    StartChatMonitorProcessing;
+end;
 
-  TThread.Queue(TThread(nil),
-    procedure
+function TAppsViewMainFrm.TryGetWindowSnapshot(const aWnd: HWND;
+  out aWindow: TWindowSnapshot): Boolean;
+var
+  lWindow: TWindowSnapshot;
+begin
+  for lWindow in fWindowBatch.Windows do
+    if lWindow.Wnd = aWnd then
     begin
-      TInterlocked.Exchange(fGuiRefreshQueued, 0);
-      if IsShuttingDown then
-        Exit;
-      UpdateGui;
-    end);
+      aWindow := lWindow;
+      Exit(True);
+    end;
+  aWindow := Default(TWindowSnapshot);
+  Result := False;
 end;
 
 function ShortCutPathExists(const aPath: string): Boolean;
@@ -3059,7 +3019,7 @@ begin
   end;
 end;
 
-procedure TAppsViewMainFrm.CheckPrefixRule(var s: string; app: TAppInfo; const aRules: TPrefixRuleArray;
+procedure TAppsViewMainFrm.CheckPrefixRule(var s: string; const aApp: TWindowSnapshot; const aRules: TPrefixRuleArray;
   aAllowFileNameMatching: Boolean; aAllowDeepMetadata: Boolean);
 var
   lAppUserModelID: string;
@@ -3069,14 +3029,14 @@ begin
   lCommandLineParams := '';
   if aAllowDeepMetadata then
   begin
-    lAppUserModelID := app.AppUserModelID;
-    lCommandLineParams := app.CommandLineParams;
+    lAppUserModelID := aApp.AppUserModelID;
+    lCommandLineParams := aApp.CommandLineParams;
   end;
 
   ApplyPrefixRuleForMetadata(
     s,
-    app.Caption,
-    app.FileName,
+    aApp.Caption,
+    aApp.FileName,
     lAppUserModelID,
     lCommandLineParams,
     aRules,
@@ -3084,7 +3044,7 @@ begin
     aAllowDeepMetadata);
 end;
 
-function TAppsViewMainFrm.ExcludeByMask(app: TAppInfo; const aMasks: TStringArray;
+function TAppsViewMainFrm.ExcludeByMask(const aApp: TWindowSnapshot; const aMasks: TStringArray;
   aAllowFileNameMatching: Boolean): boolean;
 var
   lMask: string;
@@ -3092,7 +3052,7 @@ begin
   Result := False;
   for lMask in aMasks do
   begin
-    if maxLogic.StrUtils.StringMatches(app.caption, lMask, False) then
+    if maxLogic.StrUtils.StringMatches(aApp.caption, lMask, False) then
       Exit(True);
   end;
 
@@ -3101,7 +3061,7 @@ begin
 
   for lMask in aMasks do
   begin
-    if maxLogic.StrUtils.StringMatches(app.FileName, lMask, False) then
+    if maxLogic.StrUtils.StringMatches(aApp.FileName, lMask, False) then
       Exit(True);
   end;
 end;
@@ -3303,14 +3263,12 @@ begin
   fStartupProfileStartTick := TStopwatch.GetTimeStamp;
   TInterlocked.Exchange(fStartupProfileAuxReadyLogged, 0);
   TInterlocked.Exchange(fStartupProfileDeepPrefixGuiLogged, 0);
-  TInterlocked.Exchange(fStartupProfileFirstGuiLogged, 0);
   TInterlocked.Exchange(fStartupProfileFullMetadataGuiLogged, 0);
   TInterlocked.Exchange(fStartupProfileWarmupDoneLogged, 0);
   fStartupProfileLog.Add('----------------------------------------');
   fStartupProfileLog.Add(Format('Run started at %s', [FormatDateTime('yyyy-mm-dd hh:nn:ss.zzz', Now)]));
   LogStartupTiming('FormCreate.Start');
 
-  fApps := TAppList.Create;
   fConfigCache := TConfigCache.Create(GetInstallDir);
   fWindowCaptionOverrideRecords := TDictionary<string, TCaptionOverrideRecord>.Create;
   fWindowCaptionOverrides := TDictionary<string, string>.Create;
@@ -3394,12 +3352,9 @@ begin
   SetLength(fSharedAppsSnapshot, 0);
   SetLength(fChatMonitorSnapshot, 0);
   fSharedAppsSnapshotTick := 0;
-  TInterlocked.Exchange(fDeepPrefixEdgeReady, 0);
-  TInterlocked.Exchange(fDeepPrefixLoadBusy, 0);
-  TInterlocked.Exchange(fDeepPrefixReady, 0);
   TInterlocked.Exchange(fStartupDataReady, 0);
-  TInterlocked.Exchange(fStartupSkipSharedRefreshOnce, 0);
   TInterlocked.Exchange(fShuttingDown, 0);
+  fWindowService := TWindowSnapshotService.Create(GetInstallDir, Handle);
   LogStartupTiming(
     'FormCreate.Done',
     Format('chatMonitorEnabled=%s chatSoundEnabled=%s',
@@ -3416,6 +3371,7 @@ begin
   if Assigned(fShutdownToken) then
     fShutdownToken.Cancel;
   tmrChatMonitor.Enabled := False;
+  FreeAndNil(fWindowService);
   TInterlocked.Exchange(fChatMonitorPending, 0);
   TInterlocked.Exchange(fAuxListRefreshPending, 0);
   application.OnActivate := fOrgAppOnActivate;
@@ -3423,8 +3379,6 @@ begin
 
   RequestAsyncStop(fAuxListRefresh);
   RequestAsyncStop(fChatMonitorTask);
-  RequestAsyncStop(fDeepPrefixLoadTask);
-  RequestAsyncStop(fStartupDataLoadTask);
   if Assigned(fMachineOverviewService) then
   begin
     lShutdownResult := fMachineOverviewService.Stop(cShutdownTaskWaitTimeoutMs);
@@ -3435,14 +3389,10 @@ begin
 
   WaitAsyncWithShutdown(fAuxListRefresh, cShutdownTaskWaitTimeoutMs);
   WaitAsyncWithShutdown(fChatMonitorTask, cShutdownTaskWaitTimeoutMs);
-  WaitAsyncWithShutdown(fDeepPrefixLoadTask, cShutdownTaskWaitTimeoutMs);
-  WaitAsyncWithShutdown(fStartupDataLoadTask, cShutdownTaskWaitTimeoutMs);
 
   FreeAndNil(fPendingAuxSnapshot);
   fAuxListRefresh := nil;
   fChatMonitorTask := nil;
-  fDeepPrefixLoadTask := nil;
-  fStartupDataLoadTask := nil;
   fMachineOverviewService := nil;
   FreeAndNil(fMachineOverviewLayout);
   FreeAndNil(fMachineOverviewController);
@@ -3454,7 +3404,6 @@ begin
   FreeAndNil(fConfigCache);
   FreeAndNil(fWindowCaptionOverrideRecords);
   FreeAndNil(fWindowCaptionOverrides);
-  fApps.Free;
   LogStartupTiming('FormDestroy.Flush');
   FlushStartupProfileLog;
   FreeAndNil(fStartupProfileLog);
@@ -3491,7 +3440,10 @@ begin
   end;
 
   if Key = VK_F5 then
-    UpdateGui
+  begin
+    QueueGuiRefresh;
+    StartAuxListsRefresh;
+  end
   else if Key = vk_F1 then
     lbApps.SetFocus
   else if Key = vk_F2 then
@@ -3656,6 +3608,23 @@ begin
   end;
 end;
 
+procedure TAppsViewMainFrm.RecordSlowUiOperation(const aOperation: string; const aElapsedMs: Double);
+const
+  cSlowUiThresholdMs = 50;
+  cMaxSlowUiSamples = 128;
+begin
+  if (aElapsedMs < cSlowUiThresholdMs) or (fSlowUiSampleCount > cMaxSlowUiSamples) or
+    (fStartupProfileStartTick = 0) or (not Assigned(fStartupProfileLog)) or
+    (not Assigned(fStartupProfileLogSync)) then
+    Exit;
+  Inc(fSlowUiSampleCount);
+  if fSlowUiSampleCount > cMaxSlowUiSamples then
+    LogStartupTiming('UI.Slow', 'sample limit reached')
+  else
+    LogStartupTiming('UI.Slow', Format('operation=%s durationMs=%d windows=%d',
+      [aOperation, Round(aElapsedMs), Length(fWindowBatch.Windows)]));
+end;
+
 procedure TAppsViewMainFrm.LogStartupTiming(const aPhase: string; const aDetails: string);
 var
   lMessage: string;
@@ -3687,24 +3656,7 @@ begin
   Result := (TInterlocked.CompareExchange(fStartupDataReady, 0, 0) <> 0);
 end;
 
-function TAppsViewMainFrm.IsDeepPrefixReady: Boolean;
-begin
-  Result := (TInterlocked.CompareExchange(fDeepPrefixReady, 0, 0) <> 0);
-end;
 
-function TAppsViewMainFrm.IsEdgePrefixReady: Boolean;
-begin
-  Result := (TInterlocked.CompareExchange(fDeepPrefixEdgeReady, 0, 0) <> 0);
-end;
-
-function TAppsViewMainFrm.IsDeepPrefixAllowedForApp(const aApp: TAppInfo): Boolean;
-begin
-  Result := IsDeepPrefixReady;
-  if Result or (aApp = nil) then
-    Exit;
-
-  Result := IsEdgePrefixReady and IsEdgeBasedAppFileName(aApp.FileName);
-end;
 
 procedure TAppsViewMainFrm.RequestAsyncStop(const aAsync: iAsync);
 var
@@ -3757,33 +3709,17 @@ begin
   TWaiter.WaitFor([aAsync], INFINITE, True);
 end;
 
-procedure TAppsViewMainFrm.EnsureSharedAppsSnapshotFresh(const aMaxAgeMs: UInt64);
-var
-  lNowTick: UInt64;
-begin
-  if IsShuttingDown then
-    Exit;
-
-  lNowTick := GetTickCount64;
-  if (fSharedAppsSnapshotTick <> 0) and (aMaxAgeMs <> 0)
-    and ((lNowTick - fSharedAppsSnapshotTick) < aMaxAgeMs) then
-    Exit;
-
-  fApps.Update;
-  RebuildSharedAppsSnapshot;
-end;
-
 procedure TAppsViewMainFrm.RebuildSharedAppsSnapshot;
 var
-  lIndex: Integer;
+  i: Integer;
 begin
-  SetLength(fSharedAppsSnapshot, fApps.Count);
-  for lIndex := 0 to fApps.Count - 1 do
+  SetLength(fSharedAppsSnapshot, Length(fWindowBatch.Windows));
+  for i := 0 to High(fWindowBatch.Windows) do
   begin
-    fSharedAppsSnapshot[lIndex].Wnd := fApps[lIndex].Wnd;
-    fSharedAppsSnapshot[lIndex].Caption := fApps[lIndex].Caption;
+    fSharedAppsSnapshot[i].Wnd := fWindowBatch.Windows[i].Wnd;
+    fSharedAppsSnapshot[i].Caption := fWindowBatch.Windows[i].Caption;
   end;
-  fSharedAppsSnapshotTick := GetTickCount64;
+  fSharedAppsSnapshotTick := fWindowBatch.CollectedAt;
 end;
 
 procedure TAppsViewMainFrm.RunChatMonitorSnapshot;
@@ -3811,13 +3747,20 @@ begin
   if not Assigned(fChatMonitor) then
     Exit;
 
+  if (fSharedAppsSnapshotTick = 0) or (GetTickCount64 - fSharedAppsSnapshotTick >= 900) then
+  begin
+    TInterlocked.Exchange(fChatMonitorPending, 1);
+    QueueGuiRefresh;
+    Exit;
+  end;
+
   if TInterlocked.CompareExchange(fChatMonitorBusy, 1, 0) <> 0 then
   begin
     TInterlocked.Exchange(fChatMonitorPending, 1);
     Exit;
   end;
 
-  EnsureSharedAppsSnapshotFresh(900);
+  TInterlocked.Exchange(fChatMonitorPending, 0);
   fChatMonitorSnapshot := Copy(fSharedAppsSnapshot);
   fChatMonitorTask := SimpleAsyncCall(RunChatMonitorSnapshot, 'ActiveAppView.ChatMonitor', OnChatMonitorDone);
 end;
@@ -3828,8 +3771,25 @@ begin
   lb.ItemIndex := CalculateRestoredItemIndex(lb.Items, wnd, oldItemIndex, aOldItemCaption, lb.Sorted);
 end;
 
+procedure TObservedListBox.WndProc(var aMessage: TMessage);
+begin
+  case aMessage.Msg of
+    LB_ADDSTRING, LB_INSERTSTRING, LB_DELETESTRING, LB_RESETCONTENT:
+      Inc(MutationCount);
+  end;
+  inherited;
+end;
+
 function RunMainFormSelfTests(const aArg: string): Integer;
 var
+  lTestSettings: TMemIniFile;
+  lObservedList: TObservedListBox;
+  lDetailWatch: TStopwatch;
+  lMaxApplyMs: Double;
+  lApplyMs: Double;
+  lNamedItems: TNamedValueArray;
+  lOwnedData: TObject;
+  lSample: Integer;
   lActualValue: string;
   lApps: TArray<TAppInfo>;
   lApplyResult: TWindowCaptionDialogApplyResult;
@@ -3885,6 +3845,312 @@ var
   lWasPruned: Boolean;
 begin
   Result := -1;
+  if SameText(aArg, '--self-test-ui-timing') then
+  begin
+    Result := 0;
+    lTestForm := TAppsViewMainFrm.CreateNew(nil);
+    try
+      lTestForm.fStartupProfileLog := TStringList.Create;
+      lTestForm.fStartupProfileLogSync := TCriticalSection.Create;
+      lTestForm.fStartupProfileStartTick := TStopwatch.GetTimeStamp;
+      lTestForm.RecordSlowUiOperation('Foreground', 49.9);
+      if lTestForm.fStartupProfileLog.Count <> 0 then
+        raise Exception.Create('Fast GUI operation was logged');
+      lTestForm.RecordSlowUiOperation('Foreground', 50);
+      if (lTestForm.fStartupProfileLog.Count <> 1) or
+        (not ContainsText(lTestForm.fStartupProfileLog.Text, 'operation=Foreground durationMs=50 windows=0')) then
+        raise Exception.Create('Slow GUI operation was not recorded with its duration and size');
+      for lIndex := 1 to 200 do
+        lTestForm.RecordSlowUiOperation('WindowSnapshot', 50 + lIndex);
+      if (lTestForm.fStartupProfileLog.Count <> 129) or
+        (not ContainsText(lTestForm.fStartupProfileLog[128], 'sample limit reached')) then
+        raise Exception.Create('Slow GUI sample storage is not bounded');
+      lTestForm.LogStartupTiming('OtherDiagnostic', 'still retained');
+      if lTestForm.fStartupProfileLog.Count <> 130 then
+        raise Exception.Create('Slow GUI budget affected other diagnostics');
+      lTestForm.fStartupProfileLog.Clear;
+      lTestForm.fSlowUiSampleCount := 0;
+      lTestForm.fStartupDataReady := 1;
+      lTestForm.fGuiRefreshQueued := 1;
+      lTestForm.fAuxListRefreshBusy := 1;
+      // Controlled foreground workload proves the real activation handler is timed.
+      lTestForm.fFocusSoundPlayer :=
+        procedure(aFileName: string)
+        begin
+          Sleep(60);
+        end;
+      lTestForm.AppOnActivate(lTestForm);
+      if (lTestForm.fStartupProfileLog.Count <> 1) or
+        (not ContainsText(lTestForm.fStartupProfileLog.Text, 'operation=Foreground')) then
+        raise Exception.Create('Foreground handler did not record its slow workload');
+      Writeln('UI TIMING PASS threshold=50ms samples=128 overflow=1 foreground=measured');
+    except
+      on E: Exception do
+      begin
+        Writeln('SELFTEST FAILED: ' + E.Message);
+        Result := 1;
+      end;
+    end;
+    FreeAndNil(lTestForm.fStartupProfileLog);
+    FreeAndNil(lTestForm.fStartupProfileLogSync);
+    lTestForm.Free;
+    Exit;
+  end;
+  if SameText(aArg, '--self-test-window-details') then
+  begin
+    Result := 0;
+    lTestForm := TAppsViewMainFrm.CreateNew(nil);
+    try
+      lTestForm.lbApps := TListBox.Create(lTestForm);
+      lTestForm.lbApps.Parent := lTestForm;
+      lTestForm.pnlAppDetails := TPanel.Create(lTestForm);
+      lTestForm.imgAppScreenshot := TImage.Create(lTestForm);
+      lTestForm.edAppCaption := TEdit.Create(lTestForm);
+      lTestForm.edPid := TEdit.Create(lTestForm);
+      lTestForm.edAppFileName := TEdit.Create(lTestForm);
+      lTestForm.edCommandLineParams := TEdit.Create(lTestForm);
+      lTestForm.edRelaunchCommand := TEdit.Create(lTestForm);
+      lTestForm.edAppUserModelID := TEdit.Create(lTestForm);
+      SetLength(lTestForm.fWindowBatch.Windows, 2);
+      lTestForm.fWindowBatch.Windows[0].Wnd := 100;
+      lTestForm.fWindowBatch.Windows[0].FileName := ParamStr(0);
+      lTestForm.fWindowBatch.Windows[1].Wnd := 200;
+      lTestForm.fWindowBatch.Windows[1].FileName := 'second.exe';
+      lTestForm.lbApps.Items.AddObject('first', TObject(100));
+      lTestForm.lbApps.Items.AddObject('second', TObject(200));
+      lTestForm.lbApps.ItemIndex := 0;
+      lDetailWatch := TStopwatch.StartNew;
+      lTestForm.UpdateAppDetail;
+      if (lTestForm.edAppFileName.Text <> ParamStr(0)) or
+        (lDetailWatch.ElapsedMilliseconds > 50) then
+      begin
+        Writeln('SELFTEST FAILED: selection did not display the available snapshot promptly');
+        Result := 1;
+      end;
+      lTestForm.lbApps.ItemIndex := 1;
+      lTestForm.fWindowBatch.Windows[0].CommandLineParams := 'late result for first';
+      lTestForm.fWindowBatch.Windows[0].MetadataReady := True;
+      lTestForm.UpdateAppDetail(False);
+      if (lTestForm.edAppFileName.Text <> 'second.exe') or
+        (lTestForm.edCommandLineParams.Text <> '') then
+      begin
+        Writeln('SELFTEST FAILED: stale metadata replaced the current selection');
+        Result := 1;
+      end;
+      lTestForm.lbExplorer := TListBox.Create(lTestForm);
+      lTestForm.lbExplorer.Parent := lTestForm;
+      lTestForm.lbConsole := TListBox.Create(lTestForm);
+      lTestForm.lbConsole.Parent := lTestForm;
+      // Foreground refresh applies to existing controls; time their creation separately.
+      lDetailWatch := TStopwatch.StartNew;
+      lTestForm.lbExplorer.HandleNeeded;
+      lTestForm.lbConsole.HandleNeeded;
+      Writeln(Format('GUI FIXTURE native-control-creation-ms=%.3f', [lDetailWatch.Elapsed.TotalMilliseconds]));
+      lTestForm.fStartupDataReady := 1;
+      SetLength(lTestForm.fWindowBatch.Windows, 500);
+      for lIndex := 0 to High(lTestForm.fWindowBatch.Windows) do
+      begin
+        lTestForm.fWindowBatch.Windows[lIndex] := Default(TWindowSnapshot);
+        lTestForm.fWindowBatch.Windows[lIndex].Wnd := HWND(NativeUInt(lIndex) + 1);
+        lTestForm.fWindowBatch.Windows[lIndex].Caption := Format('Window %.3d', [lIndex]);
+        lTestForm.fWindowBatch.Windows[lIndex].FileName := 'fixture.exe';
+      end;
+      lMaxApplyMs := 0;
+      for lSample := 1 to 30 do
+      begin
+        lDetailWatch := TStopwatch.StartNew;
+        lTestForm.UpdateGui;
+        lApplyMs := lDetailWatch.Elapsed.TotalMilliseconds;
+        if lSample <= 3 then
+          Writeln(Format('GUI APPLY sample=%d ms=%.3f', [lSample, lApplyMs]));
+        if (lSample = 1) or (lApplyMs > lMaxApplyMs) then
+          lMaxApplyMs := lApplyMs;
+      end;
+      Writeln(Format('GUI APPLY windows=500 samples=30 max-ms=%.3f', [lMaxApplyMs]));
+      if (lMaxApplyMs > 100) or (lTestForm.lbApps.Items.Count <> 500) then
+      begin
+        Writeln('SELFTEST FAILED: snapshot rendering exceeded the GUI budget or lost rows');
+        Result := 1;
+      end;
+    finally
+      lTestForm.Free;
+    end;
+    Exit;
+  end;
+  if SameText(aArg, '--self-test-list-sync') then
+  begin
+    Result := 0;
+    try
+      lTestForm := TAppsViewMainFrm.CreateNew(nil);
+      try
+        lObservedList := TObservedListBox.Create(lTestForm);
+        lObservedList.Parent := lTestForm;
+        lObservedList.Height := 60;
+        lTestForm.lbScripts := lObservedList;
+        SetLength(lExpectedCaptions, 80);
+        for lIndex := 0 to High(lExpectedCaptions) do
+          lExpectedCaptions[lIndex] := Format('Script %.3d', [lIndex]);
+        lTestForm.ApplyScriptsSnapshot(lExpectedCaptions);
+        lObservedList.ItemIndex := 40;
+        lObservedList.TopIndex := 38;
+        lObservedList.MutationCount := 0;
+        lTestForm.ApplyScriptsSnapshot(lExpectedCaptions);
+        if lObservedList.MutationCount <> 0 then
+          raise Exception.Create('Unchanged snapshot mutated native list rows');
+        if (lObservedList.ItemIndex <> 40) or (lObservedList.TopIndex <> 38) then
+          raise Exception.Create('Unchanged snapshot moved selection or scroll');
+        lExpectedCaptions[0] := 'Changed first script';
+        lTestForm.ApplyScriptsSnapshot(lExpectedCaptions);
+        if (lObservedList.ItemIndex <> 40) or (lObservedList.TopIndex <> 38) then
+          raise Exception.Create('Changed snapshot moved an unaffected selection or top row');
+        if lObservedList.MutationCount > 4 then
+          raise Exception.Create('One changed row rebuilt unrelated rows');
+        lTestForm.ApplyScriptsSnapshot(nil);
+        if lObservedList.Items.Count <> 0 then
+          raise Exception.Create('Empty snapshot retained stale rows');
+        lItems := TStringList.Create;
+        try
+          lItems.AddObject('first', TObject(100));
+          lItems.AddObject('second', TObject(200));
+          SynchronizeListItems(lObservedList, lItems);
+          lObservedList.ItemIndex := 1;
+          lItems.Exchange(0, 1);
+          lItems[0] := 'renamed second';
+          SynchronizeListItems(lObservedList, lItems);
+          if (lObservedList.ItemIndex <> 0) or (lObservedList.Items.Objects[0] <> TObject(200)) then
+            raise Exception.Create('Reordering or renaming lost selected window identity');
+          lItems.Clear;
+          SynchronizeListItems(lObservedList, lItems);
+        finally
+          lItems.Free;
+        end;
+        SetLength(lNamedItems, 2);
+        lNamedItems[0].Name := 'Same caption';
+        lNamedItems[0].Value := 'first path';
+        lNamedItems[1].Name := 'Same caption';
+        lNamedItems[1].Value := 'second path';
+        lObservedList.Sorted := True;
+        try
+          ApplyNamedListSnapshot(lObservedList, lNamedItems);
+          for lIndex := 0 to lObservedList.Items.Count - 1 do
+            if TListBoxItemData(lObservedList.Items.Objects[lIndex]).Value = 'second path' then
+              lObservedList.ItemIndex := lIndex;
+          lOwnedData := lObservedList.Items.Objects[lObservedList.ItemIndex];
+          lNamedItems[0].Name := 'Changed caption';
+          ApplyNamedListSnapshot(lObservedList, lNamedItems);
+          if (lObservedList.Items.Objects[lObservedList.ItemIndex] <> lOwnedData) or
+            (TListBoxItemData(lOwnedData).Value <> 'second path') then
+            raise Exception.Create('Duplicate captions lost owned row identity');
+        finally
+          lTestForm.ClearListBoxItemData(lObservedList);
+        end;
+        SetLength(lExpectedCaptions, 500);
+        for lIndex := 0 to High(lExpectedCaptions) do
+          lExpectedCaptions[lIndex] := Format('Script %.3d', [lIndex]);
+        lTestForm.ApplyScriptsSnapshot(lExpectedCaptions);
+        lMaxApplyMs := 0;
+        lObservedList.MutationCount := 0;
+        for lSample := 1 to 30 do
+        begin
+          lDetailWatch := TStopwatch.StartNew;
+          lTestForm.ApplyScriptsSnapshot(lExpectedCaptions);
+          lApplyMs := lDetailWatch.Elapsed.TotalMilliseconds;
+          if (lSample = 1) or (lApplyMs > lMaxApplyMs) then
+            lMaxApplyMs := lApplyMs;
+        end;
+        if (lMaxApplyMs > 100) or (lObservedList.MutationCount <> 0) then
+          raise Exception.Create('Repeated 500-row snapshot application blocked or mutated the list');
+        Writeln(Format('LIST APPLY rows=500 samples=30 max-ms=%.3f', [lMaxApplyMs]));
+        Writeln('LIST SYNC PASS unchanged-mutations=0 selection=preserved scroll=preserved');
+      finally
+        lTestForm.Free;
+      end;
+    except
+      on lException: Exception do
+      begin
+        Writeln('SELFTEST FAILED: ' + lException.Message);
+        Result := 1;
+      end;
+    end;
+    Exit;
+  end;
+  if SameText(aArg, '--self-test-chat-refresh-handoff') then
+  begin
+    Result := 0;
+    lTestSettings := TMemIniFile.Create('');
+    lTestForm := TAppsViewMainFrm.CreateNew(nil);
+    try
+      lTestSettings.WriteBool('ChatMonitor', 'Enabled', False);
+      lTestForm.fChatMonitor := TChatMonitor.Create(lTestSettings);
+      lTestForm.fGuiRefreshQueued := 1;
+      lTestForm.StartChatMonitorProcessing;
+      if (lTestForm.fChatMonitorBusy <> 0) or (lTestForm.fChatMonitorPending <> 1) then
+      begin
+        Writeln('SELFTEST FAILED: chat processing started before fresh titles arrived');
+        Result := 1;
+      end;
+      lTestForm.fGuiRefreshQueued := 0;
+      lTestForm.fWindowBatch.ErrorText := 'Inventory failed';
+      lTestForm.ResumeChatMonitorAfterSnapshot;
+      if lTestForm.fGuiRefreshQueued <> 0 then
+      begin
+        Writeln('SELFTEST FAILED: failed collection immediately queued another collection');
+        Result := 1;
+      end;
+      lTestForm.StartChatMonitorProcessing;
+      if lTestForm.fGuiRefreshQueued <> 1 then
+      begin
+        Writeln('SELFTEST FAILED: later scheduled chat poll did not recover from an inventory error');
+        Result := 1;
+      end;
+    finally
+      lTestForm.fShuttingDown := 1;
+      lTestForm.WaitAsyncWithShutdown(lTestForm.fChatMonitorTask, 1000);
+      lTestForm.fChatMonitorTask := nil;
+      lTestForm.fChatMonitor.Free;
+      lTestForm.Free;
+      lTestSettings.Free;
+    end;
+    Exit;
+  end;
+  if SameText(aArg, '--self-test-refresh-auxiliary') then
+  begin
+    Result := 0;
+    lTestForm := TAppsViewMainFrm.CreateNew(nil);
+    try
+      lTestForm.fStartupDataReady := 1;
+      lTestForm.fGuiRefreshQueued := 1;
+      lTestForm.fAuxListRefreshBusy := 1;
+      lTestForm.AppOnActivate(lTestForm);
+      if lTestForm.fAuxListRefreshPending <> 1 then
+      begin
+        Writeln('SELFTEST FAILED: refocus lost the auxiliary-list refresh');
+        Result := 1;
+      end;
+    finally
+      lTestForm.Free;
+    end;
+    Exit;
+  end;
+  if SameText(aArg, '--self-test-window-refresh') then
+  begin
+    Result := 0;
+    lTestForm := TAppsViewMainFrm.CreateNew(nil);
+    try
+      lTestForm.QueueGuiRefresh;
+      lTestForm.QueueGuiRefresh;
+      if lTestForm.fGuiRefreshQueued <> 1 then
+      begin
+        Writeln('SELFTEST FAILED: refresh executed inline instead of deferring and coalescing');
+        Result := 1;
+      end;
+    finally
+      lTestForm.fShuttingDown := 1;
+      CheckSynchronize;
+      lTestForm.Free;
+    end;
+    Exit;
+  end;
   if SameText(aArg, cResizeColumnWidthsSelfTestArg) then
   begin
     Result := 0;
@@ -3906,7 +4172,6 @@ begin
     lActualValue := '';
     lTestForm := TAppsViewMainFrm.CreateNew(nil);
     try
-      lTestForm.fApps := TAppList.Create;
       lTestForm.lbApps := TListBox.Create(lTestForm);
       lTestForm.lbApps.Parent := lTestForm;
       lTestForm.pnlAppDetails := TPanel.Create(lTestForm);
@@ -3914,6 +4179,7 @@ begin
       lTestForm.fStartupDataReady := 1;
       lTestForm.fGuiRefreshQueued := 1;
       lTestForm.fFocusSoundFileName := 'activation-focus.wav';
+      lTestForm.fAuxListRefreshBusy := 1;
       lTestForm.fFocusSoundPlayer :=
         procedure(aFileName: string)
         begin
@@ -3928,7 +4194,6 @@ begin
       end;
     finally
       lTestForm.fFocusSoundPlayer := nil;
-      FreeAndNil(lTestForm.fApps);
       lTestForm.Free;
     end;
     Exit;
@@ -4079,6 +4344,14 @@ begin
           'window action copy target',
           TObject(lActionWnd));
         lTestForm.lbApps.ItemIndex := 0;
+        SetLength(lTestForm.fWindowBatch.Windows, 1);
+        lTestForm.fWindowBatch.Windows[0].Wnd := lActionWnd;
+        lTestForm.fWindowBatch.Windows[0].PID := GetCurrentProcessId;
+        TryGetProcessStartedAtUtcMilliseconds(GetCurrentProcessId,
+          lTestForm.fWindowBatch.Windows[0].ProcessStartedAt);
+        lTestForm.fWindowBatch.Windows[0].FileName := ParamStr(0);
+        lTestForm.fWindowBatch.Windows[0].CommandLine := string(Winapi.Windows.GetCommandLine);
+        lTestForm.fWindowBatch.Windows[0].MetadataReady := True;
 
         lExpectedCaptions := TArray<string>.Create(
           'Copy full EXE filename',
@@ -4139,6 +4412,42 @@ begin
               [lExpectedCaptions[lIndex], lExpectedValues[lIndex], lActualValue]));
             Result := 1;
           end;
+        end;
+
+        lTestForm.fWindowBatch.Windows[0].MetadataReady := False;
+        lTestForm.fWindowBatch.Windows[0].MetadataError := 'Earlier timeout';
+        lTestForm.fWindowBatch.Windows[0].CommandLineError := 'Earlier timeout';
+        lTestForm.fWindowBatch.Windows[0].CommandLineAttemptedAt := 1;
+        lTestForm.fWindowBatch.Windows[0].MetadataAttemptedAt := 1;
+        lTestForm.fPendingCopy := lTestForm.fWindowBatch.Windows[0];
+        lTestForm.fPendingClipboardSequence := GetClipboardSequenceNumber;
+        lTestForm.TryPublishPendingWindowCopy;
+        if lTestForm.fPendingCopy.Wnd = 0 then
+        begin
+          Writeln('SELFTEST FAILED: cached metadata failure cancelled an explicit copy retry');
+          Result := 1;
+        end;
+
+        lTestForm.fWindowBatch.Windows[0].MetadataAttemptedAt := 2;
+        lTestForm.fWindowBatch.Windows[0].AttemptedMetadata := [wmIdentity];
+        lTestForm.fWindowBatch.Windows[0].MetadataError := '';
+        lTestForm.fWindowBatch.Windows[0].CommandLineAttemptedAt := 2;
+        lTestForm.TryPublishPendingWindowCopy;
+        if lTestForm.fPendingCopy.Wnd <> 0 then
+        begin
+          Writeln('SELFTEST FAILED: fresh metadata failure retained a pending copy');
+          Result := 1;
+        end;
+        lTestForm.fWindowBatch.Windows[0].MetadataReady := True;
+        lTestForm.fPendingCopy := lTestForm.fWindowBatch.Windows[0];
+        // Exercise a stale sequence without changing the user-owned clipboard.
+        lTestForm.fPendingClipboardSequence := GetClipboardSequenceNumber xor 1;
+        lActualValue := 'newer clipboard content';
+        lTestForm.TryPublishPendingWindowCopy;
+        if lActualValue <> 'newer clipboard content' then
+        begin
+          Writeln('SELFTEST FAILED: late metadata overwrote newer clipboard content');
+          Result := 1;
         end;
 
         if Assigned(lCopyPidMenuItem) and
@@ -5120,287 +5429,103 @@ begin
 end;
 
 procedure TAppsViewMainFrm.RefreshConsoleList;
-var
-  lApp: TAppInfo;
-  lCaption: string;
-  lConsoleFocusedCaption: string;
-  lConsoleWnd: hWnd;
-  lIndex: Integer;
-  lOldConsoleIndex: Integer;
-  lPrefixRules: TPrefixRuleArray;
-  lRemoved: Boolean;
-  lStartupDataReady: Boolean;
-  lTitle: string;
-  lWnd: hWnd;
-  lWindowProcessId: Cardinal;
 begin
-  if IsShuttingDown then
-    Exit;
-
-  lStartupDataReady := IsStartupDataReady;
-  if not lStartupDataReady then
-  begin
-    StartStartupDataLoad;
-    Exit;
-  end;
-
-  lPrefixRules := fConfigCache.GetPrefixRules(cPrefixMaskFileName);
-
-  lOldConsoleIndex := lbConsole.ItemIndex;
-  lConsoleFocusedCaption := '';
-  if lOldConsoleIndex <> -1 then
-    lConsoleFocusedCaption := lbConsole.Items[lOldConsoleIndex];
-  lConsoleWnd := GetWnd(lbConsole);
-  lRemoved := False;
-
-  lbConsole.Items.BeginUpdate;
-  try
-    for lIndex := lbConsole.Items.Count - 1 downto 0 do
-    begin
-      lWnd := hWnd(lbConsole.Items.Objects[lIndex]);
-      if (lWnd = 0) or (not IsWindow(lWnd)) then
-      begin
-        lbConsole.Items.Delete(lIndex);
-        lRemoved := True;
-        Continue;
-      end;
-
-      lWindowProcessId := 0;
-      GetWindowThreadProcessId(lWnd, lWindowProcessId);
-      if (lWindowProcessId = 0) or (not IsProcessActive(lWindowProcessId)) then
-      begin
-        lbConsole.Items.Delete(lIndex);
-        lRemoved := True;
-        Continue;
-      end;
-
-      lCaption := maxLogic.Windows.Desktop.GetWinCaption(lWnd);
-      if lCaption = '' then
-      begin
-        lbConsole.Items.Delete(lIndex);
-        lRemoved := True;
-        Continue;
-      end;
-
-      lTitle := '';
-      if fApps.TryGetApp(lWnd, lApp) then
-      begin
-        lCaption := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lWnd, lWindowProcessId, lCaption);
-        lTitle := BuildConsoleDisplayCaption(lCaption, lApp.FileName, lPrefixRules);
-      end else begin
-        lCaption := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lWnd, lWindowProcessId, lCaption);
-        lTitle := BuildConsoleDisplayCaption(lCaption, '', lPrefixRules);
-      end;
-      if lbConsole.Items[lIndex] <> lTitle then
-        lbConsole.Items[lIndex] := lTitle;
-    end;
-    SortConsoleItems(lbConsole.Items);
-  finally
-    lbConsole.Items.EndUpdate;
-  end;
-
-  RestoreItemIndex(lbConsole, lConsoleWnd, lOldConsoleIndex, lConsoleFocusedCaption);
-  if lRemoved then
-    TThread.Queue(TThread(nil),
-      procedure
-      begin
-        if not IsShuttingDown then
-          RestoreItemIndex(lbConsole, lConsoleWnd, lOldConsoleIndex, lConsoleFocusedCaption);
-      end);
+  QueueGuiRefresh;
 end;
 
 procedure TAppsViewMainFrm.UpdateAppDetail(const aAllowExtendedMetadata: Boolean);
 var
-  app: TAppInfo;
+  lApp: TWindowSnapshot;
+  lStream: TBytesStream;
 begin
-  if not fApps.TryGetApp(GetWnd(lbApps), app) then
-    pnlAppDetails.Visible := False
-  else
+  if not TryGetWindowSnapshot(GetWnd(lbApps), lApp) then
   begin
-    pnlAppDetails.Visible := True;
-    edAppCaption.Text := ApplyWindowCaptionOverride(fWindowCaptionOverrides, app.wnd, app.PID, app.caption);
-    edPid.Text := app.PID.ToString;
-    if aAllowExtendedMetadata then
-    begin
-      imgAppScreenshot.Picture.Graphic := app.Icon;
-      edAppFileName.Text := app.FileName;
-      edCommandLineParams.Text := app.CommandLineParams;
-      edRelaunchCommand.Text:= app.RelaunchCommand;
-      edAppUserModelID.Text:= app.AppUserModelID;
-    end
-    else
-    begin
-      edAppFileName.Text := '';
-      edCommandLineParams.Text := '';
-      edRelaunchCommand.Text := '';
-      edAppUserModelID.Text := '';
-    end;
+    pnlAppDetails.Visible := False;
+    fDisplayedDetail := Default(TWindowSnapshot);
+    Exit;
   end;
-
+  pnlAppDetails.Visible := True;
+  edAppCaption.Text := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lApp.Wnd, lApp.PID, lApp.Caption);
+  edPid.Text := lApp.PID.ToString;
+  edAppFileName.Text := lApp.FileName;
+  edCommandLineParams.Text := lApp.CommandLineParams;
+  edRelaunchCommand.Text := lApp.RelaunchCommand;
+  edAppUserModelID.Text := lApp.AppUserModelID;
+  if (not SameWindowSnapshotIdentity(lApp, fDisplayedDetail)) or
+    (lApp.MetadataAttemptedAt <> fDisplayedDetail.MetadataAttemptedAt) then
+  begin
+    if Length(lApp.IconBytes) > 0 then
+    begin
+      lStream := TBytesStream.Create(lApp.IconBytes);
+      try
+        imgAppScreenshot.Picture.Icon.LoadFromStream(lStream);
+      finally
+        lStream.Free;
+      end;
+    end else
+      imgAppScreenshot.Picture.Assign(nil);
+  end;
+  fDisplayedDetail := lApp;
+  if aAllowExtendedMetadata and (not lApp.MetadataReady) and Assigned(fWindowService) then
+    fWindowService.RequestDetails(lApp.Wnd, lApp.PID);
 end;
 
 procedure TAppsViewMainFrm.UpdateGui;
 var
-  lApp: TAppInfo;
-  lAppsFocusedCaption: string;
-  lAppsWnd: hWnd;
+  lApp: TWindowSnapshot;
+  lApps: TStringList;
+  lConsole: TStringList;
+  lExplorer: TStringList;
   lCaption: string;
-  lConsoleFocusedCaption: string;
-  lConsoleWnd: hWnd;
-  lExcludeMasks: TStringArray;
-  lExplorers: TList<TAppInfo>;
-  lExplorerFocusedCaption: string;
-  lExplorerWnd: hWnd;
-  lOldAppsIndex: Integer;
-  lOldConsoleIndex: Integer;
-  lOldExplorerIndex: Integer;
-  lDeepPrefixReady: Boolean;
-  lPrefixRules: TPrefixRuleArray;
-  lSkipSharedRefreshOnce: Boolean;
-  lStartupDataReady: Boolean;
-  lTerminalPatterns: TStringArray;
   lTitle: string;
-  lIsExplorer: Boolean;
   lIsTerminal: Boolean;
-  lWindowProcessId: Cardinal;
-  lIndex: Integer;
 begin
-  ApplyLoadedWindowCaptionOverrideState;
-  if PruneWindowCaptionOverrides then
-    QueueGuiRefresh;
   if IsShuttingDown then
     Exit;
-
-  lStartupDataReady := IsStartupDataReady;
-  if not lStartupDataReady then
+  ApplyLoadedWindowCaptionOverrideState;
+  PruneWindowCaptionOverrides;
+  if not IsStartupDataReady then
   begin
-    StartStartupDataLoad;
-    if TInterlocked.CompareExchange(fStartupProfileFirstGuiLogged, 0, 0) <> 0 then
-      Exit;
+    QueueGuiRefresh;
+    Exit;
   end;
-  lDeepPrefixReady := IsDeepPrefixReady;
-
-  lSkipSharedRefreshOnce := lStartupDataReady
-    and (TInterlocked.CompareExchange(fStartupSkipSharedRefreshOnce, 0, 1) = 1);
-  if not lSkipSharedRefreshOnce then
-    EnsureSharedAppsSnapshotFresh(250);
-
-  lExcludeMasks := fConfigCache.GetHideMasks(cHideMaskFileName);
-  lPrefixRules := fConfigCache.GetPrefixRules(cPrefixMaskFileName);
-  lTerminalPatterns := fConfigCache.GetTerminalPatterns(cTerminalPatternsFileName);
-
-  gc(lExplorers, TList<TAppInfo>.Create);
-
-  lOldAppsIndex := lbApps.ItemIndex;
-  lAppsFocusedCaption := '';
-  if lOldAppsIndex <> -1 then
-    lAppsFocusedCaption := lbApps.Items[lOldAppsIndex];
-  lAppsWnd := GetWnd(lbApps);
-
-  lOldConsoleIndex := lbConsole.ItemIndex;
-  lConsoleFocusedCaption := '';
-  if lOldConsoleIndex <> -1 then
-    lConsoleFocusedCaption := lbConsole.Items[lOldConsoleIndex];
-  lConsoleWnd := GetWnd(lbConsole);
-
-  lbApps.Items.BeginUpdate;
-  lbConsole.Items.BeginUpdate;
+  lApps := TStringList.Create;
+  lConsole := TStringList.Create;
+  lExplorer := TStringList.Create;
   try
-    lbApps.Items.Clear;
-    lbConsole.Items.Clear;
-    for lIndex := 0 to fApps.Count - 1 do
+    lApps.Sorted := True;
+    lApps.Duplicates := dupAccept;
+    lExplorer.Sorted := True;
+    lExplorer.Duplicates := dupAccept;
+    for lApp in fWindowBatch.Windows do
     begin
-      lApp := fApps[lIndex];
-
-      if (lApp.wnd = application.Handle)
-        or (lApp.wnd = self.Handle) then
+      if (lApp.Caption = '') or ExcludeByMask(lApp, fWindowBatch.HideMasks, True) then
         Continue;
-
-      if lApp.caption = '' then
-        Continue;
-      if ExcludeByMask(lApp, lExcludeMasks, lStartupDataReady) then
-        Continue;
-
-      lIsExplorer := False;
-      lIsTerminal := False;
-      if lStartupDataReady then
+      if SameText('explorer.exe', ExtractFileName(lApp.FileName)) then
       begin
-        lIsExplorer := SameText('explorer.exe', ExtractFileName(lApp.FileName));
-        if not lIsExplorer then
-          lIsTerminal := IsTerminalApp(lApp.FileName, lTerminalPatterns);
-      end;
-
-      if lIsExplorer then
-      begin
-        lExplorers.Add(lApp);
+        lExplorer.AddObject(lApp.Caption, TObject(lApp.Wnd));
         Continue;
       end;
-
-      lWindowProcessId := lApp.PID;
-      lCaption := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lApp.wnd, lWindowProcessId, lApp.Caption);
-      if lStartupDataReady then
-        lTitle := Trim(BuildWindowDisplayCaption(lCaption, lApp.FileName))
-      else
-        lTitle := Trim(lCaption);
-
+      lIsTerminal := IsTerminalApp(lApp.FileName, fWindowBatch.TerminalPatterns);
+      lCaption := ApplyWindowCaptionOverride(fWindowCaptionOverrides, lApp.Wnd, lApp.PID, lApp.Caption);
+      lTitle := Trim(BuildWindowDisplayCaption(lCaption, lApp.FileName));
+      CheckPrefixRule(lTitle, lApp, fWindowBatch.PrefixRules, True,
+        (not lIsTerminal) and (lApp.MetadataReady or (wmIdentity in lApp.AvailableMetadata)));
       if lIsTerminal then
-      begin
-        CheckPrefixRule(lTitle, lApp, lPrefixRules, lStartupDataReady, False);
-        lbConsole.Items.AddObject(lTitle, TObject(lApp.wnd));
-      end
+        lConsole.AddObject(lTitle, TObject(lApp.Wnd))
       else
-      begin
-        CheckPrefixRule(lTitle, lApp, lPrefixRules, lStartupDataReady, IsDeepPrefixAllowedForApp(lApp));
-        lbApps.Items.AddObject(lTitle, TObject(lApp.wnd));
-      end;
+        lApps.AddObject(lTitle, TObject(lApp.Wnd));
     end;
-    SortConsoleItems(lbConsole.Items);
+    SortConsoleItems(lConsole);
+    SynchronizeListItems(lbApps, lApps);
+    SynchronizeListItems(lbConsole, lConsole);
+    SynchronizeListItems(lbExplorer, lExplorer);
+    UpdateAppDetail(False);
   finally
-    lbConsole.Items.EndUpdate;
-    lbApps.Items.EndUpdate;
+    lExplorer.Free;
+    lConsole.Free;
+    lApps.Free;
   end;
-  RestoreItemIndex(lbApps, lAppsWnd, lOldAppsIndex, lAppsFocusedCaption);
-  RestoreItemIndex(lbConsole, lConsoleWnd, lOldConsoleIndex, lConsoleFocusedCaption);
-  UpdateAppDetail(False);
-
-  lExplorerWnd := GetWnd(lbExplorer);
-  lOldExplorerIndex := lbExplorer.ItemIndex;
-  lExplorerFocusedCaption := '';
-  if lOldExplorerIndex <> -1 then
-    lExplorerFocusedCaption := lbExplorer.Items[lOldExplorerIndex];
-  lbExplorer.Items.BeginUpdate;
-  try
-    lbExplorer.Items.Clear;
-    for lApp in lExplorers do
-      lbExplorer.Items.addObject(lApp.caption, TObject(lApp.wnd));
-  finally
-    lbExplorer.Items.EndUpdate;
-  end;
-  RestoreItemIndex(lbExplorer, lExplorerWnd, lOldExplorerIndex, lExplorerFocusedCaption);
-
-  if TInterlocked.CompareExchange(fStartupProfileFirstGuiLogged, 1, 0) = 0 then
-    LogStartupTiming(
-      'Gui.FirstPopulate',
-      Format(
-        'startupDataReady=%s skipRefresh=%s apps=%d console=%d explorer=%d',
-        [BoolToStr(lStartupDataReady, True), BoolToStr(lSkipSharedRefreshOnce, True),
-         lbApps.Items.Count, lbConsole.Items.Count, lbExplorer.Items.Count]));
-
-  if lStartupDataReady and (TInterlocked.CompareExchange(fStartupProfileFullMetadataGuiLogged, 1, 0) = 0) then
-    LogStartupTiming(
-      'Gui.FullMetadata',
-      Format(
-        'skipRefresh=%s apps=%d console=%d explorer=%d',
-        [BoolToStr(lSkipSharedRefreshOnce, True), lbApps.Items.Count, lbConsole.Items.Count, lbExplorer.Items.Count]));
-
-  if lDeepPrefixReady and (TInterlocked.CompareExchange(fStartupProfileDeepPrefixGuiLogged, 1, 0) = 0) then
-    LogStartupTiming(
-      'Gui.DeepPrefixReady',
-      Format(
-        'apps=%d console=%d explorer=%d',
-        [lbApps.Items.Count, lbConsole.Items.Count, lbExplorer.Items.Count]));
-
-  StartAuxListsRefresh;
 end;
 
 end.
