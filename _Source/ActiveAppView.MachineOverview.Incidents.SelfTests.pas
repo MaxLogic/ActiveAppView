@@ -721,7 +721,8 @@ begin
         lHistory.Diagnostics.LastError);
       Exit;
     end;
-    lUtc := EncodeDate(2026, 8, 29) + EncodeTime(5, 0, 0, 0);
+    // Restart hydration loads the wall-clock last 24 hours; keep this fixture recent.
+    lUtc := IncMinute(TTimeZone.Local.ToUniversalTime(Now), -120);
     lPipeline.EnqueueRaw(CreatePipelineIncidentSample(lUtc, 1000, 95));
     lPipeline.EnqueueRaw(CreatePipelineIncidentSample(IncSecond(lUtc, 15),
       16000, 97));
