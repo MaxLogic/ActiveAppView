@@ -4,6 +4,9 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `Scripts\Copy-MarkdownAsRichText.ps1` now converts markdown from the clipboard (a copied `.md` file, a path to one, or the text itself) into HTML, RTF, or pandoc plain text and puts it back on the clipboard for Jira, Outlook, Thunderbird, and other rich editors. Running it without `-Format` asks which flavor to use first; no temporary files are left behind.
+
 ### Fixed
 - Window metadata now arrives by need: selected-window identity and icons can appear before command-line retrieval, and windows from the same process reuse its command line.
 - Foreground refresh now collects window inventories and slow metadata in the background, with coalesced updates and cancellable metadata helpers.
