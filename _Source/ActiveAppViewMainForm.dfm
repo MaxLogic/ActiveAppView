@@ -520,42 +520,60 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Caption = 'Console instances (F4)'
       TabOrder = 0
     end
+    object cbConsoleFilter: TComboBox
+      AlignWithMargins = True
+      Left = 3
+      Top = 43
+      Width = 344
+      Height = 29
+      Align = alTop
+      Style = csDropDownList
+      ItemIndex = 0
+      TabOrder = 1
+      Text = 'All (Ctrl+1)'
+      OnChange = ConsoleFilterChange
+      Items.Strings = (
+        'All (Ctrl+1)'
+        'Idle Codex/Claude (Ctrl+2)'
+        'Working Codex/Claude (Ctrl+3)'
+        'Action required (Codex/Claude) (Ctrl+4)')
+    end
     object lbConsole: TListBox
       AlignWithMargins = True
       Left = 33
-      Top = 43
+      Top = 78
       Width = 284
-      Height = 807
+      Height = 772
       Align = alClient
       ItemHeight = 21
       Sorted = True
-      TabOrder = 1
+      TabOrder = 2
       OnDblClick = lbAppsDblClick
       OnKeyUp = lbAppsKeyUp
     end
     object pnlConsoleFocusLeft: TPanel
       AlignWithMargins = True
       Left = 3
-      Top = 43
+      Top = 78
       Width = 24
-      Height = 807
+      Height = 772
       Align = alLeft
       Color = clBlack
       ParentBackground = False
       ShowCaption = False
-      TabOrder = 2
+      TabOrder = 3
     end
     object pnlConsoleFocusRight: TPanel
       AlignWithMargins = True
       Left = 323
-      Top = 43
+      Top = 78
       Width = 24
-      Height = 807
+      Height = 772
       Align = alRight
       Color = clBlack
       ParentBackground = False
       ShowCaption = False
-      TabOrder = 3
+      TabOrder = 4
     end
   end
   object pnlDesktop: TPanel

@@ -18,6 +18,8 @@ uses
   ActiveAppViewCore, ActiveAppView.RenameJournal, ActiveAppView.WindowSnapshots;
 
 type
+  TConsoleFilter = (cfAll, cfIdle, cfWorking, cfActionRequired);
+
   TWindowActionTarget = record
     DisplayCaption: string;
     ProcessId: Cardinal;
@@ -57,6 +59,7 @@ type
     pnlConsole: TPanel;
     labConsoleTitle: TStaticText;
     lbConsole: TListBox;
+    cbConsoleFilter: TComboBox;
     pnlConsoleFocusLeft: TPanel;
     pnlConsoleFocusRight: TPanel;
     pnlDesktop: TPanel;
@@ -90,6 +93,7 @@ type
     btnMachineOverviewFullView: TButton;
     btnMachineOverviewHelp: TButton;
     procedure FormCreate(Sender: TObject);
+    procedure ConsoleFilterChange(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure FormActivate(Sender: TObject);
     procedure lbAppsDblClick(Sender: TObject);
@@ -130,6 +134,7 @@ type
     fChatMonitorPending: Integer;
     fChatMonitorTask: iAsync;
     fConfigCache: TConfigCache;
+    fConsoleFilter: TConsoleFilter;
     fFocusSoundFileName: string;
     fFocusSoundPlayer: TProc<string>;
     fOrgAppOnActivate: TNotifyEvent;
@@ -212,6 +217,7 @@ type
     procedure QueueGuiRefresh;
     procedure RebuildSharedAppsSnapshot;
     procedure RefreshConsoleList;
+    procedure SetConsoleFilter(const aFilter: TConsoleFilter);
     procedure RunAuxListsRefresh;
     procedure RunChatMonitorSnapshot;
     procedure StartAuxListsRefresh;
@@ -914,6 +920,37 @@ end;
 function IsCodexWorkingPrefixChar(const aChar: Char): Boolean;
 begin
   Result := (Ord(aChar) >= $2800) and (Ord(aChar) <= $28FF);
+end;
+
+function MatchesConsoleFilter(const aCaption: string; const aFilter: TConsoleFilter): Boolean;
+var
+  lCaption: string;
+  lSeparator: Integer;
+  lState: TConsoleFilter;
+begin
+  if aFilter = cfAll then
+    Exit(True);
+  lCaption := Trim(aCaption);
+  if lCaption = '' then
+    Exit(False);
+  lState := cfAll;
+  if IsCodexWorkingPrefixChar(lCaption[1]) or
+    ((Ord(lCaption[1]) >= $25D0) and (Ord(lCaption[1]) <= $25D3)) then
+    lState := cfWorking
+  else if (lCaption[1] = Char($2733)) or (lCaption[1] = Char($2731)) or
+    StartsText('[ ! ] Action Required', lCaption) or
+    StartsText('[ . ] Action Required', lCaption) then
+    lState := cfIdle
+  else begin
+    // Codex removes its spinner when idle; the task/project title is a heuristic.
+    lSeparator := Pos(' | ', lCaption);
+    if (lSeparator > 1) and (lSeparator + 2 < Length(lCaption)) then
+      lState := cfIdle;
+  end;
+  if aFilter = cfActionRequired then
+    Result := (lState = cfIdle) and ContainsText(lCaption, 'action required')
+  else
+    Result := lState = aFilter;
 end;
 
 function NormalizeConsoleSortCaption(const aCaption: string): string;
@@ -3415,6 +3452,13 @@ procedure TAppsViewMainFrm.FormKeyUp(Sender: TObject; var Key: Word;
 var
   lMachineOverviewCommand: TMachineOverviewCommand;
 begin
+  if (ActiveControl = lbConsole) and (Shift = [ssCtrl]) and
+    (Key >= Ord('1')) and (Key <= Ord('4')) then
+  begin
+    SetConsoleFilter(TConsoleFilter(Key - Ord('1')));
+    Key := 0;
+    Exit;
+  end;
   if (Key = VK_F4) and ((GetTickCount64 - fLastFormFocusTick) < cIgnoreF4AfterFocusMs) then
   begin
     Key := 0;
@@ -3782,6 +3826,8 @@ end;
 
 function RunMainFormSelfTests(const aArg: string): Integer;
 var
+  lExpectedFilterKey: Word;
+  lFilterKey: Word;
   lTestSettings: TMemIniFile;
   lObservedList: TObservedListBox;
   lDetailWatch: TStopwatch;
@@ -3845,6 +3891,164 @@ var
   lWasPruned: Boolean;
 begin
   Result := -1;
+  if SameText(aArg, '--self-test-console-filter') then
+  begin
+    Result := 0;
+    lTestForm := TAppsViewMainFrm.CreateNew(nil);
+    try
+      try
+        for lTitle in ['', 'PowerShell', 'project', 'task | ', ' | project', 'cmd.exe'] do
+          if (not MatchesConsoleFilter(lTitle, cfAll)) or
+            MatchesConsoleFilter(lTitle, cfIdle) or MatchesConsoleFilter(lTitle, cfWorking) then
+            raise Exception.Create('Unknown title was classified as an agent: ' + lTitle);
+        for lTitle in ['Review changes | ActiveAppView', ' task | project ',
+          Char($2733) + ' Review changes', Char($2731) + ' Claude Code',
+          '[ ! ] Action Required', '[ . ] Action Required | task | project'] do
+          if (not MatchesConsoleFilter(lTitle, cfIdle)) or MatchesConsoleFilter(lTitle, cfWorking) then
+            raise Exception.Create('Idle/attention title was not classified correctly: ' + lTitle);
+        for lTitle in [Char($280B) + ' task | project', Char($2802) + ' Claude Code',
+          Char($25D0) + ' task', Char($25D1) + ' task', Char($25D2) + ' task',
+          Char($25D3) + ' task'] do
+          if (not MatchesConsoleFilter(lTitle, cfWorking)) or MatchesConsoleFilter(lTitle, cfIdle) then
+            raise Exception.Create('Working title was not classified correctly: ' + lTitle);
+        for lTitle in ['[ ! ] Action Required', '[ . ] Action Required | task | project',
+          Char($2733) + ' ACTION REQUIRED: permission', 'Resolve action required | project'] do
+          if not MatchesConsoleFilter(lTitle, cfActionRequired) then
+            raise Exception.Create('Action-required idle title was not recognized: ' + lTitle);
+        for lTitle in ['', 'Action required', 'Idle task | project',
+          Char($2733) + ' Idle Claude', Char($280B) + ' Action Required | project',
+          Char($25D0) + ' Action required'] do
+          if MatchesConsoleFilter(lTitle, cfActionRequired) then
+            raise Exception.Create('Non-actionable or working title matched Action required: ' + lTitle);
+        lTestForm.lbApps := TListBox.Create(lTestForm);
+        lTestForm.lbApps.Parent := lTestForm;
+        lTestForm.lbExplorer := TListBox.Create(lTestForm);
+        lTestForm.lbExplorer.Parent := lTestForm;
+        lTestForm.lbConsole := TListBox.Create(lTestForm);
+        lTestForm.lbConsole.Parent := lTestForm;
+        lTestForm.cbConsoleFilter := TComboBox.Create(lTestForm);
+        lTestForm.cbConsoleFilter.Parent := lTestForm;
+        lTestForm.cbConsoleFilter.Style := csDropDownList;
+        lTestForm.cbConsoleFilter.Items.AddStrings(['All', 'Idle', 'Working', 'Action required']);
+        lTestForm.cbConsoleFilter.ItemIndex := 0;
+        lTestForm.cbConsoleFilter.OnChange := lTestForm.ConsoleFilterChange;
+        lTestForm.pnlAppDetails := TPanel.Create(lTestForm);
+        lTestForm.fStartupDataReady := 1;
+        lTestForm.fWindowBatch.TerminalPatterns := ['*alacritty.exe', '*WindowsTerminal.exe'];
+        SetLength(lTestForm.fWindowBatch.Windows, 1);
+        lTestForm.fWindowBatch.Windows[0].Wnd := 100;
+        lTestForm.fWindowBatch.Windows[0].PID := 100;
+        lTestForm.fWindowBatch.Windows[0].Caption := 'PowerShell';
+        lTestForm.fWindowBatch.Windows[0].FileName := 'C:\Tools\alacritty.exe';
+        lTestForm.UpdateGui;
+        if lTestForm.lbConsole.Count <> 1 then
+          raise Exception.Create('All filter lost an ordinary terminal');
+        for lIndex := 0 to 2 do
+        begin
+          case lIndex of
+            0: lTestForm.ActiveControl := lTestForm.lbApps;
+            1: lTestForm.ActiveControl := lTestForm.lbExplorer;
+            2: lTestForm.ActiveControl := lTestForm.cbConsoleFilter;
+          end;
+          for lExpectedFilterKey := Ord('1') to Ord('4') do
+          begin
+            lFilterKey := lExpectedFilterKey;
+            lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+            if (lFilterKey <> lExpectedFilterKey) or
+              (lTestForm.cbConsoleFilter.ItemIndex <> 0) or (lTestForm.lbConsole.Count <> 1) then
+              raise Exception.Create('Console shortcut was handled while another control had focus');
+          end;
+        end;
+        lTestForm.ActiveControl := lTestForm.lbConsole;
+        lFilterKey := Ord('2');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if (lFilterKey <> 0) or (lTestForm.lbConsole.Count <> 0) then
+          raise Exception.Create('Ctrl+2 did not filter out an ordinary terminal');
+        lFilterKey := Ord('1');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if (lFilterKey <> 0) or (lTestForm.lbConsole.Count <> 1) then
+          raise Exception.Create('Ctrl+1 did not restore all terminals');
+        SetLength(lTestForm.fWindowBatch.Windows, 5);
+        for lIndex := 1 to 4 do
+        begin
+          lTestForm.fWindowBatch.Windows[lIndex].Wnd := 100 + lIndex;
+          lTestForm.fWindowBatch.Windows[lIndex].PID := 100 + lIndex;
+          lTestForm.fWindowBatch.Windows[lIndex].FileName := 'C:\Tools\WindowsTerminal.exe';
+        end;
+        lTestForm.fWindowBatch.Windows[1].Caption := 'Idle task | project';
+        lTestForm.fWindowBatch.Windows[2].Caption := Char($280B) + ' Working task | project';
+        lTestForm.fWindowBatch.Windows[3].Caption := Char($2733) + ' Claude task';
+        lTestForm.fWindowBatch.Windows[4].Caption := 'Browser title | project';
+        lTestForm.fWindowBatch.Windows[4].FileName := 'C:\Tools\browser.exe';
+        lTestForm.UpdateGui;
+        lTestForm.lbConsole.ItemIndex := lTestForm.lbConsole.Items.IndexOfObject(TObject(101));
+        lTestForm.ActiveControl := lTestForm.lbConsole;
+        lFilterKey := Ord('2');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if (lTestForm.lbConsole.Count <> 2) or (lTestForm.GetWnd(lTestForm.lbConsole) <> 101) or
+          (lTestForm.cbConsoleFilter.ItemIndex <> 1) or (lTestForm.lbApps.Count <> 1) or
+          (lTestForm.ActiveControl <> lTestForm.lbConsole) then
+          raise Exception.Create('Idle filter lost selection/focus or changed the Applications list');
+        lFilterKey := Ord('3');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl, ssShift]);
+        if (lFilterKey <> Ord('3')) or (lTestForm.lbConsole.Count <> 2) then
+          raise Exception.Create('Ctrl+Shift+3 incorrectly changed the console filter');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if (lFilterKey <> 0) or (lTestForm.lbConsole.Count <> 1) or
+          (lTestForm.cbConsoleFilter.ItemIndex <> 2) then
+          raise Exception.Create('Ctrl+3 did not select the working terminal');
+        lTestForm.fWindowBatch.Windows[2].Caption := 'Working task | project';
+        lTestForm.UpdateGui;
+        if lTestForm.lbConsole.Count <> 0 then
+          raise Exception.Create('Completed agent remained in the working filter');
+        lTestForm.cbConsoleFilter.ItemIndex := 1;
+        lTestForm.cbConsoleFilter.Perform(CN_COMMAND, MakeWParam(0, CBN_SELCHANGE),
+          LPARAM(lTestForm.cbConsoleFilter.Handle));
+        if lTestForm.lbConsole.Count <> 3 then
+          raise Exception.Create('Native dropdown selection did not include the completed agent');
+        lTestForm.cbConsoleFilter.ItemIndex := 0;
+        lTestForm.ConsoleFilterChange(lTestForm.cbConsoleFilter);
+        if lTestForm.lbConsole.Count <> 4 then
+          raise Exception.Create('Dropdown All did not restore the ordinary terminal');
+        lTestForm.fWindowBatch.Windows[0].Caption := 'Action required';
+        lTestForm.fWindowBatch.Windows[1].Caption := '[ ! ] Action Required | Codex task | project';
+        lTestForm.fWindowBatch.Windows[3].Caption := Char($2733) + ' action required: Claude task';
+        lTestForm.fWindowBatch.Windows[4].Caption := '[ ! ] Action Required | browser';
+        lFilterKey := Ord('4');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl, ssShift]);
+        if (lFilterKey <> Ord('4')) or (lTestForm.cbConsoleFilter.ItemIndex <> 0) then
+          raise Exception.Create('Ctrl+Shift+4 incorrectly changed the console filter');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if (lFilterKey <> 0) or (lTestForm.cbConsoleFilter.ItemIndex <> 3) or
+          (lTestForm.lbConsole.Count <> 2) or
+          (lTestForm.lbConsole.Items.IndexOfObject(TObject(101)) < 0) or
+          (lTestForm.lbConsole.Items.IndexOfObject(TObject(103)) < 0) then
+          raise Exception.Create('Ctrl+4 did not select only the actionable idle agents');
+        lFilterKey := Ord('2');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if lTestForm.lbConsole.Count <> 3 then
+          raise Exception.Create('Idle filter lost the action-required entries');
+        lTestForm.cbConsoleFilter.ItemIndex := 3;
+        lTestForm.cbConsoleFilter.Perform(CN_COMMAND, MakeWParam(0, CBN_SELCHANGE),
+          LPARAM(lTestForm.cbConsoleFilter.Handle));
+        lTestForm.fWindowBatch.Windows[1].Caption := 'Idle task | project';
+        lTestForm.UpdateGui;
+        if (lTestForm.lbConsole.Count <> 1) or
+          (lTestForm.lbConsole.Items.IndexOfObject(TObject(103)) <> 0) then
+          raise Exception.Create('Cleared action-required title remained in the filter');
+        Writeln('CONSOLE FILTER PASS');
+      except
+        on E: Exception do
+        begin
+          Writeln('SELFTEST FAILED: ' + E.Message);
+          Result := 1;
+        end;
+      end;
+    finally
+      lTestForm.Free;
+    end;
+    Exit;
+  end;
   if SameText(aArg, '--self-test-ui-timing') then
   begin
     Result := 0;
@@ -5433,6 +5637,20 @@ begin
   QueueGuiRefresh;
 end;
 
+procedure TAppsViewMainFrm.SetConsoleFilter(const aFilter: TConsoleFilter);
+begin
+  fConsoleFilter := aFilter;
+  if Assigned(cbConsoleFilter) then
+    cbConsoleFilter.ItemIndex := Ord(aFilter);
+  UpdateGui;
+end;
+
+procedure TAppsViewMainFrm.ConsoleFilterChange(Sender: TObject);
+begin
+  if cbConsoleFilter.ItemIndex >= 0 then
+    SetConsoleFilter(TConsoleFilter(cbConsoleFilter.ItemIndex));
+end;
+
 procedure TAppsViewMainFrm.UpdateAppDetail(const aAllowExtendedMetadata: Boolean);
 var
   lApp: TWindowSnapshot;
@@ -5512,8 +5730,10 @@ begin
       CheckPrefixRule(lTitle, lApp, fWindowBatch.PrefixRules, True,
         (not lIsTerminal) and (lApp.MetadataReady or (wmIdentity in lApp.AvailableMetadata)));
       if lIsTerminal then
-        lConsole.AddObject(lTitle, TObject(lApp.Wnd))
-      else
+      begin
+        if MatchesConsoleFilter(lApp.Caption, fConsoleFilter) then
+          lConsole.AddObject(lTitle, TObject(lApp.Wnd));
+      end else
         lApps.AddObject(lTitle, TObject(lApp.Wnd));
     end;
     SortConsoleItems(lConsole);
