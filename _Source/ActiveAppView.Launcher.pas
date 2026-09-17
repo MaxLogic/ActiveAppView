@@ -7,6 +7,7 @@ uses
 
 const
   cLaunchClassificationSelfTestArg = '--self-test-launch-classification';
+  cLaunchCleanEnvironmentSelfTestArg = '--self-test-launch-clean-environment';
   cLaunchHelperCrashIsolatedSelfTestArg = '--self-test-launch-helper-crash-isolated';
   cLaunchHelperPathsSelfTestArg = '--self-test-launch-helper-paths';
 
@@ -20,10 +21,11 @@ implementation
 
 uses
   System.Classes, System.IOUtils, System.StrUtils, System.Win.ComObj,
-  Winapi.ActiveX, Winapi.ShellAPI, Winapi.ShlObj, Winapi.Windows;
+  Winapi.ActiveX, Winapi.ShellAPI, Winapi.ShlObj, Winapi.UserEnv, Winapi.Windows;
 
 const
   cLaunchHelperArg = '--launch-helper';
+  cLaunchHelperEnvProbeArg = '--launch-helper-env-probe';
   cLaunchHelperProbeArg = '--launch-helper-probe';
   cLaunchHelperTestFailArg = '--launch-helper-test-fail';
   cLaunchExitProcessCreateFailed = 30;
@@ -34,6 +36,10 @@ const
   cLaunchProbeDirectory = 61;
   cLaunchProbeExecutable = 62;
   cLaunchProbeShellFallback = 63;
+  cLaunchProbeEnvClean = 64;
+  cLaunchProbeEnvInherited = 65;
+  cLaunchProbeEnvIncomplete = 66;
+  cLaunchSelfTestTaintName = 'ACTIVEAPPVIEW_SELFTEST_TAINT';
   cLaunchWaitTimeoutMs = 5000;
 
 type
@@ -387,6 +393,21 @@ begin
   Result := cLaunchExitTestFailure;
 end;
 
+function RunLaunchHelperEnvProbe: Integer;
+var
+  lName: string;
+begin
+  if GetEnvironmentVariable(cLaunchSelfTestTaintName) <> '' then
+    Exit(cLaunchProbeEnvInherited);
+
+  // a clean block must still be a usable user environment, not an empty one
+  for lName in ['SystemRoot', 'USERPROFILE', 'PATH', 'TEMP'] do
+    if GetEnvironmentVariable(lName) = '' then
+      Exit(cLaunchProbeEnvIncomplete);
+
+  Result := cLaunchProbeEnvClean;
+end;
+
 function RunLauncherHelperFromCommandLine: Integer;
 var
   lMode: string;
@@ -399,11 +420,45 @@ begin
     Exit(RunLaunchHelperExecute);
   if SameText(lMode, cLaunchHelperTestFailArg) then
     Exit(RunLaunchHelperTestFail);
+  if SameText(lMode, cLaunchHelperEnvProbeArg) then
+    Exit(RunLaunchHelperEnvProbe);
 end;
 
-function TryRunHelper(const aMode: string; const aPath: string; const aParams: string; out aExitCode: Cardinal): Boolean;
+// Rebuilds the user's environment from the registry, so launched targets do not
+// inherit whatever environment our own process happened to be started with.
+function TryCreateCleanEnvironment(out aEnvironment: Pointer; out aErrorCode: Cardinal): Boolean;
+var
+  lToken: THandle;
+begin
+  aEnvironment := nil;
+  aErrorCode := ERROR_SUCCESS;
+  if not OpenProcessToken(GetCurrentProcess, TOKEN_QUERY or TOKEN_DUPLICATE or TOKEN_IMPERSONATE, lToken) then
+  begin
+    aErrorCode := GetLastError;
+    Exit(False);
+  end;
+  try
+    Result := CreateEnvironmentBlock(aEnvironment, lToken, False);
+    if not Result then
+    begin
+      aErrorCode := GetLastError;
+      aEnvironment := nil;
+    end;
+  finally
+    CloseHandle(lToken);
+  end;
+end;
+
+// aEnvironment = nil lets the helper inherit our environment.
+function TryRunHelperWithEnvironment(
+  const aMode: string;
+  const aPath: string;
+  const aParams: string;
+  const aEnvironment: Pointer;
+  out aExitCode: Cardinal): Boolean;
 var
   lCommandLine: string;
+  lCreationFlags: Cardinal;
   lProcessInfo: TProcessInformation;
   lStartupInfo: TStartupInfo;
   lWaitResult: Cardinal;
@@ -414,6 +469,9 @@ begin
   lStartupInfo.cb := SizeOf(TStartupInfo);
   lStartupInfo.dwFlags := STARTF_USESHOWWINDOW;
   lStartupInfo.wShowWindow := SW_HIDE;
+  lCreationFlags := CREATE_NO_WINDOW;
+  if aEnvironment <> nil then
+    lCreationFlags := lCreationFlags or CREATE_UNICODE_ENVIRONMENT;
 
   Result := CreateProcess(
     PChar(ParamStr(0)),
@@ -421,8 +479,8 @@ begin
     nil,
     nil,
     False,
-    CREATE_NO_WINDOW,
-    nil,
+    lCreationFlags,
+    aEnvironment,
     nil,
     lStartupInfo,
     lProcessInfo);
@@ -449,6 +507,23 @@ begin
   end;
 end;
 
+function TryRunHelper(const aMode: string; const aPath: string; const aParams: string; out aExitCode: Cardinal): Boolean;
+var
+  lEnvironment: Pointer;
+  lErrorCode: Cardinal;
+begin
+  // launching with our inherited environment beats not launching at all
+  if not TryCreateCleanEnvironment(lEnvironment, lErrorCode) then
+    OutputDebugString(PChar(Format(
+      'Launcher: clean environment unavailable (error %d); helper inherits ours', [lErrorCode])));
+  try
+    Result := TryRunHelperWithEnvironment(aMode, aPath, aParams, lEnvironment, aExitCode);
+  finally
+    if lEnvironment <> nil then
+      DestroyEnvironmentBlock(lEnvironment);
+  end;
+end;
+
 function TryLaunchPathIsolated(const aPath: string; const aParams: string; out aExitCode: Cardinal): Boolean;
 begin
   Result := TryRunHelper(cLaunchHelperArg, aPath, aParams, aExitCode);
@@ -470,6 +545,48 @@ begin
       'SELFTEST FAILED: helper failure exit expected=%d actual=%d',
       [cLaunchExitTestFailure, lExitCode]));
     Exit(1);
+  end;
+end;
+
+function RunLaunchCleanEnvironmentSelfTest: Integer;
+var
+  lExitCode: Cardinal;
+begin
+  Result := 0;
+  if not SetEnvironmentVariable(PChar(cLaunchSelfTestTaintName), '1') then
+  begin
+    Writeln('SELFTEST FAILED: could not taint our own process environment');
+    Exit(1);
+  end;
+  try
+    // control: the fallback path still launches, and the probe does detect an inherited taint
+    if not TryRunHelperWithEnvironment(cLaunchHelperEnvProbeArg, '', '', nil, lExitCode) then
+    begin
+      Writeln('SELFTEST FAILED: launch helper could not be created with an inherited environment');
+      Exit(1);
+    end;
+    if lExitCode <> cLaunchProbeEnvInherited then
+    begin
+      Writeln(Format(
+        'SELFTEST FAILED: inherited-environment control expected=%d actual=%d',
+        [cLaunchProbeEnvInherited, lExitCode]));
+      Exit(1);
+    end;
+
+    if not TryRunHelper(cLaunchHelperEnvProbeArg, '', '', lExitCode) then
+    begin
+      Writeln('SELFTEST FAILED: launch helper environment probe could not be created');
+      Exit(1);
+    end;
+    if lExitCode <> cLaunchProbeEnvClean then
+    begin
+      Writeln(Format(
+        'SELFTEST FAILED: helper environment expected=%d (clean) actual=%d (%d=inherited taint, %d=incomplete)',
+        [cLaunchProbeEnvClean, lExitCode, cLaunchProbeEnvInherited, cLaunchProbeEnvIncomplete]));
+      Exit(1);
+    end;
+  finally
+    SetEnvironmentVariable(PChar(cLaunchSelfTestTaintName), nil);
   end;
 end;
 
@@ -728,6 +845,20 @@ begin
   begin
     try
       Result := RunLaunchClassificationSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+    Exit;
+  end;
+
+  if SameText(aArg, cLaunchCleanEnvironmentSelfTestArg) then
+  begin
+    try
+      Result := RunLaunchCleanEnvironmentSelfTest;
     except
       on lException: Exception do
       begin

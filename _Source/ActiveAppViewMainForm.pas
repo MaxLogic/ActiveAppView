@@ -3574,8 +3574,18 @@ begin
   fn := CombinePath([GetInstallDir, cScriptsFolderName, lbScripts.Items[i]]);
   if TFile.Exists(fn) then
     TThread.CreateAnonymousThread(
-      procedure begin
-        exec(fn);
+      procedure
+      var
+        lExitCode: Cardinal;
+      begin
+        // same isolated helper as desktop and shortcut items, so scripts start with a clean environment
+        if TryLaunchPathIsolated(fn, '', lExitCode) and IsLaunchSuccessExitCode(lExitCode) then
+          Exit;
+        TThread.Queue(nil,
+          procedure
+          begin
+            MessageDlg(Format(rsLaunchFailed, [fn]), mtWarning, [mbOK], 0);
+          end);
       end).Start;
 
 end;
