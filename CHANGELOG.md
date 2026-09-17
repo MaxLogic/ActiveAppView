@@ -9,6 +9,7 @@ All notable changes to this project are documented in this file.
 - `Scripts\Copy-MarkdownAsRichText.ps1` now converts markdown from the clipboard (a copied `.md` file, a path to one, or the text itself) into HTML, RTF, or pandoc plain text and puts it back on the clipboard for Jira, Outlook, Thunderbird, and other rich editors. Running it without `-Format` asks which flavor to use first; no temporary files are left behind.
 
 ### Fixed
+- Elevated terminal windows now appear in Console instances while ActiveAppView runs non-elevated. The process path lookup asked for more access than it needed, so elevated windows had no file name and were never recognized as terminals.
 - Window metadata now arrives by need: selected-window identity and icons can appear before command-line retrieval, and windows from the same process reuse its command line.
 - Foreground refresh now collects window inventories and slow metadata in the background, with coalesced updates and cancellable metadata helpers.
 - Window and auxiliary lists now preserve unchanged rows, selection, and scroll position during synchronization; selected-window details arrive asynchronously.

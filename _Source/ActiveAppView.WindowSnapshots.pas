@@ -96,6 +96,12 @@ uses
 
 const
   cAllMetadata: TWindowMetadataFields = [wmIdentity, wmCommandLine, wmIcon];
+  cRestrictedFileNameSelfTestArg = '--self-test-window-restricted-filename';
+  cRestrictedFileNameFixtureArg = '--window-filename-test-window';
+  // Everyone gets SYNCHRONIZE, PROCESS_QUERY_LIMITED_INFORMATION and PROCESS_TERMINATE only: the rights
+  // our non-elevated process effectively holds on an elevated one.
+  cRestrictedProcessSddl = 'D:(A;;0x101001;;;WD)';
+  cSddlRevision1 = 1;
 
 function AvailableMetadata(const aWindow: TWindowSnapshot): TWindowMetadataFields;
 begin
@@ -627,6 +633,102 @@ begin
   end;
 end;
 
+function ConvertStringSecurityDescriptorToSecurityDescriptor(aStringSecurityDescriptor: PWideChar;
+  aStringSDRevision: DWORD; out aSecurityDescriptor: Pointer; aSecurityDescriptorSize: PULONG): BOOL;
+  stdcall; external advapi32 name 'ConvertStringSecurityDescriptorToSecurityDescriptorW';
+
+function RunFileNameFixtureWindow(const aTitle: string): Integer;
+var
+  lMsg: TMsg;
+  lWatch: TStopwatch;
+  lWnd: HWND;
+begin
+  lWnd := CreateWindowEx(WS_EX_TOOLWINDOW or WS_EX_NOACTIVATE, 'STATIC', PChar(aTitle), WS_POPUP,
+    0, 0, 0, 0, 0, 0, HInstance, nil);
+  if lWnd = 0 then
+    Exit(1);
+  // Self-limiting, so a killed parent test cannot leave us behind.
+  lWatch := TStopwatch.StartNew;
+  while lWatch.ElapsedMilliseconds < 30000 do
+  begin
+    while PeekMessage(lMsg, 0, 0, 0, PM_REMOVE) do
+      DispatchMessage(lMsg);
+    Sleep(20);
+  end;
+  DestroyWindow(lWnd);
+  Result := 0;
+end;
+
+function RunRestrictedFileNameSelfTest: Integer;
+var
+  lCommandLine: string;
+  lDescriptor: Pointer;
+  lFileName: string;
+  lProbe: THandle;
+  lProcessInfo: TProcessInformation;
+  lSecurity: TSecurityAttributes;
+  lStartupInfo: TStartupInfo;
+  lTitle: string;
+  lWatch: TStopwatch;
+  lWnd: HWND;
+begin
+  Result := 0;
+  try
+    if not ConvertStringSecurityDescriptorToSecurityDescriptor(cRestrictedProcessSddl, cSddlRevision1,
+      lDescriptor, nil) then
+      RaiseLastOSError;
+    try
+      lSecurity := Default(TSecurityAttributes);
+      lSecurity.nLength := SizeOf(lSecurity);
+      lSecurity.lpSecurityDescriptor := lDescriptor;
+      lTitle := Format('ActiveAppView.RestrictedFixture.%d.%d', [GetCurrentProcessId, GetTickCount64]);
+      lCommandLine := Format('"%s" %s %s', [ParamStr(0), cRestrictedFileNameFixtureArg, lTitle]);
+      UniqueString(lCommandLine);
+      lStartupInfo := Default(TStartupInfo);
+      lStartupInfo.cb := SizeOf(lStartupInfo);
+      if not CreateProcess(PChar(ParamStr(0)), PChar(lCommandLine), @lSecurity, nil, False, CREATE_NO_WINDOW,
+        nil, nil, lStartupInfo, lProcessInfo) then
+        RaiseLastOSError;
+      try
+        CloseHandle(lProcessInfo.hThread);
+        // Guard the fixture: the test proves nothing unless the full query right really is denied.
+        lProbe := OpenProcess(PROCESS_QUERY_INFORMATION, False, lProcessInfo.dwProcessId);
+        if lProbe <> 0 then
+        begin
+          CloseHandle(lProbe);
+          raise Exception.Create('Fixture process granted PROCESS_QUERY_INFORMATION');
+        end;
+        lWatch := TStopwatch.StartNew;
+        repeat
+          lWnd := FindWindow('STATIC', PChar(lTitle));
+          if lWnd = 0 then
+            Sleep(20);
+        until (lWnd <> 0) or (lWatch.ElapsedMilliseconds > 10000);
+        if lWnd = 0 then
+          raise Exception.Create('Restricted fixture window did not appear');
+        lFileName := maxLogic.Windows.Desktop.GetFileName(lWnd);
+        if lFileName = '' then
+          raise Exception.Create('restricted process file name was empty');
+        if not SameText(lFileName, ParamStr(0)) then
+          raise Exception.Create('Restricted process file name mismatch: ' + lFileName);
+        Writeln(Format('RESTRICTED FILENAME PASS child-pid=%d', [lProcessInfo.dwProcessId]));
+      finally
+        TerminateProcess(lProcessInfo.hProcess, 0);
+        WaitForSingleObject(lProcessInfo.hProcess, 5000);
+        CloseHandle(lProcessInfo.hProcess);
+      end;
+    finally
+      LocalFree(HLOCAL(lDescriptor));
+    end;
+  except
+    on lException: Exception do
+    begin
+      Writeln('SELFTEST FAILED: ' + lException.Message);
+      Result := 1;
+    end;
+  end;
+end;
+
 function RunWindowMetadataHelper: Integer;
 var
   lApp: TAppInfo;
@@ -650,6 +752,8 @@ begin
     Sleep(INFINITE);
     Exit(0);
   end;
+  if SameText(ParamStr(1), cRestrictedFileNameFixtureArg) then
+    Exit(RunFileNameFixtureWindow(ParamStr(2)));
   if not SameText(ParamStr(1), '--window-metadata') then
     Exit;
   Result := 1;
@@ -846,6 +950,8 @@ var
 begin
   if SameText(aArg, '--self-test-window-metadata-policy') then
     Exit(RunMetadataPolicySelfTest);
+  if SameText(aArg, cRestrictedFileNameSelfTestArg) then
+    Exit(RunRestrictedFileNameSelfTest);
   Result := -1;
   if not SameText(aArg, '--self-test-window-snapshots') and
     not SameText(aArg, '--self-test-window-snapshot-ownership') and
