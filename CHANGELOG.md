@@ -10,6 +10,7 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 - Scripts, Desktop items, and ShortCuts now start with a clean user environment rebuilt from the registry instead of inheriting ActiveAppView's own. A terminal opened from the Desktop list had inherited `CLAUDE_CODE_CHILD_SESSION` from the shell that started ActiveAppView, which turned off transcript saving in the next Claude Code session. Scripts now go through the same isolated launch helper and run with the Scripts folder as working directory.
+- Enter now brings a minimized elevated window, such as an elevated terminal, to the front while ActiveAppView runs non-elevated. Windows refused our restore call across the elevation boundary, so the window stayed minimized; we now fall back to a posted restore command.
 - Elevated terminal windows now appear in Console instances while ActiveAppView runs non-elevated. The process path lookup asked for more access than it needed, so elevated windows had no file name and were never recognized as terminals.
 - Window metadata now arrives by need: selected-window identity and icons can appear before command-line retrieval, and windows from the same process reuse its command line.
 - Foreground refresh now collects window inventories and slow metadata in the background, with coalesced updates and cancellable metadata helpers.

@@ -7,8 +7,8 @@ function RunSelfTests: Integer;
 implementation
 
 uses
-  System.Classes, System.Diagnostics, System.IniFiles, System.IOUtils, System.SysUtils,
-  Winapi.Windows,
+  System.Classes, System.Diagnostics, System.IniFiles, System.IOUtils, System.SyncObjs, System.SysUtils,
+  Winapi.Messages, Winapi.Windows,
   ActiveAppView.CaptionOverrideState.SelfTests, ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache,
   ActiveAppView.FocusSound, ActiveAppView.MachineOverview.SelfTests, ActiveAppViewCore, ActiveAppView.Launcher,
   ActiveAppView.RenameJournal.SelfTests,
@@ -19,6 +19,83 @@ const
   cConfigCacheRuleSpacingSelfTestArg = '--self-test-config-cache-rule-spacing';
   cInvalidWndMetadataSelfTestArg = '--self-test-chat-monitor-invalid-wnd';
   cWindowEnumerationSelfTestArg = '--self-test-window-enumeration';
+  cWindowRestoreCommandSelfTestArg = '--self-test-window-restore-command';
+
+// ShowWindow cannot restore a window of an elevated process while we run non-elevated, and a test
+// cannot create an elevated window. So we prove the fallback alone restores a real minimized window
+// that lives on another thread, the way a foreign window does.
+function RunWindowRestoreCommandSelfTest: Integer;
+var
+  lReady: TEvent;
+  lThread: TThread;
+  lWnd: HWND;
+begin
+  Result := 0;
+  lWnd := 0;
+  lReady := TEvent.Create(nil, True, False, '');
+  try
+    lThread := TThread.CreateAnonymousThread(
+      procedure
+      var
+        lMsg: TMsg;
+      begin
+        lWnd := CreateWindowEx(WS_EX_TOOLWINDOW or WS_EX_NOACTIVATE, 'STATIC', 'RestoreCommandSelfTest',
+          WS_POPUP or WS_MINIMIZE, 0, 0, 1, 1, 0, 0, HInstance, nil);
+        lReady.SetEvent;
+        if lWnd = 0 then
+          Exit;
+        try
+          while GetMessage(lMsg, 0, 0, 0) do
+          begin
+            TranslateMessage(lMsg);
+            DispatchMessage(lMsg);
+          end;
+        finally
+          DestroyWindow(lWnd);
+        end;
+      end);
+    lThread.FreeOnTerminate := False;
+    lThread.Start;
+    try
+      if (lReady.WaitFor(5000) <> wrSignaled) or (lWnd = 0) then
+      begin
+        Writeln('SELFTEST FAILED: restore-command host window was not created');
+        Exit(1);
+      end;
+      try
+        if not IsIconic(lWnd) then
+        begin
+          Writeln('SELFTEST FAILED: restore-command host window did not start minimized');
+          Exit(1);
+        end;
+
+        if not maxLogic.Windows.Desktop.RestoreMinimizedWindowByCommand(lWnd, 2000) then
+        begin
+          Writeln('SELFTEST FAILED: restore command did not report a restored window');
+          Exit(1);
+        end;
+        if IsIconic(lWnd) then
+        begin
+          Writeln('SELFTEST FAILED: window is still minimized after the restore command');
+          Exit(1);
+        end;
+      finally
+        PostThreadMessage(lThread.ThreadID, WM_QUIT, 0, 0);
+      end;
+    finally
+      lThread.WaitFor;
+      lThread.Free;
+    end;
+
+    if maxLogic.Windows.Desktop.RestoreMinimizedWindowByCommand(lWnd, 100) then
+    begin
+      Writeln('SELFTEST FAILED: restore command reported success for a destroyed window');
+      Exit(1);
+    end;
+  finally
+    lReady.Free;
+  end;
+end;
 
 function RunWindowEnumerationSelfTest: Integer;
 var
@@ -360,6 +437,17 @@ begin
   begin
     try
       Result := RunWindowEnumerationSelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
+  end else if SameText(ParamStr(1), cWindowRestoreCommandSelfTestArg) then
+  begin
+    try
+      Result := RunWindowRestoreCommandSelfTest;
     except
       on lException: Exception do
       begin
