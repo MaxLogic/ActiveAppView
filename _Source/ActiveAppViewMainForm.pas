@@ -9,7 +9,8 @@ uses
   Vcl.Graphics, Vcl.Menus, Vcl.StdCtrls,
   CancelToken, maxAsync,
   ActiveAppView.CaptionOverrideState, ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache,
-  ActiveAppView.FocusSound, ActiveAppView.MachineOverview.Commands, ActiveAppView.MachineOverview.HelpForm,
+  ActiveAppView.FocusSound, ActiveAppView.HarnessSetup, ActiveAppView.MachineOverview.Commands,
+  ActiveAppView.MachineOverview.HelpForm,
   ActiveAppView.MachineOverview.History, ActiveAppView.MachineOverview.HistoryForm,
   ActiveAppView.MachineOverview.Layout,
   ActiveAppView.MachineOverview.Service,
@@ -59,6 +60,7 @@ type
     pnlConsole: TPanel;
     labConsoleTitle: TStaticText;
     lbConsole: TListBox;
+    btnSetupHarnesses: TButton;
     cbConsoleFilter: TComboBox;
     pnlConsoleFocusLeft: TPanel;
     pnlConsoleFocusRight: TPanel;
@@ -93,6 +95,7 @@ type
     btnMachineOverviewFullView: TButton;
     btnMachineOverviewHelp: TButton;
     procedure FormCreate(Sender: TObject);
+    procedure btnSetupHarnessesClick(Sender: TObject);
     procedure ConsoleFilterChange(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure FormActivate(Sender: TObject);
@@ -128,6 +131,9 @@ type
     // PIDs of the windows listed by the previous refresh; they identify vanished rows.
     fWindowPids: TDictionary<hWnd, Cardinal>;
     fAuxListRefresh: iAsync;
+    fHarnessChanges: THarnessChanges;
+    fHarnessSetup: iAsync;
+    fHarnessSetupError: string;
     fAuxListRefreshBusy: Integer;
     fAuxListRefreshPending: Integer;
     fChatMonitorConfiguredEnabled: Boolean;
@@ -221,6 +227,7 @@ type
     procedure RebuildSharedAppsSnapshot;
     procedure RefreshConsoleList;
     procedure SelectConsoleFilter(const aFilter: TConsoleFilter);
+    procedure ShowHarnessSetupPlan;
     procedure SetConsoleFilter(const aFilter: TConsoleFilter);
     procedure RunAuxListsRefresh;
     procedure RunChatMonitorSnapshot;
@@ -313,7 +320,7 @@ uses
   Vcl.Clipbrd,
   AutoFree, maxCallMeLater, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils, maxLogic.Windows.Desktop,
   MaxLogic.Windows.Identity,
-  ActiveAppView.Launcher, ActiveAppView.SelectionTrace;
+  ActiveAppView.AgentState, ActiveAppView.Launcher, ActiveAppView.SelectionTrace;
 
 function IsHungAppWindow(aWnd: HWND): BOOL; stdcall; external user32;
 
@@ -394,6 +401,11 @@ const
 resourcestring
   rsDialogCancel = 'Cancel';
   rsDialogOk = 'OK';
+  rsHarnessHookMissing = 'The hook program is missing: %s';
+  rsHarnessSetupApply = 'ActiveAppView will update these harness settings:';
+  rsHarnessSetupApplyQuestion = 'Apply these changes?';
+  rsHarnessSetupCodexTrust = 'Codex asks once to trust new hooks: run /hooks in Codex after setup.';
+  rsHarnessSetupFailed = 'Harness setup failed: %s';
   rsLaunchFailed = 'Failed to launch item: %s';
   rsMachineOverviewFreeze = 'Freeze display (Ctrl+E)';
   rsMachineOverviewFullView = 'Full View (Shift+F8)';
@@ -908,37 +920,58 @@ begin
   Result := (Ord(aChar) >= $2800) and (Ord(aChar) <= $28FF);
 end;
 
-function MatchesConsoleFilter(const aCaption: string; const aFilter: TConsoleFilter): Boolean;
+function ConsoleAgentState(const aCaption: string; const aAgent: TAgentState;
+  const aAuthoritative: Boolean): TAgentState;
 var
   lCaption: string;
+  lDefinite: Boolean;
   lSeparator: Integer;
-  lState: TConsoleFilter;
 begin
-  if aFilter = cfAll then
-    Exit(True);
+  // Precedence: the harness's own session registry, a hook waiting for the user, definite title
+  // markers, other hook states, the Codex task | project heuristic, and a harness in the process tree.
+  if (aAuthoritative and (aAgent >= asIdle)) or (aAgent = asActionRequired) then
+    Exit(aAgent);
   lCaption := Trim(aCaption);
+  Result := asNone;
+  lDefinite := True;
   if lCaption = '' then
-    Exit(aFilter = cfNonAgent);
-  lState := cfAll;
-  if IsCodexWorkingPrefixChar(lCaption[1]) or
+    lDefinite := False
+  else if IsCodexWorkingPrefixChar(lCaption[1]) or
     ((Ord(lCaption[1]) >= $25D0) and (Ord(lCaption[1]) <= $25D3)) then
-    lState := cfWorking
+    Result := asWorking
   else if (lCaption[1] = Char($2733)) or (lCaption[1] = Char($2731)) or
     StartsText('[ ! ] Action Required', lCaption) or
     StartsText('[ . ] Action Required', lCaption) then
-    lState := cfIdle
+    Result := asIdle
   else begin
+    lDefinite := False;
     // Codex removes its spinner when idle; the task/project title is a heuristic.
     lSeparator := Pos(' | ', lCaption);
     if (lSeparator > 1) and (lSeparator + 2 < Length(lCaption)) then
-      lState := cfIdle;
+      Result := asIdle;
   end;
-  if aFilter = cfActionRequired then
-    Result := (lState = cfIdle) and ContainsText(lCaption, 'action required')
-  else if aFilter = cfNonAgent then
-    Result := lState = cfAll
+  if (not lDefinite) and (aAgent in [asIdle, asWorking]) then
+    Result := aAgent
+  else if (Result = asNone) and (aAgent = asAgent) then
+    Result := asAgent;
+  if (Result = asIdle) and ContainsText(lCaption, 'action required') then
+    Result := asActionRequired;
+end;
+
+function MatchesConsoleFilter(const aCaption: string; const aFilter: TConsoleFilter;
+  const aAgent: TAgentState = asNone; const aAuthoritative: Boolean = False): Boolean;
+var
+  lState: TAgentState;
+begin
+  lState := ConsoleAgentState(aCaption, aAgent, aAuthoritative);
+  case aFilter of
+    cfIdle: Result := lState in [asIdle, asActionRequired];
+    cfWorking: Result := lState = asWorking;
+    cfActionRequired: Result := lState = asActionRequired;
+    cfNonAgent: Result := lState = asNone;
   else
-    Result := lState = aFilter;
+    Result := True;
+  end;
 end;
 
 function NormalizeConsoleSortCaption(const aCaption: string): string;
@@ -3299,6 +3332,7 @@ begin
 
   RequestAsyncStop(fAuxListRefresh);
   RequestAsyncStop(fChatMonitorTask);
+  RequestAsyncStop(fHarnessSetup);
   if Assigned(fMachineOverviewService) then
   begin
     lShutdownResult := fMachineOverviewService.Stop(cShutdownTaskWaitTimeoutMs);
@@ -3309,10 +3343,12 @@ begin
 
   WaitAsyncWithShutdown(fAuxListRefresh, cShutdownTaskWaitTimeoutMs);
   WaitAsyncWithShutdown(fChatMonitorTask, cShutdownTaskWaitTimeoutMs);
+  WaitAsyncWithShutdown(fHarnessSetup, cShutdownTaskWaitTimeoutMs);
 
   FreeAndNil(fPendingAuxSnapshot);
   fAuxListRefresh := nil;
   fChatMonitorTask := nil;
+  fHarnessSetup := nil;
   fMachineOverviewService := nil;
   FreeAndNil(fMachineOverviewLayout);
   FreeAndNil(fMachineOverviewController);
@@ -3793,6 +3829,22 @@ begin
           '[ ! ] Action Required', Char($280B) + ' task', Char($25D0) + ' task'] do
           if MatchesConsoleFilter(lTitle, cfNonAgent) then
             raise Exception.Create('Agent title matched the non-agent filter: ' + lTitle);
+        // Hook and process-tree states combined with titles.
+        if MatchesConsoleFilter('C:\Program Files\PowerShell\7\pwsh.exe', cfNonAgent, asAgent) or
+          MatchesConsoleFilter('C:\Program Files\PowerShell\7\pwsh.exe', cfIdle, asAgent) or
+          (not MatchesConsoleFilter('', cfIdle, asIdle)) or
+          (not MatchesConsoleFilter('task | project', cfWorking, asWorking)) or
+          (not MatchesConsoleFilter(Char($2733) + ' Claude', cfIdle, asWorking)) or
+          (not MatchesConsoleFilter(Char($280B) + ' task', cfWorking, asIdle)) or
+          (not MatchesConsoleFilter(Char($2733) + ' Claude', cfActionRequired, asActionRequired)) or
+          MatchesConsoleFilter(Char($25D0) + ' task', cfWorking, asActionRequired) or
+          (not MatchesConsoleFilter('PowerShell', cfNonAgent, asNone)) or
+          // Claude's session registry beats the title: waiting behind an idle marker, busy behind none.
+          (not MatchesConsoleFilter(Char($2733) + ' Claude', cfActionRequired, asActionRequired, True)) or
+          (not MatchesConsoleFilter('C:\Program Files\PowerShell\7\pwsh.exe', cfWorking, asWorking, True)) or
+          (not MatchesConsoleFilter(Char($25D0) + ' task', cfIdle, asIdle, True)) or
+          MatchesConsoleFilter(Char($25D0) + ' task', cfIdle, asIdle, False) then
+          raise Exception.Create('Hook or process-tree state was combined with the title incorrectly');
         for lTitle in ['Review changes | ActiveAppView', ' task | project ',
           Char($2733) + ' Review changes', Char($2731) + ' Claude Code',
           '[ ! ] Action Required', '[ . ] Action Required | task | project'] do
@@ -3942,6 +3994,10 @@ begin
           (lTestForm.lbConsole.Count <> 1) or
           (lTestForm.lbConsole.Items.IndexOfObject(TObject(100)) <> 0) then
           raise Exception.Create('Ctrl+5 did not select only the non-agent terminal');
+        lTestForm.fWindowBatch.Windows[0].AgentState := asAgent;
+        lTestForm.UpdateGui;
+        if lTestForm.lbConsole.Count <> 0 then
+          raise Exception.Create('A terminal running a harness remained in the non-agent filter');
         if lAnnounced <> '1012103134' then
           raise Exception.Create('Filter announcements were wrong: ' + lAnnounced);
         Writeln('CONSOLE FILTER PASS');
@@ -5567,6 +5623,67 @@ begin
     PlaySound(PChar(cSounds[aFilter]), HInstance, SND_RESOURCE or SND_ASYNC or SND_NODEFAULT);
 end;
 
+procedure TAppsViewMainFrm.btnSetupHarnessesClick(Sender: TObject);
+var
+  lHookExe: string;
+begin
+  lHookExe := TPath.Combine(GetInstallDir, 'AgentStateHook.exe');
+  if not TFile.Exists(lHookExe) then
+  begin
+    MessageDlg(Format(rsHarnessHookMissing, [lHookExe]), mtError, [mbOK], 0);
+    Exit;
+  end;
+  // Finding WSL homes starts wsl.exe, so the plan is built off the UI thread.
+  btnSetupHarnesses.Enabled := False;
+  fHarnessChanges := nil;
+  fHarnessSetupError := '';
+  fHarnessSetup := SimpleAsyncCall(
+    procedure
+    begin
+      try
+        fHarnessChanges := PlanHarnessSetup(lHookExe);
+      except
+        on lException: Exception do
+          fHarnessSetupError := lException.Message;
+      end;
+    end, 'ActiveAppView.HarnessSetup', ShowHarnessSetupPlan);
+end;
+
+procedure TAppsViewMainFrm.ShowHarnessSetupPlan;
+var
+  lChange: THarnessChange;
+  lCodex: Boolean;
+  lPending: Boolean;
+  lText: string;
+begin
+  btnSetupHarnesses.Enabled := True;
+  if IsShuttingDown then
+    Exit;
+  if fHarnessSetupError <> '' then
+  begin
+    MessageDlg(Format(rsHarnessSetupFailed, [fHarnessSetupError]), mtError, [mbOK], 0);
+    Exit;
+  end;
+  lPending := False;
+  lCodex := False;
+  for lChange in fHarnessChanges do
+    if lChange.Changed and (lChange.ErrorText = '') then
+    begin
+      lPending := True;
+      lCodex := lCodex or (lChange.Kind = hkCodex);
+    end;
+  lText := rsHarnessSetupApply + sLineBreak + sLineBreak + DescribeHarnessChanges(fHarnessChanges);
+  if lCodex then
+    lText := lText + sLineBreak + rsHarnessSetupCodexTrust + sLineBreak;
+  if not lPending then
+  begin
+    MessageDlg(lText, mtInformation, [mbOK], 0);
+    Exit;
+  end;
+  if MessageDlg(lText + sLineBreak + rsHarnessSetupApplyQuestion, mtConfirmation, [mbOK, mbCancel], 0) = mrOk then
+    MessageDlg(ApplyHarnessChanges(fHarnessChanges), mtInformation, [mbOK], 0);
+end;
+
 procedure TAppsViewMainFrm.ConsoleFilterChange(Sender: TObject);
 begin
   if cbConsoleFilter.ItemIndex >= 0 then
@@ -5720,7 +5837,7 @@ begin
         (not lIsTerminal) and (lApp.MetadataReady or (wmIdentity in lApp.AvailableMetadata)));
       if lIsTerminal then
       begin
-        if MatchesConsoleFilter(lApp.Caption, fConsoleFilter) then
+        if MatchesConsoleFilter(lApp.Caption, fConsoleFilter, lApp.AgentState, lApp.AgentAuthoritative) then
           lConsole.AddObject(lTitle, TObject(lApp.Wnd));
       end else
         lApps.AddObject(lTitle, TObject(lApp.Wnd));

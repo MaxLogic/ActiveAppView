@@ -5,11 +5,11 @@ interface
 uses
   System.Classes, System.SyncObjs, System.SysUtils,
   Winapi.Messages, Winapi.Windows,
-  ActiveAppView.ConfigCache;
+  ActiveAppView.AgentState, ActiveAppView.ConfigCache;
 
 const
   cWindowSnapshotMessage = WM_APP + 181;
-  cWindowRefreshMessage = WM_APP + 182;
+  cWindowRefreshMessage = cAgentStateRefreshMessage;
 
 type
   TWindowMetadataField = (wmIdentity, wmCommandLine, wmIcon);
@@ -21,6 +21,9 @@ type
     ProcessStartedAt: Int64;
     Caption: string;
     FileName: string;
+    // Terminal windows only; filled from the process tree and harness hooks.
+    AgentState: TAgentState;
+    AgentAuthoritative: Boolean;
     AppUserModelID: string;
     CommandLine: string;
     CommandLineParams: string;
@@ -228,6 +231,32 @@ begin
   aTarget.AvailableMetadata := AvailableMetadata(aSource);
   aTarget.AttemptedMetadata := aSource.AttemptedMetadata;
   aTarget.RetryAfter := aSource.RetryAfter;
+end;
+
+procedure ApplyTerminalAgentStates(var aBatch: TWindowSnapshotBatch);
+var
+  lIndexes: TArray<Integer>;
+  lPattern: string;
+  lStates: TArray<TAgentWindowState>;
+  lTerminals: TArray<TAgentTerminal>;
+  i: Integer;
+begin
+  for i := 0 to High(aBatch.Windows) do
+    for lPattern in aBatch.TerminalPatterns do
+      if (aBatch.Windows[i].Caption <> '') and StringMatches(aBatch.Windows[i].FileName, lPattern, False) then
+      begin
+        lIndexes := lIndexes + [i];
+        SetLength(lTerminals, Length(lTerminals) + 1);
+        lTerminals[High(lTerminals)].PID := aBatch.Windows[i].PID;
+        lTerminals[High(lTerminals)].StartedAt := aBatch.Windows[i].ProcessStartedAt;
+        Break;
+      end;
+  lStates := CollectTerminalAgentStates(lTerminals);
+  for i := 0 to High(lStates) do
+  begin
+    aBatch.Windows[lIndexes[i]].AgentState := lStates[i].State;
+    aBatch.Windows[lIndexes[i]].AgentAuthoritative := lStates[i].Authoritative;
+  end;
 end;
 
 function CollectWindow(aWnd: HWND; aParam: LPARAM): BOOL; stdcall;
@@ -554,6 +583,7 @@ begin
           if lCollector.fErrorText <> '' then
             raise Exception.Create(lCollector.fErrorText);
           lBatch.Windows := lCollector.fWindows.ToArray;
+          ApplyTerminalAgentStates(lBatch);
         finally
           lCollector.fWindows.Free;
           lCollector.Free;

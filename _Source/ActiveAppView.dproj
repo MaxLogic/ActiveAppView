@@ -139,6 +139,8 @@
         <DelphiCompile Include="$(MainSource)">
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
+        <DCCReference Include="ActiveAppView.AgentState.pas"/>
+        <DCCReference Include="ActiveAppView.HarnessSetup.pas"/>
         <DCCReference Include="ActiveAppView.CaptionOverrideState.pas"/>
         <DCCReference Include="ActiveAppView.CaptionOverrideState.SelfTests.pas"/>
         <DCCReference Include="ActiveAppView.ChatMonitor.pas"/>

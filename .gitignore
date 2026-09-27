@@ -51,3 +51,4 @@ _analysis/
 .copilot/
 .windsurf/
 /_Source/ConsoleFilterSounds.res
+/_Source/*.dfmcheck.cache

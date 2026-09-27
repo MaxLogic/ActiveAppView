@@ -5,6 +5,8 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- Console instances now knows Claude sessions whose window title shows no marker, and Claude sessions waiting for input behind an idle title. It reads Claude Code's own session registry and finds `claude.exe`/`codex.exe` (also a self-updated `claude.exe.old.*`) below each terminal.
+- A Setup harnesses... button adds a state hook to Claude Code and Codex on Windows and in WSL, after a preview and with a backup. Hooked sessions report working, idle, and permission waits directly instead of through title guesses.
 - Console instances has a Non Codex/Claude filter (Ctrl+5) for terminals without an agent title marker. Switching any console filter now plays a short spoken confirmation of the selected filter.
 - `Scripts\save-md.ps1` saves clipboard text as a temporary Markdown file and copies its full path back to the clipboard.
 - Console instances has All, Idle Codex/Claude, Working Codex/Claude, and Action required filters. Ctrl+1 through Ctrl+4 switch filters only while the Console list has focus. Detection uses terminal title markers and the idle `task | project` heuristic; Action required selects idle entries containing that phrase.

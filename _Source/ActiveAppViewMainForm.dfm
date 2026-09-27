@@ -552,6 +552,20 @@ object AppsViewMainFrm: TAppsViewMainFrm
       OnDblClick = lbAppsDblClick
       OnKeyUp = lbAppsKeyUp
     end
+    object btnSetupHarnesses: TButton
+      AlignWithMargins = True
+      Left = 3
+      Top = 819
+      Width = 344
+      Height = 31
+      Hint = 'Add ActiveAppView state hooks to Claude Code and Codex on Windows and in WSL'
+      Align = alBottom
+      Caption = 'Setup harnesses...'
+      ParentShowHint = False
+      ShowHint = True
+      TabOrder = 3
+      OnClick = btnSetupHarnessesClick
+    end
     object pnlConsoleFocusLeft: TPanel
       AlignWithMargins = True
       Left = 3
@@ -562,7 +576,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Color = clBlack
       ParentBackground = False
       ShowCaption = False
-      TabOrder = 3
+      TabOrder = 4
     end
     object pnlConsoleFocusRight: TPanel
       AlignWithMargins = True
@@ -574,7 +588,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Color = clBlack
       ParentBackground = False
       ShowCaption = False
-      TabOrder = 4
+      TabOrder = 5
     end
   end
   object pnlDesktop: TPanel

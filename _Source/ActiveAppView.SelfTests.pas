@@ -9,8 +9,9 @@ implementation
 uses
   System.Classes, System.Diagnostics, System.IniFiles, System.IOUtils, System.SyncObjs, System.SysUtils,
   Winapi.Messages, Winapi.Windows,
-  ActiveAppView.CaptionOverrideState.SelfTests, ActiveAppView.ChatMonitor, ActiveAppView.ConfigCache,
-  ActiveAppView.FocusSound, ActiveAppView.MachineOverview.SelfTests, ActiveAppViewCore, ActiveAppView.Launcher,
+  ActiveAppView.AgentState, ActiveAppView.CaptionOverrideState.SelfTests, ActiveAppView.ChatMonitor,
+  ActiveAppView.ConfigCache, ActiveAppView.FocusSound, ActiveAppView.HarnessSetup,
+  ActiveAppView.MachineOverview.SelfTests, ActiveAppViewCore, ActiveAppView.Launcher,
   ActiveAppView.RenameJournal.SelfTests,
   ActiveAppViewMainForm, maxLogic.Windows.Desktop;
 
@@ -392,6 +393,14 @@ begin
     Exit;
 
   Result := RunChatMonitorSelfTests(ParamStr(1));
+  if Result <> -1 then
+    Exit;
+
+  Result := RunAgentStateSelfTests(ParamStr(1));
+  if Result <> -1 then
+    Exit;
+
+  Result := RunHarnessSetupSelfTests(ParamStr(1));
   if Result <> -1 then
     Exit;
 

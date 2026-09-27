@@ -31,13 +31,23 @@ Accessibility tool for active application / explorer quick selection
 
 ## Console activity filter
 - The dropdown above Console instances starts at All. Ctrl+1 through Ctrl+5 work only while the Console list itself has focus, and preserve that focus. F4 returns to the list; the dropdown can also be operated directly.
-- Filtering uses the original terminal title, before local Rename labels or display prefixes. Windows Terminal and Alacritty are included by the shipped `TerminalPatterns.txt`.
-- Working includes leading Braille spinner characters and Claude's half-circle spinner. Idle includes Claude's asterisk markers, Codex's Action Required titles, and the approved `task | project` title-format heuristic. Unknown titles appear only in All.
+- Windows Terminal and Alacritty are included by the shipped `TerminalPatterns.txt`. Each terminal's state comes from the first source that knows it:
+  1. Claude Code's own session registry, `%USERPROFILE%\.claude\sessions\<pid>.json`, for Windows Claude sessions running below the terminal: `busy` is Working, `waiting` is Action required, `idle` and `shell` (a background shell is running) are Idle. This needs no setup and also finds sessions whose title Claude never set.
+  2. Harness hooks (see Setup harnesses below). A hook asking for the user wins over the title; otherwise definite title markers win, because a hook misses some transitions such as an interrupted Claude turn.
+  3. The original terminal title, before local Rename labels or display prefixes.
+  4. A `claude.exe` or `codex.exe` process below the terminal, including a self-updated `claude.exe.old.*`. Such a terminal is an agent even when its state is unknown; it then appears only in All.
+- Working includes leading Braille spinner characters and Claude's half-circle spinner. Idle includes Claude's asterisk markers, Codex's Action Required titles, and the approved `task | project` title-format heuristic. Unknown titles appear only in All unless another source knows the state.
 - Action required shows the subset of idle Codex/Claude entries whose original title contains `action required`, ignoring case. These entries also remain in Idle.
-- Non Codex/Claude shows terminals whose title matches none of the agent markers, including untitled ones.
+- Non Codex/Claude shows terminals where no source finds an agent, including untitled ones.
 - Every filter change, by shortcut or dropdown, plays a short spoken confirmation (ElevenLabs Bella voice). The clips are embedded in the executable from `_Source\Sounds`.
-- This is title-based detection: an unrelated terminal using those title formats can match, and disabled or custom titles can hide an agent's state. Windows Terminal exposes the current window title, so inactive tabs and split panes are not separately classified. Idle means the title is ready for input or needs attention; background jobs may still be running.
+- Title-only detection remains a fallback: an unrelated terminal using those title formats can match, and disabled or custom titles can hide an agent's state. Windows Terminal exposes the current window title, so inactive tabs and split panes are not separately classified. Idle means the title is ready for input or needs attention; background jobs may still be running.
 - Codex's [title implementation](https://github.com/openai/codex/blob/main/codex-rs/tui/src/chatwidget/status_surfaces.rs) describes its activity prefix. Claude markers are based on reported behavior in [the older spinner report](https://github.com/anthropics/claude-code/issues/69306) and [the half-circle spinner report](https://github.com/anthropics/claude-code/issues/88360), rather than a guaranteed API.
+
+## Setup harnesses
+- The Setup harnesses... button below Console instances adds `AgentStateHook.exe` (built next to `ActiveAppView.exe`) as a hook to Claude Code (`~/.claude/settings.json`) and Codex (`~/.codex/hooks.json`) on Windows and in every WSL distribution that has those folders. It first shows which files change; on OK it keeps a `.bak-activeappview-<timestamp>` copy of each existing file. Running it again replaces our entries and leaves other hooks untouched.
+- Codex asks once to trust new hooks: run `/hooks` in Codex after setup. Hooks apply to sessions started afterwards.
+- The hook writes one small file per session to `%LOCALAPPDATA%\ActiveAppView\AgentState` and never prints or blocks. It records its Windows parent processes, which is how a session maps to its terminal window, from WSL too (interop runs it below the terminal's `wsl.exe`). Files of ended or dead sessions are removed.
+- Diagnostics without changing anything: `ActiveAppView.exe --harness-setup-preview` prints the planned files, `ActiveAppView.exe --agent-state-dump` prints the state resolved for each terminal process.
 
 ## Focus sound
 - ActiveAppView plays the WAV file configured by `[FocusSound] File` when the application gains foreground focus.
