@@ -18,7 +18,7 @@ uses
   ActiveAppViewCore, ActiveAppView.RenameJournal, ActiveAppView.WindowSnapshots;
 
 type
-  TConsoleFilter = (cfAll, cfIdle, cfWorking, cfActionRequired);
+  TConsoleFilter = (cfAll, cfIdle, cfWorking, cfActionRequired, cfNonAgent);
 
   TWindowActionTarget = record
     DisplayCaption: string;
@@ -137,6 +137,7 @@ type
     fChatMonitorTask: iAsync;
     fConfigCache: TConfigCache;
     fConsoleFilter: TConsoleFilter;
+    fConsoleFilterAnnouncer: TProc<TConsoleFilter>;
     fFocusSoundFileName: string;
     fFocusSoundPlayer: TProc<string>;
     fOrgAppOnActivate: TNotifyEvent;
@@ -219,6 +220,7 @@ type
     procedure QueueGuiRefresh;
     procedure RebuildSharedAppsSnapshot;
     procedure RefreshConsoleList;
+    procedure SelectConsoleFilter(const aFilter: TConsoleFilter);
     procedure SetConsoleFilter(const aFilter: TConsoleFilter);
     procedure RunAuxListsRefresh;
     procedure RunChatMonitorSnapshot;
@@ -916,7 +918,7 @@ begin
     Exit(True);
   lCaption := Trim(aCaption);
   if lCaption = '' then
-    Exit(False);
+    Exit(aFilter = cfNonAgent);
   lState := cfAll;
   if IsCodexWorkingPrefixChar(lCaption[1]) or
     ((Ord(lCaption[1]) >= $25D0) and (Ord(lCaption[1]) <= $25D3)) then
@@ -933,6 +935,8 @@ begin
   end;
   if aFilter = cfActionRequired then
     Result := (lState = cfIdle) and ContainsText(lCaption, 'action required')
+  else if aFilter = cfNonAgent then
+    Result := lState = cfAll
   else
     Result := lState = aFilter;
 end;
@@ -3332,9 +3336,9 @@ var
   lMachineOverviewCommand: TMachineOverviewCommand;
 begin
   if (ActiveControl = lbConsole) and (Shift = [ssCtrl]) and
-    (Key >= Ord('1')) and (Key <= Ord('4')) then
+    (Key >= Ord('1')) and (Key <= Ord('1') + Ord(High(TConsoleFilter))) then
   begin
-    SetConsoleFilter(TConsoleFilter(Key - Ord('1')));
+    SelectConsoleFilter(TConsoleFilter(Key - Ord('1')));
     Key := 0;
     Exit;
   end;
@@ -3720,6 +3724,7 @@ var
   lOwnedData: TObject;
   lSample: Integer;
   lActualValue: string;
+  lAnnounced: string;
   lApps: TArray<TAppInfo>;
   lApplyResult: TWindowCaptionDialogApplyResult;
   lActionWnd: hWnd;
@@ -3781,9 +3786,13 @@ begin
     try
       try
         for lTitle in ['', 'PowerShell', 'project', 'task | ', ' | project', 'cmd.exe'] do
-          if (not MatchesConsoleFilter(lTitle, cfAll)) or
+          if (not MatchesConsoleFilter(lTitle, cfAll)) or (not MatchesConsoleFilter(lTitle, cfNonAgent)) or
             MatchesConsoleFilter(lTitle, cfIdle) or MatchesConsoleFilter(lTitle, cfWorking) then
             raise Exception.Create('Unknown title was classified as an agent: ' + lTitle);
+        for lTitle in ['Review changes | ActiveAppView', Char($2733) + ' Claude Code',
+          '[ ! ] Action Required', Char($280B) + ' task', Char($25D0) + ' task'] do
+          if MatchesConsoleFilter(lTitle, cfNonAgent) then
+            raise Exception.Create('Agent title matched the non-agent filter: ' + lTitle);
         for lTitle in ['Review changes | ActiveAppView', ' task | project ',
           Char($2733) + ' Review changes', Char($2731) + ' Claude Code',
           '[ ! ] Action Required', '[ . ] Action Required | task | project'] do
@@ -3812,9 +3821,16 @@ begin
         lTestForm.cbConsoleFilter := TComboBox.Create(lTestForm);
         lTestForm.cbConsoleFilter.Parent := lTestForm;
         lTestForm.cbConsoleFilter.Style := csDropDownList;
-        lTestForm.cbConsoleFilter.Items.AddStrings(['All', 'Idle', 'Working', 'Action required']);
+        lTestForm.cbConsoleFilter.Items.AddStrings(['All', 'Idle', 'Working', 'Action required',
+          'Non-agent']);
         lTestForm.cbConsoleFilter.ItemIndex := 0;
         lTestForm.cbConsoleFilter.OnChange := lTestForm.ConsoleFilterChange;
+        lAnnounced := '';
+        lTestForm.fConsoleFilterAnnouncer :=
+          procedure(aFilter: TConsoleFilter)
+          begin
+            lAnnounced := lAnnounced + IntToStr(Ord(aFilter));
+          end;
         lTestForm.pnlAppDetails := TPanel.Create(lTestForm);
         lTestForm.fStartupDataReady := 1;
         lTestForm.fWindowBatch.TerminalPatterns := ['*alacritty.exe', '*WindowsTerminal.exe'];
@@ -3833,7 +3849,7 @@ begin
             1: lTestForm.ActiveControl := lTestForm.lbExplorer;
             2: lTestForm.ActiveControl := lTestForm.cbConsoleFilter;
           end;
-          for lExpectedFilterKey := Ord('1') to Ord('4') do
+          for lExpectedFilterKey := Ord('1') to Ord('5') do
           begin
             lFilterKey := lExpectedFilterKey;
             lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
@@ -3919,6 +3935,15 @@ begin
         if (lTestForm.lbConsole.Count <> 1) or
           (lTestForm.lbConsole.Items.IndexOfObject(TObject(103)) <> 0) then
           raise Exception.Create('Cleared action-required title remained in the filter');
+        lTestForm.ActiveControl := lTestForm.lbConsole;
+        lFilterKey := Ord('5');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if (lFilterKey <> 0) or (lTestForm.cbConsoleFilter.ItemIndex <> 4) or
+          (lTestForm.lbConsole.Count <> 1) or
+          (lTestForm.lbConsole.Items.IndexOfObject(TObject(100)) <> 0) then
+          raise Exception.Create('Ctrl+5 did not select only the non-agent terminal');
+        if lAnnounced <> '1012103134' then
+          raise Exception.Create('Filter announcements were wrong: ' + lAnnounced);
         Writeln('CONSOLE FILTER PASS');
       except
         on E: Exception do
@@ -5529,10 +5554,23 @@ begin
   UpdateGui;
 end;
 
+procedure TAppsViewMainFrm.SelectConsoleFilter(const aFilter: TConsoleFilter);
+const
+  // WAVE resources from ConsoleFilterSounds.rc (ElevenLabs Bella voice).
+  cSounds: array[TConsoleFilter] of string = ('CONSOLE_FILTER_ALL', 'CONSOLE_FILTER_IDLE',
+    'CONSOLE_FILTER_WORKING', 'CONSOLE_FILTER_ACTION', 'CONSOLE_FILTER_NON_AGENT');
+begin
+  SetConsoleFilter(aFilter);
+  if Assigned(fConsoleFilterAnnouncer) then
+    fConsoleFilterAnnouncer(aFilter)
+  else
+    PlaySound(PChar(cSounds[aFilter]), HInstance, SND_RESOURCE or SND_ASYNC or SND_NODEFAULT);
+end;
+
 procedure TAppsViewMainFrm.ConsoleFilterChange(Sender: TObject);
 begin
   if cbConsoleFilter.ItemIndex >= 0 then
-    SetConsoleFilter(TConsoleFilter(cbConsoleFilter.ItemIndex));
+    SelectConsoleFilter(TConsoleFilter(cbConsoleFilter.ItemIndex));
 end;
 
 procedure TAppsViewMainFrm.UpdateAppDetail(const aAllowExtendedMetadata: Boolean);

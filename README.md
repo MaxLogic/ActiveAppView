@@ -6,7 +6,7 @@ Accessibility tool for active application / explorer quick selection
 - F2: Explorer
 - F3: Scripts
 - F4: Console instances
-- Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+4, while Console instances has focus: All / Idle Codex or Claude / Working Codex or Claude / Action required
+- Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+4 / Ctrl+5, while Console instances has focus: All / Idle Codex or Claude / Working Codex or Claude / Action required / Non Codex/Claude
 - F6: Desktop
 - F7: ShortCuts
 - F8: Machine Overview
@@ -30,10 +30,12 @@ Accessibility tool for active application / explorer quick selection
 - Set `RefreshIntervalSeconds=0` to disable periodic title polling.
 
 ## Console activity filter
-- The dropdown above Console instances starts at All. Ctrl+1 through Ctrl+4 work only while the Console list itself has focus, and preserve that focus. F4 returns to the list; the dropdown can also be operated directly.
+- The dropdown above Console instances starts at All. Ctrl+1 through Ctrl+5 work only while the Console list itself has focus, and preserve that focus. F4 returns to the list; the dropdown can also be operated directly.
 - Filtering uses the original terminal title, before local Rename labels or display prefixes. Windows Terminal and Alacritty are included by the shipped `TerminalPatterns.txt`.
 - Working includes leading Braille spinner characters and Claude's half-circle spinner. Idle includes Claude's asterisk markers, Codex's Action Required titles, and the approved `task | project` title-format heuristic. Unknown titles appear only in All.
 - Action required shows the subset of idle Codex/Claude entries whose original title contains `action required`, ignoring case. These entries also remain in Idle.
+- Non Codex/Claude shows terminals whose title matches none of the agent markers, including untitled ones.
+- Every filter change, by shortcut or dropdown, plays a short spoken confirmation (ElevenLabs Bella voice). The clips are embedded in the executable from `_Source\Sounds`.
 - This is title-based detection: an unrelated terminal using those title formats can match, and disabled or custom titles can hide an agent's state. Windows Terminal exposes the current window title, so inactive tabs and split panes are not separately classified. Idle means the title is ready for input or needs attention; background jobs may still be running.
 - Codex's [title implementation](https://github.com/openai/codex/blob/main/codex-rs/tui/src/chatwidget/status_surfaces.rs) describes its activity prefix. Claude markers are based on reported behavior in [the older spinner report](https://github.com/anthropics/claude-code/issues/69306) and [the half-circle spinner report](https://github.com/anthropics/claude-code/issues/88360), rather than a guaranteed API.
 

@@ -56,6 +56,7 @@ uses
   ActiveAppViewMainForm in 'ActiveAppViewMainForm.pas' {AppsViewMainFrm};
 
 {$R *.res}
+{$R 'ConsoleFilterSounds.res' 'ConsoleFilterSounds.rc'}
 
 const
   cSingleInstanceMutexName = 'Local\ActiveAppView.SingleInstance';

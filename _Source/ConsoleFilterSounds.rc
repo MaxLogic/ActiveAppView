@@ -1,0 +1,5 @@
+CONSOLE_FILTER_ALL WAVE "Sounds\console-filter-all.wav"
+CONSOLE_FILTER_IDLE WAVE "Sounds\console-filter-idle.wav"
+CONSOLE_FILTER_WORKING WAVE "Sounds\console-filter-working.wav"
+CONSOLE_FILTER_ACTION WAVE "Sounds\console-filter-action.wav"
+CONSOLE_FILTER_NON_AGENT WAVE "Sounds\console-filter-non-agent.wav"

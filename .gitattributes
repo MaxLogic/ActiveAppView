@@ -5,6 +5,7 @@
 *.dfm      text eol=crlf
 *.dproj    text eol=crlf
 *.groupproj text eol=crlf
+*.rc       text eol=crlf
 
 # Scripts should stay LF
 *.sh       text eol=lf

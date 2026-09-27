@@ -536,7 +536,8 @@ object AppsViewMainFrm: TAppsViewMainFrm
         'All (Ctrl+1)'
         'Idle Codex/Claude (Ctrl+2)'
         'Working Codex/Claude (Ctrl+3)'
-        'Action required (Codex/Claude) (Ctrl+4)')
+        'Action required (Codex/Claude) (Ctrl+4)'
+        'Non Codex/Claude (Ctrl+5)')
     end
     object lbConsole: TListBox
       AlignWithMargins = True

@@ -191,6 +191,9 @@
         <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\MaxLogic.StrUtils.pas"/>
         <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\maxLogic.Windows.Desktop.pas"/>
         <DCCReference Include="..\..\MaxLogic\MaxLogicFoundation\MaxLogic.Windows.Identity.pas"/>
+        <RcCompile Include="ConsoleFilterSounds.rc">
+            <Form>ConsoleFilterSounds.res</Form>
+        </RcCompile>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
             <DependentOn>..\..\MaxLogic\MaxLogicFoundation\MaxLogicDefault.optset</DependentOn>

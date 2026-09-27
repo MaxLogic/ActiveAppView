@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- Console instances has a Non Codex/Claude filter (Ctrl+5) for terminals without an agent title marker. Switching any console filter now plays a short spoken confirmation of the selected filter.
 - `Scripts\save-md.ps1` saves clipboard text as a temporary Markdown file and copies its full path back to the clipboard.
 - Console instances has All, Idle Codex/Claude, Working Codex/Claude, and Action required filters. Ctrl+1 through Ctrl+4 switch filters only while the Console list has focus. Detection uses terminal title markers and the idle `task | project` heuristic; Action required selects idle entries containing that phrase.
 - `Scripts\Copy-MarkdownAsRichText.ps1` now converts markdown from the clipboard (a copied `.md` file, a path to one, or the text itself) into HTML, RTF, or pandoc plain text and puts it back on the clipboard for Jira, Outlook, Thunderbird, and other rich editors. Running it without `-Format` asks which flavor to use first; no temporary files are left behind.
