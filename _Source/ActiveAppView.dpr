@@ -49,6 +49,7 @@ uses
   ActiveAppView.MachineOverview.WindowsProviders in 'ActiveAppView.MachineOverview.WindowsProviders.pas',
   ActiveAppView.RenameJournal in 'ActiveAppView.RenameJournal.pas',
   ActiveAppView.RenameJournal.SelfTests in 'ActiveAppView.RenameJournal.SelfTests.pas',
+  ActiveAppView.SelectionTrace in 'ActiveAppView.SelectionTrace.pas',
   ActiveAppView.SelfTests in 'ActiveAppView.SelfTests.pas',
   ActiveAppView.WindowSnapshots in 'ActiveAppView.WindowSnapshots.pas',
   ActiveAppViewCore in 'ActiveAppViewCore.pas',

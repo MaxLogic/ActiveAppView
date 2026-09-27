@@ -179,6 +179,34 @@ type
     fErrorText: string;
   end;
 
+function RetainLastKnownCaptions(const aWindows, aPrevious: TWindowSnapshots): TWindowSnapshots;
+var
+  lCount: Integer;
+  lOld: TWindowSnapshot;
+  i: Integer;
+begin
+  // A title that is empty for a moment must not drop the row (and with it the user's selection).
+  SetLength(Result, Length(aWindows));
+  lCount := 0;
+  for i := 0 to High(aWindows) do
+  begin
+    if aWindows[i].Caption <> '' then
+    begin
+      Result[lCount] := aWindows[i];
+      Inc(lCount);
+      Continue;
+    end;
+    for lOld in aPrevious do
+      if (lOld.Wnd = aWindows[i].Wnd) and (lOld.PID = aWindows[i].PID) and (lOld.Caption <> '') then
+      begin
+        Result[lCount] := lOld;
+        Inc(lCount);
+        Break;
+      end;
+  end;
+  SetLength(Result, lCount);
+end;
+
 function SameWindowSnapshotIdentity(const aLeft, aRight: TWindowSnapshot): Boolean;
 begin
   Result := (aLeft.Wnd = aRight.Wnd) and (aLeft.PID = aRight.PID) and
@@ -221,8 +249,12 @@ begin
       (not maxLogic.Windows.Desktop.IsWndValid(aWnd)) then
       Exit;
     lWindow.Caption := maxLogic.Windows.Desktop.GetWinCaption(aWnd);
+    // Keep an untitled window only as a candidate for its last known caption; Collect drops the rest.
     if lWindow.Caption = '' then
+    begin
+      lCollector.fWindows.Add(lWindow);
       Exit;
+    end;
     lWindow.FileName := maxLogic.Windows.Desktop.GetFileName(aWnd);
     if not TryGetProcessStartedAtUtcMilliseconds(lWindow.PID, lWindow.ProcessStartedAt) then
       lWindow.ProcessStartedAt := 0;
@@ -536,6 +568,7 @@ begin
           Continue;
         if lBatch.ErrorText = '' then
         begin
+          lBatch.Windows := RetainLastKnownCaptions(lBatch.Windows, fBatch.Windows);
           for i := 0 to High(lBatch.Windows) do
             for lOldWindow in fBatch.Windows do
               if SameWindowSnapshotIdentity(lBatch.Windows[i], lOldWindow) then
@@ -939,6 +972,7 @@ var
   lFinished: TEvent;
   lFields: TWindowMetadataFields;
   lArguments: string;
+  lPrevious: TWindowSnapshots;
   lProcessResult: TMachineOverviewProcessResult;
   lService: TWindowSnapshotService;
   lStartedAt: Int64;
@@ -1081,6 +1115,27 @@ begin
       end;
       Exit;
     end;
+    SetLength(lBatch.Windows, 3);
+    lBatch.Windows[0].Wnd := 10;
+    lBatch.Windows[0].PID := 1;
+    lBatch.Windows[1].Wnd := 20;
+    lBatch.Windows[1].PID := 2;
+    lBatch.Windows[2].Wnd := 30;
+    lBatch.Windows[2].PID := 3;
+    lBatch.Windows[2].Caption := 'Current';
+    SetLength(lPrevious, 2);
+    lPrevious[0].Wnd := 10;
+    lPrevious[0].PID := 1;
+    lPrevious[0].Caption := 'Last known';
+    lPrevious[0].FileName := 'app.exe';
+    lPrevious[1].Wnd := 20;
+    lPrevious[1].PID := 9;
+    lPrevious[1].Caption := 'Other process';
+    lBatch.Windows := RetainLastKnownCaptions(lBatch.Windows, lPrevious);
+    if (Length(lBatch.Windows) <> 2) or (lBatch.Windows[0].Caption <> 'Last known') or
+      (lBatch.Windows[0].FileName <> 'app.exe') or (lBatch.Windows[1].Caption <> 'Current') then
+      raise Exception.Create('Momentarily untitled window did not keep its last known caption');
+    Writeln('SNAPSHOT CAPTION PASS empty-title-retained untitled-dropped');
     lService := TWindowSnapshotService.Create(TPath.GetTempPath, 0);
     try
       lWatch := TStopwatch.StartNew;

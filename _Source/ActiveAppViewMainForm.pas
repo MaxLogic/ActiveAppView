@@ -125,6 +125,8 @@ type
     fPendingClipboardSequence: DWORD;
     fWindowService: TWindowSnapshotService;
     fWindowBatch: TWindowSnapshotBatch;
+    // PIDs of the windows listed by the previous refresh; they identify vanished rows.
+    fWindowPids: TDictionary<hWnd, Cardinal>;
     fAuxListRefresh: iAsync;
     fAuxListRefreshBusy: Integer;
     fAuxListRefreshPending: Integer;
@@ -263,9 +265,9 @@ type
     procedure WindowActionListBoxContextPopup(aSender: TObject; aMousePos: TPoint; var aHandled: Boolean);
     function ShouldConsumeSuppressedReturnKey(const aSender: TObject; const aKey: Word): Boolean;
     procedure SuppressNextReturnKey(const aListBox: TListBox);
-    procedure QuickValidateListBoxProcesses(const aListBox: TListBox);
     procedure RemoveWindowFromSnapshots(const aWnd: hWnd);
     procedure RemoveWindowFromListBox(const aListBox: TListBox; const aWnd: hWnd);
+    function WindowListName(const aListBox: TListBox): string;
     procedure RemoveWindowFromUiAndCache(const aWnd: hWnd);
     procedure SelectListBoxItemIndex(const aListBox: TListBox; const aItemIndex: Integer);
     procedure ScheduleWindowActionCleanup(const aWnd: hWnd; const aProcessId: Cardinal);
@@ -283,7 +285,6 @@ type
       aAllowFileNameMatching: Boolean; aAllowDeepMetadata: Boolean);
     function ExcludeByMask(const aApp: TWindowSnapshot; const aMasks: TStringArray;
       aAllowFileNameMatching: Boolean): boolean;
-    procedure RestoreItemIndex(lb: TListBox; wnd: hwnd; oldItemIndex: integer; const aOldItemCaption: string);
     function GetWnd(lb: TListBox): hwnd;
     procedure ActiveControlChanged(Sender: TObject);
     procedure ClearListBoxItemData(lb: TListBox);
@@ -293,9 +294,8 @@ type
     procedure AddDesktopItemsFromFolder(const aFolder: string; var aItems: TNamedValueArray);
     procedure ActivateDesktopItem;
     procedure ActivateShortCutItem;
-    procedure RestoreSelectedItem(lb: TListBox; const aCaption: string);
   public
-
+    destructor Destroy; override;
   end;
 
 var
@@ -311,7 +311,9 @@ uses
   Vcl.Clipbrd,
   AutoFree, maxCallMeLater, maxLogic.AutoStart, maxLogic.IOUtils, maxLogic.StrUtils, maxLogic.Windows.Desktop,
   MaxLogic.Windows.Identity,
-  ActiveAppView.Launcher;
+  ActiveAppView.Launcher, ActiveAppView.SelectionTrace;
+
+function IsHungAppWindow(aWnd: HWND): BOOL; stdcall; external user32;
 
 {$R *.dfm}
 
@@ -355,12 +357,10 @@ const
   cWindowTitlePollingSectionName = 'WindowTitlePolling';
   cWindowTitlePollingIntervalSecondsKey = 'RefreshIntervalSeconds';
   cDefaultIntervalSeconds = 5;
-  cRestoreItemIndexSelfTestArg = '--self-test-restore-item-index';
   cResizeColumnWidthsSelfTestArg = '--self-test-resize-column-widths';
   cShortCutValueParsingSelfTestArg = '--self-test-shortcut-value-parsing';
   cWindowCaptionOverridesSelfTestArg = '--self-test-window-caption-overrides';
   cConsoleTitleSortSelfTestArg = '--self-test-console-title-sort';
-  cConsolePollAppPurgeSelfTestArg = '--self-test-console-poll-app-purge';
   cFocusSoundSelfTestArg = '--self-test-focus-sound';
   cWindowActionCopySelfTestArg = '--self-test-window-action-copy';
   cWindowActionProbeSelfTestArg = '--self-test-window-action-probe';
@@ -901,22 +901,6 @@ begin
   aShortCutsWidth := aTotalWidth - lConsumedWidth;
 end;
 
-function FindSortedCaptionIndex(const aItems: TStrings; const aOldItemCaption: string): Integer;
-var
-  lItems: TStringList;
-  lIndex: Integer;
-begin
-  Result := -1;
-  if aOldItemCaption = '' then
-    Exit;
-
-  gc(lItems, TStringList.Create);
-  lItems.Assign(aItems);
-  lItems.Sorted := True;
-  if lItems.Find(aOldItemCaption, lIndex) then
-    Result := lIndex;
-end;
-
 function IsCodexWorkingPrefixChar(const aChar: Char): Boolean;
 begin
   Result := (Ord(aChar) >= $2800) and (Ord(aChar) <= $28FF);
@@ -994,59 +978,6 @@ begin
   Result := NativeUInt(aList.Objects[aIndex]);
 end;
 
-function WindowArrayContains(const aWindows: TArray<hWnd>; const aWnd: hWnd): Boolean;
-var
-  lWnd: hWnd;
-begin
-  Result := False;
-  for lWnd in aWindows do
-  begin
-    if lWnd = aWnd then
-      Exit(True);
-  end;
-end;
-
-function RemoveWindowsFromItems(const aItems: TStrings; const aWindows: TArray<hWnd>): Boolean;
-var
-  lIndex: Integer;
-  lWnd: hWnd;
-begin
-  Result := False;
-  if (not Assigned(aItems)) or (Length(aWindows) = 0) then
-    Exit;
-
-  aItems.BeginUpdate;
-  try
-    for lIndex := aItems.Count - 1 downto 0 do
-    begin
-      lWnd := hWnd(aItems.Objects[lIndex]);
-      if WindowArrayContains(aWindows, lWnd) then
-      begin
-        aItems.Delete(lIndex);
-        Result := True;
-      end;
-    end;
-  finally
-    aItems.EndUpdate;
-  end;
-end;
-
-function RemoveWindowsFromListBox(const aListBox: TListBox; const aWindows: TArray<hWnd>): Boolean;
-begin
-  Result := False;
-  if not Assigned(aListBox) then
-    Exit;
-
-  Result := RemoveWindowsFromItems(aListBox.Items, aWindows);
-
-  if aListBox.Items.Count = 0 then
-    aListBox.ItemIndex := -1
-  else if aListBox.ItemIndex < 0 then
-    aListBox.ItemIndex := 0
-  else if aListBox.ItemIndex >= aListBox.Items.Count then
-    aListBox.ItemIndex := aListBox.Items.Count - 1;
-end;
-
 function FindWindowItemIndex(const aItems: TStrings; const aWnd: hWnd): Integer;
 var
   lIndex: Integer;
@@ -1060,44 +991,6 @@ begin
     if hWnd(aItems.Objects[lIndex]) = aWnd then
       Exit(lIndex);
   end;
-end;
-
-function CalculateWindowItemIndexAfterRemoval(const aItems: TStrings; const aOldItemIndex: Integer;
-  const aOldWnd: hWnd; const aRemovedWnd: hWnd): Integer;
-begin
-  Result := -1;
-  if (not Assigned(aItems)) or (aItems.Count = 0) then
-    Exit;
-  if aOldItemIndex < 0 then
-    Exit;
-
-  if (aOldWnd <> 0) and (aOldWnd <> aRemovedWnd) then
-  begin
-    Result := FindWindowItemIndex(aItems, aOldWnd);
-    if Result <> -1 then
-      Exit;
-  end;
-
-  Result := aOldItemIndex;
-  if Result >= aItems.Count then
-    Result := aItems.Count - 1;
-end;
-
-function CalculateItemIndexAfterDeletingIndex(const aItemCount: Integer; const aDeletedItemIndex: Integer): Integer;
-begin
-  Result := -1;
-  if aItemCount <= 0 then
-    Exit;
-
-  Result := aDeletedItemIndex;
-  if Result >= aItemCount then
-    Result := aItemCount - 1;
-end;
-
-function CalculateWindowItemIndexAfterValidation(const aItems: TStrings; const aOldItemIndex: Integer;
-  const aOldWnd: hWnd): Integer;
-begin
-  Result := CalculateWindowItemIndexAfterRemoval(aItems, aOldItemIndex, aOldWnd, 0);
 end;
 
 function TitleHasDisplayPrefix(const aTitle: string; const aPrefix: string): Boolean;
@@ -1123,34 +1016,6 @@ begin
     if TitleHasDisplayPrefix(aTitle, lRule.Prefix) then
       Exit(True);
   end;
-end;
-
-function CalculateRestoredItemIndex(const aItems: TStrings; const aWnd: hWnd; const aOldItemIndex: Integer;
-  const aOldItemCaption: string; const aSorted: Boolean): Integer;
-var
-  lIndex: Integer;
-begin
-  Result := -1;
-  if (not Assigned(aItems)) or (aItems.Count = 0) then
-    Exit;
-
-  for lIndex := 0 to aItems.Count - 1 do
-  begin
-    if aWnd = hWnd(aItems.Objects[lIndex]) then
-      Exit(lIndex);
-  end;
-
-  if (aOldItemCaption <> '') and aSorted then
-  begin
-    lIndex := FindSortedCaptionIndex(aItems, aOldItemCaption);
-    if lIndex <> -1 then
-      Exit(lIndex);
-  end;
-
-  if (aOldItemIndex >= 0) and (aOldItemIndex < aItems.Count) then
-    Exit(aOldItemIndex);
-  if aOldItemIndex >= aItems.Count then
-    Exit(aItems.Count - 1);
 end;
 
 function IsWindowActionListBox(const aListBox: TObject; const aAppsListBox: TObject; const aExplorerListBox: TObject;
@@ -1911,94 +1776,56 @@ begin
   end;
 end;
 
-procedure TAppsViewMainFrm.QuickValidateListBoxProcesses(const aListBox: TListBox);
-var
-  lIndex: Integer;
-  lOldItemIndex: Integer;
-  lOldWnd: hWnd;
-  lProcessId: Cardinal;
-  lRemoved: Boolean;
-  lWnd: hWnd;
-begin
-  if not Assigned(aListBox) then
-    Exit;
-
-  lOldItemIndex := aListBox.ItemIndex;
-  lOldWnd := 0;
-  if (lOldItemIndex >= 0) and (lOldItemIndex < aListBox.Items.Count) then
-    lOldWnd := hWnd(aListBox.Items.Objects[lOldItemIndex]);
-  lRemoved := False;
-
-  aListBox.Items.BeginUpdate;
-  try
-    for lIndex := aListBox.Items.Count - 1 downto 0 do
-    begin
-      lWnd := hWnd(aListBox.Items.Objects[lIndex]);
-      if lWnd = 0 then
-      begin
-        aListBox.Items.Delete(lIndex);
-        lRemoved := True;
-        Continue;
-      end;
-      if not IsWindow(lWnd) then
-      begin
-        aListBox.Items.Delete(lIndex);
-        lRemoved := True;
-        Continue;
-      end;
-
-      lProcessId := 0;
-      GetWindowThreadProcessId(lWnd, lProcessId);
-      if (lProcessId = 0) or (not IsProcessActive(lProcessId)) then
-      begin
-        aListBox.Items.Delete(lIndex);
-        lRemoved := True;
-      end;
-    end;
-  finally
-    aListBox.Items.EndUpdate;
-  end;
-
-  if lRemoved then
-    aListBox.ItemIndex := CalculateWindowItemIndexAfterValidation(aListBox.Items, lOldItemIndex, lOldWnd);
-end;
-
 procedure TAppsViewMainFrm.RemoveWindowFromListBox(const aListBox: TListBox; const aWnd: hWnd);
 var
   lIndex: Integer;
-  lItemIndex: Integer;
-  lRemovedIndex: Integer;
+  lSelectedIndex: Integer;
+  lSelectedWnd: hWnd;
+  lTopIndex: Integer;
 begin
-  if (not Assigned(aListBox)) or (aWnd = 0) then
+  if not Assigned(aListBox) then
+    Exit;
+  lIndex := FindWindowItemIndex(aListBox.Items, aWnd);
+  if lIndex < 0 then
     Exit;
 
-  lRemovedIndex := -1;
-
+  lSelectedWnd := GetWnd(aListBox);
+  lTopIndex := aListBox.TopIndex;
   aListBox.Items.BeginUpdate;
   try
-    for lIndex := aListBox.Items.Count - 1 downto 0 do
+    aListBox.Items.Delete(lIndex);
+    // Only the row the user is still on moves the selection; otherwise their current choice stays.
+    if lSelectedWnd = aWnd then
     begin
-      if hWnd(aListBox.Items.Objects[lIndex]) = aWnd then
-      begin
-        aListBox.Items.Delete(lIndex);
-        lRemovedIndex := lIndex;
-      end;
-    end;
+      lSelectedIndex := lIndex;
+      if lSelectedIndex >= aListBox.Items.Count then
+        lSelectedIndex := aListBox.Items.Count - 1;
+    end else
+      lSelectedIndex := FindWindowItemIndex(aListBox.Items, lSelectedWnd);
+    aListBox.ItemIndex := lSelectedIndex;
+    if lTopIndex > lIndex then
+      Dec(lTopIndex);
+    if (lTopIndex >= 0) and (lTopIndex < aListBox.Items.Count) then
+      aListBox.TopIndex := lTopIndex;
   finally
     aListBox.Items.EndUpdate;
   end;
 
-  if lRemovedIndex <> -1 then
-  begin
-    lItemIndex := CalculateItemIndexAfterDeletingIndex(aListBox.Items.Count, lRemovedIndex);
-    SelectListBoxItemIndex(aListBox, lItemIndex);
-    TThread.Queue(TThread(nil),
-      procedure
-      begin
-        if not IsShuttingDown then
-          SelectListBoxItemIndex(aListBox, lItemIndex);
-      end);
-  end;
+  if lSelectedWnd = aWnd then
+    TraceSelection('selection-moved', Format('list=%s reason=window-closed old=0x%x new=0x%x',
+      [WindowListName(aListBox), NativeUInt(aWnd), NativeUInt(GetWnd(aListBox))]));
+end;
+
+function TAppsViewMainFrm.WindowListName(const aListBox: TListBox): string;
+begin
+  if aListBox = lbApps then
+    Result := 'apps'
+  else if aListBox = lbExplorer then
+    Result := 'explorer'
+  else if aListBox = lbConsole then
+    Result := 'console'
+  else
+    Result := aListBox.Name;
 end;
 
 procedure TAppsViewMainFrm.RemoveWindowFromUiAndCache(const aWnd: hWnd);
@@ -2530,13 +2357,73 @@ begin
     Result := aItems[aIndex];
 end;
 
-procedure SynchronizeListItems(const aListBox: TListBox; const aDesired: TStrings;
-  const aOwnsData: Boolean = False);
+type
+  TListSelectionFallback = (lsfKept, lsfNone, lsfSamePid, lsfNextNeighbour, lsfPreviousNeighbour, lsfEmpty);
+  TListRowGroupFunc = reference to function(const aData: TObject): Cardinal;
+
+  // How a synchronization treated the selection; OldData is only set for rows we do not own.
+  TListSyncOutcome = record
+    Fallback: TListSelectionFallback;
+    OldText: string;
+    OldData: TObject;
+  end;
+
+const
+  cListSelectionFallbackNames: array[TListSelectionFallback] of string =
+    ('kept', 'none', 'same-pid', 'next', 'previous', 'empty');
+
+function FindReplacementRow(const aItems: TStrings; const aOldKeys: TArray<string>; const aOldIndex: Integer;
+  const aOwnsData: Boolean; const aGroupOf: TListRowGroupFunc; const aGroup: Cardinal;
+  out aFallback: TListSelectionFallback): Integer;
+var
+  lNewIndexes: TDictionary<string, Integer>;
+  i: Integer;
+begin
+  Result := -1;
+  aFallback := lsfEmpty;
+  if aItems.Count = 0 then
+    Exit;
+  if aGroup <> 0 then
+  begin
+    for i := 0 to aItems.Count - 1 do
+      if (aGroupOf(aItems.Objects[i]) = aGroup) and
+        ((Result < 0) or (Abs(i - aOldIndex) < Abs(Result - aOldIndex))) then
+        Result := i;
+    aFallback := lsfSamePid;
+    if Result >= 0 then
+      Exit;
+  end;
+  lNewIndexes := TDictionary<string, Integer>.Create;
+  try
+    for i := aItems.Count - 1 downto 0 do
+      lNewIndexes.AddOrSetValue(ListRowKey(aItems, i, aOwnsData), i);
+    aFallback := lsfNextNeighbour;
+    for i := aOldIndex + 1 to High(aOldKeys) do
+      if lNewIndexes.TryGetValue(aOldKeys[i], Result) then
+        Exit;
+    aFallback := lsfPreviousNeighbour;
+    for i := aOldIndex - 1 downto 0 do
+      if lNewIndexes.TryGetValue(aOldKeys[i], Result) then
+        Exit;
+  finally
+    lNewIndexes.Free;
+  end;
+  // Nothing of the old list survived: stay at the old position.
+  aFallback := lsfNone;
+  Result := aOldIndex;
+  if Result >= aItems.Count then
+    Result := aItems.Count - 1;
+end;
+
+function SynchronizeListItems(const aListBox: TListBox; const aDesired: TStrings;
+  const aOwnsData: Boolean = False; const aGroupOf: TListRowGroupFunc = nil): TListSyncOutcome;
 var
   lCounts: TDictionary<string, Integer>;
   lCount: Integer;
   lData: TObject;
   lKey: string;
+  lOldKeys: TArray<string>;
+  lSelectedGroup: Cardinal;
   lSelectedKey: string;
   lTopKey: string;
   lOldIndex: Integer;
@@ -2546,6 +2433,7 @@ var
   lEqual: Boolean;
   i, j: Integer;
 begin
+  Result := Default(TListSyncOutcome);
   lEqual := aListBox.Items.Count = aDesired.Count;
   if lEqual then
     for i := 0 to aDesired.Count - 1 do
@@ -2561,8 +2449,19 @@ begin
   lOldTop := aListBox.TopIndex;
   lSelectedKey := '';
   lTopKey := '';
+  lSelectedGroup := 0;
   if lOldIndex >= 0 then
-    lSelectedKey := ListRowKey(aListBox.Items, lOldIndex, aOwnsData);
+  begin
+    SetLength(lOldKeys, aListBox.Items.Count);
+    for i := 0 to High(lOldKeys) do
+      lOldKeys[i] := ListRowKey(aListBox.Items, i, aOwnsData);
+    lSelectedKey := lOldKeys[lOldIndex];
+    Result.OldText := aListBox.Items[lOldIndex];
+    if not aOwnsData then
+      Result.OldData := aListBox.Items.Objects[lOldIndex];
+    if Assigned(aGroupOf) then
+      lSelectedGroup := aGroupOf(aListBox.Items.Objects[lOldIndex]);
+  end;
   if (lOldTop >= 0) and (lOldTop < aListBox.Items.Count) then
     lTopKey := ListRowKey(aListBox.Items, lOldTop, aOwnsData);
   lCounts := TDictionary<string, Integer>.Create(TFastCaseAwareComparer.Ordinal);
@@ -2622,12 +2521,9 @@ begin
         if (lTopIndex < 0) and (lKey = lTopKey) then
           lTopIndex := i;
       end;
-      if lSelectedIndex < 0 then
-      begin
-        lSelectedIndex := lOldIndex;
-        if lSelectedIndex >= aListBox.Items.Count then
-          lSelectedIndex := aListBox.Items.Count - 1;
-      end;
+      if (lSelectedIndex < 0) and (lOldIndex >= 0) then
+        lSelectedIndex := FindReplacementRow(aListBox.Items, lOldKeys, lOldIndex, aOwnsData, aGroupOf,
+          lSelectedGroup, Result.Fallback);
       if aListBox.ItemIndex <> lSelectedIndex then
         aListBox.ItemIndex := lSelectedIndex;
       if lTopIndex < 0 then
@@ -2994,30 +2890,6 @@ begin
   MessageDlg(Format(rsLaunchFailed, [lTargetPath]), mtWarning, [mbOK], 0);
 end;
 
-procedure TAppsViewMainFrm.RestoreSelectedItem(lb: TListBox; const aCaption: string);
-var
-  lIndex: integer;
-begin
-  if lb.Items.Count = 0 then
-  begin
-    lb.ItemIndex := -1;
-    Exit;
-  end;
-
-  if aCaption <> '' then
-  begin
-    lIndex := lb.Items.IndexOf(aCaption);
-    if lIndex >= 0 then
-    begin
-      lb.ItemIndex := lIndex;
-      Exit;
-    end;
-  end;
-
-  if lb.ItemIndex < 0 then
-    lb.ItemIndex := 0;
-end;
-
 procedure ApplyPrefixRuleForMetadata(var aTitle: string; const aCaption: string; const aFileName: string;
   const aAppUserModelID: string; const aCommandLineParams: string; const aRules: TPrefixRuleArray;
   const aAllowFileNameMatching: Boolean; const aAllowDeepMetadata: Boolean);
@@ -3297,6 +3169,7 @@ begin
   fStartupProfileLog := TStringList.Create;
   fStartupProfileLogSync := TCriticalSection.Create;
   fStartupProfileLogFileName := CombinePath([GetInstallDir, 'startup-profile.log']);
+  ConfigureSelectionTrace(CombinePath([GetInstallDir, 'selection-trace.log']));
   fStartupProfileStartTick := TStopwatch.GetTimeStamp;
   TInterlocked.Exchange(fStartupProfileAuxReadyLogged, 0);
   TInterlocked.Exchange(fStartupProfileDeepPrefixGuiLogged, 0);
@@ -3396,6 +3269,12 @@ begin
     'FormCreate.Done',
     Format('chatMonitorEnabled=%s chatSoundEnabled=%s',
       [BoolToStr(fChatMonitorConfiguredEnabled, True), BoolToStr(chkChatNotificationSound.Checked, True)]));
+end;
+
+destructor TAppsViewMainFrm.Destroy;
+begin
+  inherited;
+  FreeAndNil(fWindowPids);
 end;
 
 procedure TAppsViewMainFrm.FormDestroy(Sender: TObject);
@@ -3819,12 +3698,6 @@ begin
   fChatMonitorTask := SimpleAsyncCall(RunChatMonitorSnapshot, 'ActiveAppView.ChatMonitor', OnChatMonitorDone);
 end;
 
-procedure TAppsViewMainFrm.RestoreItemIndex(lb: TListBox; wnd: hwnd;
-  oldItemIndex: integer; const aOldItemCaption: string);
-begin
-  lb.ItemIndex := CalculateRestoredItemIndex(lb.Items, wnd, oldItemIndex, aOldItemCaption, lb.Sorted);
-end;
-
 procedure TObservedListBox.WndProc(var aMessage: TMessage);
 begin
   case aMessage.Msg of
@@ -4234,6 +4107,24 @@ begin
           if (lObservedList.ItemIndex <> 0) or (lObservedList.Items.Objects[0] <> TObject(200)) then
             raise Exception.Create('Reordering or renaming lost selected window identity');
           lItems.Clear;
+          for lIndex := 1 to 5 do
+            lItems.AddObject(Format('row %d', [lIndex]), TObject(lIndex * 10));
+          SynchronizeListItems(lObservedList, lItems);
+          lObservedList.ItemIndex := 2;
+          lItems.Delete(2);
+          lItems.Delete(0);
+          lItems.InsertObject(0, 'new a', TObject(70));
+          lItems.InsertObject(0, 'new b', TObject(80));
+          SynchronizeListItems(lObservedList, lItems);
+          if lObservedList.Items.Objects[lObservedList.ItemIndex] <> TObject(40) then
+            raise Exception.Create('Vanished selection did not move to its next old neighbour');
+          lObservedList.ItemIndex := lObservedList.Items.IndexOfObject(TObject(50));
+          lItems.Delete(lItems.IndexOfObject(TObject(50)));
+          lItems.Move(lItems.IndexOfObject(TObject(40)), 0);
+          SynchronizeListItems(lObservedList, lItems);
+          if lObservedList.Items.Objects[lObservedList.ItemIndex] <> TObject(40) then
+            raise Exception.Create('Vanished last selection did not move to its previous old neighbour');
+          lItems.Clear;
           SynchronizeListItems(lObservedList, lItems);
         finally
           lItems.Free;
@@ -4278,6 +4169,76 @@ begin
         Writeln('LIST SYNC PASS unchanged-mutations=0 selection=preserved scroll=preserved');
       finally
         lTestForm.Free;
+      end;
+    except
+      on lException: Exception do
+      begin
+        Writeln('SELFTEST FAILED: ' + lException.Message);
+        Result := 1;
+      end;
+    end;
+    Exit;
+  end;
+  if SameText(aArg, '--self-test-selection-trace') then
+  begin
+    Result := RunSelectionTraceSelfTests('--self-test-selection-trace-file');
+    if Result <> 0 then
+      Exit;
+    lTempDir := TPath.Combine(TPath.GetTempPath, 'ActiveAppView-SelectionSync-' + TGUID.NewGuid.ToString);
+    TDirectory.CreateDirectory(lTempDir);
+    lStateFileName := TPath.Combine(lTempDir, 'selection-trace.log');
+    lTestForm := TAppsViewMainFrm.CreateNew(nil);
+    try
+      try
+        ConfigureSelectionTrace(lStateFileName);
+        lTestForm.lbApps := TListBox.Create(lTestForm);
+        lTestForm.lbApps.Parent := lTestForm;
+        lTestForm.lbExplorer := TListBox.Create(lTestForm);
+        lTestForm.lbExplorer.Parent := lTestForm;
+        lTestForm.lbConsole := TListBox.Create(lTestForm);
+        lTestForm.lbConsole.Parent := lTestForm;
+        lTestForm.pnlAppDetails := TPanel.Create(lTestForm);
+        lTestForm.fStartupDataReady := 1;
+        SetLength(lTestForm.fWindowBatch.Windows, 4);
+        for lIndex := 0 to 3 do
+        begin
+          lTestForm.fWindowBatch.Windows[lIndex].Wnd := hWnd(100 + lIndex);
+          lTestForm.fWindowBatch.Windows[lIndex].PID := 10 + lIndex;
+          lTestForm.fWindowBatch.Windows[lIndex].Caption := Format('Window %d', [lIndex]);
+          // Explorer rows skip the app detail panel, which this fixture does not build.
+          lTestForm.fWindowBatch.Windows[lIndex].FileName := 'C:\Windows\explorer.exe';
+        end;
+        lTestForm.UpdateGui;
+        lTestForm.lbExplorer.ItemIndex := 1;
+        lTestForm.fWindowBatch.Windows[1].Caption := 'Window 1 renamed';
+        lTestForm.UpdateGui;
+        if (lTestForm.GetWnd(lTestForm.lbExplorer) <> hWnd(101)) or (not WaitSelectionTraceIdle(5000)) or
+          TFile.Exists(lStateFileName) then
+          raise Exception.Create('A rename lost the selection or wrote a trace line');
+        // Window 101 is replaced by a new window of the same process (PID 11).
+        lTestForm.fWindowBatch.Windows[1].Wnd := hWnd(200);
+        lTestForm.fWindowBatch.Windows[1].Caption := 'Window 9 recreated';
+        lTestForm.UpdateGui;
+        if lTestForm.GetWnd(lTestForm.lbExplorer) <> hWnd(200) then
+          raise Exception.Create('Vanished selection did not move to a window of the same process');
+        Delete(lTestForm.fWindowBatch.Windows, 2, 1);
+        lTestForm.lbExplorer.ItemIndex := lTestForm.lbExplorer.Items.IndexOfObject(TObject(hWnd(102)));
+        lTestForm.UpdateGui;
+        if lTestForm.GetWnd(lTestForm.lbExplorer) <> hWnd(103) then
+          raise Exception.Create('Vanished selection did not move to its next old neighbour');
+        if not WaitSelectionTraceIdle(5000) then
+          raise Exception.Create('Selection trace did not finish writing');
+        lTitle := TFile.ReadAllText(lStateFileName, TEncoding.UTF8);
+        if (Pos('selection-lost list=explorer fallback=same-pid old=0x65 pid=11 caption="Window 1 renamed" ' +
+          'batch=absent nowIn=- isWindow=0', lTitle) = 0) or
+          (Pos('selection-lost list=explorer fallback=next old=0x66 pid=12', lTitle) = 0) or
+          (Pos('newCaption="Window 9 recreated"', lTitle) = 0) then
+          raise Exception.Create('Selection trace is missing expected diagnostics: ' + lTitle);
+        Writeln('SELECTION TRACE PASS kept-silent same-pid next-neighbour diagnostics');
+      finally
+        ConfigureSelectionTrace('');
+        lTestForm.Free;
+        TDirectory.Delete(lTempDir, True);
       end;
     except
       on lException: Exception do
@@ -4413,37 +4374,6 @@ begin
     Exit;
   end;
 
-  if SameText(aArg, cRestoreItemIndexSelfTestArg) then
-  begin
-    Result := 0;
-    lItems := TStringList.Create;
-    try
-      lItems.Sorted := True;
-      lItems.Add('A');
-      lItems.Add('C');
-      lResultIndex := FindSortedCaptionIndex(lItems, 'Z');
-      if lResultIndex <> -1 then
-      begin
-        Writeln(Format('SELFTEST FAILED: expected missing caption index=-1, got %d', [lResultIndex]));
-        Result := 1;
-      end;
-      lItems.Sorted := False;
-      lItems.Clear;
-      lItems.AddObject('A', TObject(hWnd(10)));
-      lItems.AddObject('B', TObject(hWnd(20)));
-      lResultIndex := CalculateRestoredItemIndex(lItems, 0, -1, '', False);
-      if lResultIndex <> -1 then
-      begin
-        Writeln(Format('SELFTEST FAILED: restore item index should preserve no selection actual=%d',
-          [lResultIndex]));
-        Result := 1;
-      end;
-    finally
-      lItems.Free;
-    end;
-    Exit;
-  end;
-
   if SameText(aArg, cConsoleTitleSortSelfTestArg) then
   begin
     Result := 0;
@@ -4480,35 +4410,6 @@ begin
       if lItems.Objects[0] <> TObject(100) then
       begin
         Writeln('SELFTEST FAILED: console sort tie-breaker should use process id');
-        Result := 1;
-      end;
-    finally
-      lItems.Free;
-    end;
-    Exit;
-  end;
-
-  if SameText(aArg, cConsolePollAppPurgeSelfTestArg) then
-  begin
-    Result := 0;
-    lItems := TStringList.Create;
-    try
-      lItems.AddObject('App', TObject(hWnd(10)));
-      lItems.AddObject('Terminal', TObject(hWnd(20)));
-      if not RemoveWindowsFromItems(lItems, [hWnd(20)]) then
-      begin
-        Writeln('SELFTEST FAILED: console poll app purge reported no removal');
-        Result := 1;
-      end;
-      if lItems.Count <> 1 then
-      begin
-        Writeln(Format('SELFTEST FAILED: console poll app purge expected count=1 actual=%d',
-          [lItems.Count]));
-        Result := 1;
-      end;
-      if (lItems.Count > 0) and (hWnd(lItems.Objects[0]) <> hWnd(10)) then
-      begin
-        Writeln('SELFTEST FAILED: console poll app purge removed the wrong window');
         Result := 1;
       end;
     finally
@@ -4933,70 +4834,43 @@ begin
       Writeln('SELFTEST FAILED: window-action probe removed the wrong snapshot');
       Result := 1;
     end;
-    lItems := TStringList.Create;
+    lTestForm := TAppsViewMainFrm.CreateNew(nil);
     try
-      lItems.AddObject('first', TObject(hWnd(10)));
-      lItems.AddObject('selected', TObject(hWnd(20)));
-      lItems.AddObject('third', TObject(hWnd(30)));
-      lItems.Delete(0);
-      lResultIndex := CalculateWindowItemIndexAfterRemoval(lItems, 1, hWnd(20), hWnd(10));
-      if lResultIndex <> 0 then
+      lTestListBox := TListBox.Create(lTestForm);
+      lTestListBox.Parent := lTestForm;
+      for lIndex := 1 to 4 do
+        lTestListBox.Items.AddObject(Format('window %d', [lIndex]), TObject(hWnd(lIndex * 10)));
+      lTestListBox.ItemIndex := 3;
+      lTestForm.RemoveWindowFromListBox(lTestListBox, hWnd(20));
+      if lTestForm.GetWnd(lTestListBox) <> hWnd(40) then
       begin
-        Writeln(Format('SELFTEST FAILED: window-action probe should preserve selected hwnd at index 0 actual=%d',
-          [lResultIndex]));
+        Writeln('SELFTEST FAILED: delayed close cleanup moved a selection the user had changed');
         Result := 1;
       end;
-      lResultIndex := CalculateWindowItemIndexAfterRemoval(lItems, 0, hWnd(20), hWnd(20));
-      if lResultIndex <> 0 then
+      lTestListBox.ItemIndex := 1;
+      lTestForm.RemoveWindowFromListBox(lTestListBox, hWnd(30));
+      if lTestForm.GetWnd(lTestListBox) <> hWnd(40) then
       begin
-        Writeln(Format('SELFTEST FAILED: window-action probe should select nearest surviving item actual=%d',
-          [lResultIndex]));
+        Writeln('SELFTEST FAILED: removing the selected window did not select the next row');
         Result := 1;
       end;
-      lResultIndex := CalculateItemIndexAfterDeletingIndex(9, 6);
-      if lResultIndex <> 6 then
+      lTestForm.RemoveWindowFromListBox(lTestListBox, hWnd(40));
+      if lTestForm.GetWnd(lTestListBox) <> hWnd(10) then
       begin
-        Writeln(Format('SELFTEST FAILED: deleting 7th listbox item should keep index 6 actual=%d',
-          [lResultIndex]));
+        Writeln('SELFTEST FAILED: removing the selected last row did not select the previous row');
         Result := 1;
       end;
-      lResultIndex := CalculateItemIndexAfterDeletingIndex(6, 6);
-      if lResultIndex <> 5 then
+      lTestForm.RemoveWindowFromListBox(lTestListBox, hWnd(10));
+      if lTestListBox.ItemIndex <> -1 then
       begin
-        Writeln(Format('SELFTEST FAILED: deleting last listbox item should clamp to previous actual=%d',
-          [lResultIndex]));
-        Result := 1;
-      end;
-      lResultIndex := CalculateWindowItemIndexAfterRemoval(lItems, -1, 0, hWnd(10));
-      if lResultIndex <> -1 then
-      begin
-        Writeln(Format('SELFTEST FAILED: window-action probe should preserve no selection actual=%d',
-          [lResultIndex]));
-        Result := 1;
-      end;
-      lItems.Clear;
-      lItems.AddObject('first', TObject(hWnd(10)));
-      lItems.AddObject('selected', TObject(hWnd(20)));
-      lItems.AddObject('third', TObject(hWnd(30)));
-      lItems.Delete(0);
-      lResultIndex := CalculateWindowItemIndexAfterValidation(lItems, 1, hWnd(20));
-      if lResultIndex <> 0 then
-      begin
-        Writeln(Format('SELFTEST FAILED: refocus validation should preserve selected hwnd at index 0 actual=%d',
-          [lResultIndex]));
-        Result := 1;
-      end;
-      lItems.Delete(0);
-      lResultIndex := CalculateWindowItemIndexAfterValidation(lItems, 0, hWnd(20));
-      if lResultIndex <> 0 then
-      begin
-        Writeln(Format('SELFTEST FAILED: refocus validation should select nearest surviving item actual=%d',
-          [lResultIndex]));
+        Writeln('SELFTEST FAILED: removing the only row left a selection');
         Result := 1;
       end;
     finally
-      lItems.Free;
+      lTestForm.Free;
     end;
+    if Result = 0 then
+      Writeln('WINDOW ACTION PROBE PASS popup-target snapshot-removal selection-kept');
     Exit;
   end;
 
@@ -5698,12 +5572,67 @@ begin
     fWindowService.RequestDetails(lApp.Wnd, lApp.PID);
 end;
 
+function WindowClassName(const aWnd: hWnd): string;
+var
+  lBuffer: array[0..255] of Char;
+begin
+  SetString(Result, lBuffer, GetClassName(aWnd, lBuffer, Length(lBuffer)));
+end;
+
+procedure TraceWindowListSync(const aForm: TAppsViewMainFrm; const aListBox: TListBox;
+  const aOutcome: TListSyncOutcome; const aPids: TDictionary<hWnd, Cardinal>);
+  function Flag(const aValue: BOOL): Char;
+  begin
+    if aValue then
+      Result := '1'
+    else
+      Result := '0';
+  end;
+
+var
+  lNewCaption: string;
+  lNowIn: string;
+  lOldPid: Cardinal;
+  lWnd: hWnd;
+begin
+  if aOutcome.Fallback = lsfKept then
+    Exit;
+  lWnd := hWnd(aOutcome.OldData);
+  if not (Assigned(aForm.fWindowPids) and aForm.fWindowPids.TryGetValue(lWnd, lOldPid)) then
+    lOldPid := 0;
+  lNowIn := '-';
+  if FindWindowItemIndex(aForm.lbApps.Items, lWnd) >= 0 then
+    lNowIn := 'apps'
+  else if FindWindowItemIndex(aForm.lbExplorer.Items, lWnd) >= 0 then
+    lNowIn := 'explorer'
+  else if FindWindowItemIndex(aForm.lbConsole.Items, lWnd) >= 0 then
+    lNowIn := 'console';
+  lNewCaption := '';
+  if aListBox.ItemIndex >= 0 then
+    lNewCaption := aListBox.Items[aListBox.ItemIndex];
+  // Enough to tell a closed, hidden, hung, untitled, filtered or moved window apart.
+  TraceSelection('selection-lost', Format(
+    'list=%s fallback=%s old=0x%x pid=%d caption="%s" batch=%s nowIn=%s isWindow=%s visible=%s ' +
+    'hung=%s titleLen=%d class="%s" consoleFilter=%d new=0x%x newCaption="%s"',
+    [aForm.WindowListName(aListBox), cListSelectionFallbackNames[aOutcome.Fallback], NativeUInt(lWnd), lOldPid,
+     aOutcome.OldText, IfThen(aPids.ContainsKey(lWnd), 'present', 'absent'), lNowIn,
+     Flag(IsWindow(lWnd)), Flag(IsWindowVisible(lWnd)), Flag(IsHungAppWindow(lWnd)),
+     GetWindowTextLength(lWnd), WindowClassName(lWnd), Ord(aForm.fConsoleFilter), NativeUInt(aForm.GetWnd(aListBox)),
+     lNewCaption]));
+end;
+
 procedure TAppsViewMainFrm.UpdateGui;
 var
   lApp: TWindowSnapshot;
   lApps: TStringList;
+  lAppsOutcome: TListSyncOutcome;
   lConsole: TStringList;
+  lConsoleOutcome: TListSyncOutcome;
   lExplorer: TStringList;
+  lExplorerOutcome: TListSyncOutcome;
+  lGroupOf: TListRowGroupFunc;
+  lOldPids: TDictionary<hWnd, Cardinal>;
+  lPids: TDictionary<hWnd, Cardinal>;
   lCaption: string;
   lTitle: string;
   lIsTerminal: Boolean;
@@ -5720,7 +5649,19 @@ begin
   lApps := TStringList.Create;
   lConsole := TStringList.Create;
   lExplorer := TStringList.Create;
+  lPids := TDictionary<hWnd, Cardinal>.Create;
   try
+    // A vanished selected window hands the selection to another window of the same process first.
+    lGroupOf :=
+      function(const aData: TObject): Cardinal
+      begin
+        if not lPids.TryGetValue(hWnd(aData), Result) and
+          not (Assigned(fWindowPids) and fWindowPids.TryGetValue(hWnd(aData), Result)) then
+          Result := 0;
+      end;
+    for lApp in fWindowBatch.Windows do
+      if lApp.PID <> 0 then
+        lPids.AddOrSetValue(lApp.Wnd, lApp.PID);
     lApps.Sorted := True;
     lApps.Duplicates := dupAccept;
     lExplorer.Sorted := True;
@@ -5747,11 +5688,18 @@ begin
         lApps.AddObject(lTitle, TObject(lApp.Wnd));
     end;
     SortConsoleItems(lConsole);
-    SynchronizeListItems(lbApps, lApps);
-    SynchronizeListItems(lbConsole, lConsole);
-    SynchronizeListItems(lbExplorer, lExplorer);
+    lAppsOutcome := SynchronizeListItems(lbApps, lApps, False, lGroupOf);
+    lConsoleOutcome := SynchronizeListItems(lbConsole, lConsole, False, lGroupOf);
+    lExplorerOutcome := SynchronizeListItems(lbExplorer, lExplorer, False, lGroupOf);
+    TraceWindowListSync(Self, lbApps, lAppsOutcome, lPids);
+    TraceWindowListSync(Self, lbConsole, lConsoleOutcome, lPids);
+    TraceWindowListSync(Self, lbExplorer, lExplorerOutcome, lPids);
     UpdateAppDetail(False);
+    lOldPids := fWindowPids;
+    fWindowPids := lPids;
+    lPids := lOldPids;
   finally
+    lPids.Free;
     lExplorer.Free;
     lConsole.Free;
     lApps.Free;
