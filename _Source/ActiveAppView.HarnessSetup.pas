@@ -240,10 +240,9 @@ var
   lWslExe: string;
 begin
   Result := nil;
-  // Claude runs Windows hooks through Git Bash, Codex through cmd.exe.
-  PlanTarget(hkClaude, 'Windows ' + cHarnessTitles[hkClaude],
-    TPath.Combine(GetEnvironmentVariable('USERPROFILE'), '.claude'),
-    QuoteIfNeeded(ReplaceStr(aHookExe, '\', '/')) + ' claude', #13#10, Result);
+  // Windows Claude needs no hook: ActiveAppView reads its session registry (see ActiveAppView.AgentState).
+  // Inside WSL that registry holds Linux PIDs we cannot map to a window, so WSL Claude still gets the hook.
+  // Codex runs Windows hooks through cmd.exe.
   PlanTarget(hkCodex, 'Windows ' + cHarnessTitles[hkCodex],
     TPath.Combine(GetEnvironmentVariable('USERPROFILE'), '.codex'),
     QuoteIfNeeded(aHookExe) + ' codex', #13#10, Result);

@@ -12,7 +12,7 @@ uses
   ActiveAppView.AgentState, ActiveAppView.CaptionOverrideState.SelfTests, ActiveAppView.ChatMonitor,
   ActiveAppView.ConfigCache, ActiveAppView.FocusSound, ActiveAppView.HarnessSetup,
   ActiveAppView.MachineOverview.SelfTests, ActiveAppViewCore, ActiveAppView.Launcher,
-  ActiveAppView.RenameJournal.SelfTests,
+  ActiveAppView.RenameJournal.SelfTests, ActiveAppView.SelectionTrace,
   ActiveAppViewMainForm, maxLogic.Windows.Desktop;
 
 const
@@ -401,6 +401,10 @@ begin
     Exit;
 
   Result := RunHarnessSetupSelfTests(ParamStr(1));
+  if Result <> -1 then
+    Exit;
+
+  Result := RunSelectionTraceSelfTests(ParamStr(1));
   if Result <> -1 then
     Exit;
 
