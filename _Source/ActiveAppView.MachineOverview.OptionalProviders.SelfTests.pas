@@ -138,6 +138,7 @@ end;
 
 function RunCpuTemperatureSelectionSelfTest: Integer;
 var
+  lCoreTemp: TMachineOverviewCoreTempSharedData;
   lProviderName: string;
   lTemperatureCelsius: Double;
   lZones: TArray<TMachineOverviewThermalZoneReading>;
@@ -180,6 +181,55 @@ begin
     Writeln('SELFTEST FAILED: ambiguous ACPI thermal zone was mislabeled as CPU package');
     Exit;
   end;
+  if SizeOf(TMachineOverviewCoreTempSharedData) <> 2686 then
+  begin
+    Writeln('SELFTEST FAILED: Core Temp shared data layout changed size');
+    Exit;
+  end;
+  lCoreTemp := Default(TMachineOverviewCoreTempSharedData);
+  lCoreTemp.CoreCount := 2;
+  lCoreTemp.CpuCount := 1;
+  lCoreTemp.TjMax[0] := 90;
+  lCoreTemp.Temperatures[0] := 62.5;
+  lCoreTemp.Temperatures[1] := 84;
+  lCoreTemp.Temperatures[2] := 99; // beyond CoreCount * CpuCount
+  if (not TrySelectMachineOverviewCoreTempTemperature(lCoreTemp,
+      lTemperatureCelsius, lProviderName)) or
+    (Abs(lTemperatureCelsius - 84) > 0.0001) or
+    (not ContainsText(lProviderName, 'Core Temp')) then
+  begin
+    Writeln('SELFTEST FAILED: Core Temp hottest core was not selected');
+    Exit;
+  end;
+  lCoreTemp.DeltaToTjMax := 1;
+  lCoreTemp.Temperatures[0] := 30;
+  lCoreTemp.Temperatures[1] := 20;
+  if (not TrySelectMachineOverviewCoreTempTemperature(lCoreTemp,
+      lTemperatureCelsius, lProviderName)) or
+    (Abs(lTemperatureCelsius - 70) > 0.0001) then
+  begin
+    Writeln('SELFTEST FAILED: Core Temp distance to TjMax was not converted');
+    Exit;
+  end;
+  lCoreTemp.DeltaToTjMax := 0;
+  lCoreTemp.Fahrenheit := 1;
+  lCoreTemp.Temperatures[0] := 176;
+  lCoreTemp.Temperatures[1] := 140;
+  if (not TrySelectMachineOverviewCoreTempTemperature(lCoreTemp,
+      lTemperatureCelsius, lProviderName)) or
+    (Abs(lTemperatureCelsius - 80) > 0.0001) then
+  begin
+    Writeln('SELFTEST FAILED: Core Temp Fahrenheit was not converted');
+    Exit;
+  end;
+  lCoreTemp.CoreCount := 0;
+  if TrySelectMachineOverviewCoreTempTemperature(lCoreTemp,
+      lTemperatureCelsius, lProviderName) then
+  begin
+    Writeln('SELFTEST FAILED: empty Core Temp data reported a temperature');
+    Exit;
+  end;
+
   SetLength(lZones, 0);
   if TrySelectMachineOverviewChassisTemperature(lZones,
       lTemperatureCelsius, lProviderName) then

@@ -445,14 +445,13 @@ function BuildResponsivenessText(
   const aSource: TMachineOverviewPresentationSource): string;
 begin
   Result := Format('foreground reply %s now; 60 s max %s; DPC %s now; '+
-    '60 s max %s; interrupts %s; DWM missed frames %s; processor queue %s',
+    '60 s max %s; interrupts %s; DWM missed frames %s',
     [MeasurementMilliseconds(aSource, 'foreground_reply_ms'),
      MeasurementMilliseconds(aSource, 'foreground_reply_max_60s'),
      MeasurementPercent(aSource, 'dpc_percent'),
      MeasurementPercent(aSource, 'dpc_percent_max_60s'),
      MeasurementPercent(aSource, 'interrupt_percent'),
-     MeasurementCount(aSource, 'dwm_frames_missed_delta'),
-     MeasurementCount(aSource, 'processor_queue_length')]);
+     MeasurementCount(aSource, 'dwm_frames_missed_delta')]);
 end;
 
 function BuildSystemCountsText(
@@ -705,8 +704,13 @@ begin
       lMeasurement.Available) then
     Exit('Unavailable');
   if aKind = 'percent' then
-    Result := FormatPercent(lMeasurement.Value)
-  else if aKind = 'bytes' then
+  begin
+    // share of all logical CPUs, plus the same load as a multiple of one core
+    Result := FormatPercent(lMeasurement.Value);
+    if aSource.CpuAggregate.LogicalProcessorCount > 0 then
+      Result := Result + ' (' + FormatPercent(lMeasurement.Value *
+        aSource.CpuAggregate.LogicalProcessorCount) + ' of one core)';
+  end else if aKind = 'bytes' then
     Result := FormatBytes(lMeasurement.Value)
   else if aKind = 'bytes_per_second' then
     Result := FormatBytesPerSecond(lMeasurement.Value)
@@ -864,7 +868,8 @@ begin
     end;
   Result := Result + sLineBreak + 'Provider collection latency' + sLineBreak;
   for lMeasurement in aSource.Measurements do
-    if StartsText('collector_duration_ms:', lMeasurement.Name) and
+    if (StartsText('collector_duration_ms:', lMeasurement.Name) or
+      StartsText('collector_cpu_ms:', lMeasurement.Name)) and
       lMeasurement.Available then
       Result := Result + OneLine(lMeasurement.Name) + '=' +
         InvariantFormat('0', lMeasurement.Value) + ' ms' + sLineBreak;

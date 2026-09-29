@@ -93,7 +93,6 @@ type
     fPreviousDwmLate: UInt64;
     fPreviousDwmMissed: UInt64;
     fPreviousDwmRefresh: UInt64;
-    fProcessorQueueCounter: TPdhCounterHandle;
     fQuery: TPdhQueryHandle;
     fRolling: TObject;
     procedure AddCounter(const aPath, aName: string;
@@ -250,8 +249,7 @@ begin
     'interrupts_per_sec', fInterruptRateCounter);
   AddCounter('\Memory\Pages Input/sec', 'pages_input_per_sec', fPagesInputCounter);
   AddCounter('\Memory\Pages Output/sec', 'pages_output_per_sec', fPagesOutputCounter);
-  AddCounter('\System\Processor Queue Length',
-    'processor_queue_length', fProcessorQueueCounter);
+  // no \System object counters: PDH walks every thread for them (~50 ms CPU)
 end;
 
 destructor TMachineOverviewWindowsProvider.Destroy;
@@ -681,8 +679,6 @@ begin
       'interrupts_per_sec', 'count_per_second', 0, MaxDouble);
     AddPdhMeasurement(lMeasurements, fDpcRateCounter, 'dpc_rate',
       'count_per_second', 0, MaxDouble);
-    AddPdhMeasurement(lMeasurements, fProcessorQueueCounter,
-      'processor_queue_length', 'count', 0, MaxDouble);
   end else
   begin
     AddMeasurement(lMeasurements, 'cpu_total_percent', 'percent', False, 0);
@@ -692,7 +688,6 @@ begin
     AddMeasurement(lMeasurements, 'interrupts_per_sec',
       'count_per_second', False, 0);
     AddMeasurement(lMeasurements, 'dpc_rate', 'count_per_second', False, 0);
-    AddMeasurement(lMeasurements, 'processor_queue_length', 'count', False, 0);
   end;
 
   lCoreAvailable := CollectPerformanceInformation(lMeasurements, lPageSize);

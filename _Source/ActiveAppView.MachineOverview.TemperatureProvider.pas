@@ -23,6 +23,24 @@ type
     CpuPackageTemperatureCelsius: TMachineOverviewOptionalDouble;
     ChassisTemperatureCelsius: TMachineOverviewOptionalDouble;
     ChassisProviderName: string;
+    CpuErrorText: string;
+    ChassisErrorText: string;
+  end;
+
+  // Core Temp's CORE_TEMP_SHARED_DATA, published as "CoreTempMappingObject"
+  TMachineOverviewCoreTempSharedData = packed record
+    Load: array[0..255] of Cardinal;
+    TjMax: array[0..127] of Cardinal;
+    CoreCount: Cardinal;
+    CpuCount: Cardinal;
+    Temperatures: array[0..255] of Single;
+    Vid: Single;
+    CpuSpeed: Single;
+    FsbSpeed: Single;
+    Multiplier: Single;
+    CpuName: array[0..99] of AnsiChar;
+    Fahrenheit: Byte;
+    DeltaToTjMax: Byte;
   end;
 
   TMachineOverviewRetainedTemperature = record
@@ -49,6 +67,9 @@ function TrySelectMachineOverviewCpuTemperature(
   out aTemperatureCelsius: Double; out aProviderName: string): Boolean;
 function TrySelectMachineOverviewChassisTemperature(
   const aReadings: TArray<TMachineOverviewThermalZoneReading>;
+  out aTemperatureCelsius: Double; out aProviderName: string): Boolean;
+function TrySelectMachineOverviewCoreTempTemperature(
+  const aData: TMachineOverviewCoreTempSharedData;
   out aTemperatureCelsius: Double; out aProviderName: string): Boolean;
 function TryParseMachineOverviewNvidiaSmiOutput(const aText: string;
   out aGpuTemperatureCelsius, aGpuPowerWatts: TMachineOverviewOptionalDouble;
@@ -300,13 +321,15 @@ begin
     aNowMonotonicMs, aStaleAfterMs, aCache.GpuPowerWatts,
     aSample.Measurements[1], lPowerCurrent, lPowerAgeMs);
   ResolveRetainedTemperature(aProbe.CpuPackageTemperatureCelsius,
-    lCpuProviderName, lUnavailableText, 'cpu_package_temperature_c', 'C',
-    'Conservatively identified Windows CPU package thermal zone', -50, 200,
+    lCpuProviderName, IfThen(aProbe.CpuErrorText.IsEmpty, lUnavailableText,
+    aProbe.CpuErrorText), 'cpu_package_temperature_c', 'C',
+    'Core Temp hottest core, else Windows CPU package thermal zone', -50, 200,
     aNowMonotonicMs, aStaleAfterMs,
     aCache.CpuPackageTemperatureCelsius, aSample.Measurements[2],
     lCpuCurrent, lCpuAgeMs);
   ResolveRetainedTemperature(aProbe.ChassisTemperatureCelsius,
-    lChassisProviderName, lUnavailableText, 'chassis_temperature_c', 'C',
+    lChassisProviderName, IfThen(aProbe.ChassisErrorText.IsEmpty,
+    lUnavailableText, aProbe.ChassisErrorText), 'chassis_temperature_c', 'C',
     'Hottest Windows thermal zone not named as a CPU sensor', -50, 200,
     aNowMonotonicMs, aStaleAfterMs, aCache.ChassisTemperatureCelsius,
     aSample.Measurements[3], lChassisCurrent, lChassisAgeMs);
@@ -388,6 +411,69 @@ begin
       aProviderName := 'Windows Thermal Zone Information: ' +
         lReading.InstanceName;
     end;
+  end;
+end;
+
+function TrySelectMachineOverviewCoreTempTemperature(
+  const aData: TMachineOverviewCoreTempSharedData;
+  out aTemperatureCelsius: Double; out aProviderName: string): Boolean;
+var
+  lCelsius: Double;
+  lCount: Cardinal;
+  i: Cardinal;
+begin
+  aTemperatureCelsius := 0;
+  aProviderName := '';
+  Result := False;
+  if (aData.CoreCount = 0) or (aData.CpuCount = 0) or
+    (aData.CoreCount > Cardinal(Length(aData.Temperatures))) or
+    (aData.CpuCount > Cardinal(Length(aData.TjMax))) or
+    (aData.CoreCount * aData.CpuCount > Cardinal(Length(aData.Temperatures))) then
+    Exit;
+  lCount := aData.CoreCount * aData.CpuCount;
+  for i := 0 to lCount - 1 do
+  begin
+    lCelsius := aData.Temperatures[i];
+    if aData.DeltaToTjMax <> 0 then
+      lCelsius := aData.TjMax[i div aData.CoreCount] - lCelsius;
+    if aData.Fahrenheit <> 0 then
+      lCelsius := (lCelsius - 32) * 5 / 9;
+    if IsNan(lCelsius) or IsInfinite(lCelsius) or (lCelsius < -50) or
+      (lCelsius > 200) then
+      Continue;
+    if (not Result) or (lCelsius > aTemperatureCelsius) then
+    begin
+      Result := True;
+      aTemperatureCelsius := lCelsius;
+    end;
+  end;
+  if Result then
+    aProviderName := Format('Core Temp: hottest of %d cores', [lCount]);
+end;
+
+function TryReadCoreTempSharedData(
+  out aData: TMachineOverviewCoreTempSharedData): Boolean;
+var
+  lMapping: THandle;
+  lView: Pointer;
+begin
+  aData := Default(TMachineOverviewCoreTempSharedData);
+  Result := False;
+  lMapping := OpenFileMapping(FILE_MAP_READ, False, 'CoreTempMappingObject');
+  if lMapping = 0 then
+    Exit;
+  try
+    lView := MapViewOfFile(lMapping, FILE_MAP_READ, 0, 0, SizeOf(aData));
+    if lView = nil then
+      Exit;
+    try
+      Move(lView^, aData, SizeOf(aData));
+      Result := True;
+    finally
+      UnmapViewOfFile(lView);
+    end;
+  finally
+    CloseHandle(lMapping);
   end;
 end;
 
@@ -579,13 +665,14 @@ begin
   end;
   Result := TryReadThermalZones(aReadings);
   if not Result then
-    aErrorText := 'Windows exposes no thermal zones; CPU and chassis sensors '+
-      'need an elevated sensor collector';
+    aErrorText := 'Windows exposes no thermal zones';
 end;
 
 procedure TMachineOverviewTemperatureProvider.Collect(
   out aSample: TMachineOverviewProviderSample);
 var
+  lCoreTemp: TMachineOverviewCoreTempSharedData;
+  lHasZones: Boolean;
   lNowMonotonicMs: UInt64;
   lProbe: TMachineOverviewTemperatureProbe;
   lProviderName: string;
@@ -594,28 +681,40 @@ var
   lZoneError: string;
 begin
   CollectNvidiaSmi(lProbe);
-  if TryCollectThermalZones(lReadings, lZoneError) then
+  lHasZones := TryCollectThermalZones(lReadings, lZoneError);
+  // Core Temp reads the CPU sensors through its own driver; prefer it
+  if (TryReadCoreTempSharedData(lCoreTemp) and
+      TrySelectMachineOverviewCoreTempTemperature(lCoreTemp, lTemperature,
+        lProviderName)) or
+    (lHasZones and TrySelectMachineOverviewCpuTemperature(lReadings,
+      lTemperature, lProviderName)) then
   begin
-    if TrySelectMachineOverviewCpuTemperature(lReadings, lTemperature,
-        lProviderName) then
-    begin
-      lProbe.CpuPackageTemperatureCelsius.Available := True;
-      lProbe.CpuPackageTemperatureCelsius.Value := lTemperature;
-      lProbe.CpuProviderName := lProviderName;
-      lProbe.Status := TMachineOverviewProviderStatus.Available;
-    end else
-      AppendError(lProbe.ErrorText,
-        'Windows thermal zones do not identify a CPU package sensor');
-    if TrySelectMachineOverviewChassisTemperature(lReadings, lTemperature,
-        lProviderName) then
-    begin
-      lProbe.ChassisTemperatureCelsius.Available := True;
-      lProbe.ChassisTemperatureCelsius.Value := lTemperature;
-      lProbe.ChassisProviderName := lProviderName;
-      lProbe.Status := TMachineOverviewProviderStatus.Available;
-    end;
+    lProbe.CpuPackageTemperatureCelsius.Available := True;
+    lProbe.CpuPackageTemperatureCelsius.Value := lTemperature;
+    lProbe.CpuProviderName := lProviderName;
+    lProbe.Status := TMachineOverviewProviderStatus.Available;
   end else
-    AppendError(lProbe.ErrorText, lZoneError);
+  begin
+    lProbe.CpuErrorText := 'needs Core Temp running or a Windows CPU '+
+      'thermal zone';
+    AppendError(lProbe.ErrorText, 'CPU temperature ' + lProbe.CpuErrorText);
+  end;
+  if lHasZones and TrySelectMachineOverviewChassisTemperature(lReadings,
+      lTemperature, lProviderName) then
+  begin
+    lProbe.ChassisTemperatureCelsius.Available := True;
+    lProbe.ChassisTemperatureCelsius.Value := lTemperature;
+    lProbe.ChassisProviderName := lProviderName;
+    lProbe.Status := TMachineOverviewProviderStatus.Available;
+  end else
+  begin
+    if lHasZones then
+      lProbe.ChassisErrorText := 'no non-CPU Windows thermal zone'
+    else
+      lProbe.ChassisErrorText := lZoneError;
+    AppendError(lProbe.ErrorText, 'chassis temperature: ' +
+      lProbe.ChassisErrorText);
+  end;
   lNowMonotonicMs := GetTickCount64;
   BuildMachineOverviewTemperatureSample(lProbe,
     TTimeZone.Local.ToUniversalTime(Now), lNowMonotonicMs,

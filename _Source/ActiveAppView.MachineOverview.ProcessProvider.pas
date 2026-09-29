@@ -40,7 +40,7 @@ implementation
 
 uses
   System.DateUtils, System.Generics.Collections, System.SysUtils,
-  Winapi.PsAPI, Winapi.TlHelp32, Winapi.Windows,
+  Winapi.PsAPI, Winapi.Windows,
   AutoFree,
   ActiveAppView.MachineOverview.Domain;
 
@@ -74,11 +74,6 @@ type
     LastSeenMonotonicMs: UInt64;
     Path: string;
     Status: TMachineOverviewProcessPathStatus;
-  end;
-
-  TMachineOverviewProcessEntry = record
-    DisplayName: string;
-    ProcessId: Cardinal;
   end;
 
   TMachineOverviewCollectedProcess = record
@@ -117,16 +112,10 @@ type
       const aNowMonotonicMs, aElapsedMs: UInt64;
       const aLogicalProcessorCount: Cardinal;
       const aSeenIdentities: TDictionary<string, Boolean>;
-      const aDisplayName: string;
       out aProcess: TMachineOverviewCollectedProcess;
       out aAccessDenied: Boolean): Boolean;
     procedure ExpireMissingProcesses(
       const aSeenIdentities: TDictionary<string, Boolean>);
-    procedure PopulateProcessPathsForRanking(
-      const aProcesses: TList<TMachineOverviewCollectedProcess>;
-      const aRanked: TArray<TMachineOverviewRankedProcess>;
-      const aNowMonotonicMs: UInt64;
-      const aResolved: TDictionary<string, Boolean>);
     procedure UpdateRollingMeasurements(
       const aCpuRanked, aRamRanked,
       aIoRanked: TArray<TMachineOverviewRankedProcess>;
@@ -205,62 +194,48 @@ begin
   end;
 end;
 
-function TryEnumerateProcesses(
-  out aProcesses: TArray<TMachineOverviewProcessEntry>;
+// EnumProcesses instead of a Toolhelp snapshot: the snapshot walks every
+// thread in the system and cost ~70 ms CPU per sample on a 600-process box.
+// Names come from the cached image path of each process we can open.
+function TryEnumerateProcesses(out aProcessIds: TArray<Cardinal>;
   out aErrorCode: Cardinal): Boolean;
 var
-  lEntry: TProcessEntry32W;
-  lProcess: TMachineOverviewProcessEntry;
-  lProcesses: TList<TMachineOverviewProcessEntry>;
-  lSnapshot: THandle;
+  lBytesReturned: Cardinal;
+  lCapacity: Integer;
+  lCount: Integer;
+  lIds: TArray<Cardinal>;
+  i: Integer;
 begin
-  aProcesses := nil;
-  aErrorCode := 0;
-  lSnapshot := CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if lSnapshot = INVALID_HANDLE_VALUE then
-  begin
-    aErrorCode := GetLastError;
-    Exit(False);
-  end;
-  lProcesses := TList<TMachineOverviewProcessEntry>.Create;
-  try
-    lEntry := Default(TProcessEntry32W);
-    lEntry.dwSize := SizeOf(lEntry);
-    SetLastError(ERROR_SUCCESS);
-    if not Process32FirstW(lSnapshot, lEntry) then
+  aProcessIds := nil;
+  aErrorCode := ERROR_SUCCESS;
+  lCapacity := 1024;
+  repeat
+    SetLength(lIds, lCapacity);
+    if not EnumProcesses(PDWORD(lIds), lCapacity * SizeOf(Cardinal),
+      lBytesReturned) then
     begin
       aErrorCode := GetLastError;
-      Exit(aErrorCode = ERROR_NO_MORE_FILES);
+      Exit(False);
     end;
-    repeat
+    if lBytesReturned < Cardinal(lCapacity * SizeOf(Cardinal)) then
+      Break;
+    if lCapacity >= cMachineOverviewMaximumProcessCount then
     begin
-      if lEntry.th32ProcessID <> 0 then
-      begin
-        if lProcesses.Count >= cMachineOverviewMaximumProcessCount then
-        begin
-          aErrorCode := ERROR_INSUFFICIENT_BUFFER;
-          Exit(False);
-        end;
-        lProcess := Default(TMachineOverviewProcessEntry);
-        lProcess.ProcessId := lEntry.th32ProcessID;
-        lProcess.DisplayName := PWideChar(@lEntry.szExeFile[0]);
-        lProcesses.Add(lProcess);
-      end;
-      lEntry.dwSize := SizeOf(lEntry);
-      SetLastError(ERROR_SUCCESS);
+      aErrorCode := ERROR_INSUFFICIENT_BUFFER;
+      Exit(False);
     end;
-    until not Process32NextW(lSnapshot, lEntry);
-    aErrorCode := GetLastError;
-    Result := aErrorCode = ERROR_NO_MORE_FILES;
-    if Result then
+    lCapacity := lCapacity * 2;
+  until False;
+  SetLength(aProcessIds, lBytesReturned div SizeOf(Cardinal));
+  lCount := 0;
+  for i := 0 to High(aProcessIds) do
+    if lIds[i] <> 0 then
     begin
-      aProcesses := lProcesses.ToArray;
-      aErrorCode := ERROR_SUCCESS;
+      aProcessIds[lCount] := lIds[i];
+      Inc(lCount);
     end;
-  finally
-    lProcesses.Free;
-    CloseHandle(lSnapshot);
-  end;
+  SetLength(aProcessIds, lCount);
+  Result := True;
 end;
 
 function TryCalculateMachineOverviewProcessDelta(
@@ -588,7 +563,6 @@ function TMachineOverviewProcessProvider.CollectProcess(
   const aProcessId: Cardinal; const aNowMonotonicMs, aElapsedMs: UInt64;
   const aLogicalProcessorCount: Cardinal;
   const aSeenIdentities: TDictionary<string, Boolean>;
-  const aDisplayName: string;
   out aProcess: TMachineOverviewCollectedProcess;
   out aAccessDenied: Boolean): Boolean;
 var
@@ -688,88 +662,14 @@ begin
     aProcess.HandleCountAvailable := GetProcessHandleCount(lHandle, lHandleCount);
     if aProcess.HandleCountAvailable then
       aProcess.HandleCount := lHandleCount;
-    aProcess.DisplayName := Trim(aDisplayName);
-    if aProcess.DisplayName.IsEmpty then
+    if ResolveProcessPath(lHandle, aProcess.Identity, aNowMonotonicMs,
+      aProcess.Path, aProcess.PathStatus) then
+      aProcess.DisplayName := ExtractFileName(aProcess.Path)
+    else
       aProcess.DisplayName := 'PID ' + UIntToStr(aProcessId);
-    aProcess.PathStatus := TMachineOverviewProcessPathStatus.Unavailable;
     Result := True;
   finally
     CloseHandle(lHandle);
-  end;
-end;
-
-function FindCollectedProcessIndex(
-  const aProcesses: TList<TMachineOverviewCollectedProcess>;
-  const aIdentity: TMachineOverviewProcessIdentity): Integer;
-var
-  i: Integer;
-begin
-  for i := 0 to aProcesses.Count - 1 do
-    if (aProcesses[i].Identity.ProcessId = aIdentity.ProcessId) and
-      (aProcesses[i].Identity.CreationTime100ns =
-        aIdentity.CreationTime100ns) then
-      Exit(i);
-  Result := -1;
-end;
-
-procedure TMachineOverviewProcessProvider.PopulateProcessPathsForRanking(
-  const aProcesses: TList<TMachineOverviewCollectedProcess>;
-  const aRanked: TArray<TMachineOverviewRankedProcess>;
-  const aNowMonotonicMs: UInt64;
-  const aResolved: TDictionary<string, Boolean>);
-var
-  lCreationTime: TFileTime;
-  lExitTime: TFileTime;
-  lHandle: THandle;
-  lIndex: Integer;
-  lKernelTime: TFileTime;
-  lKey: string;
-  lProcess: TMachineOverviewCollectedProcess;
-  lRankedProcess: TMachineOverviewRankedProcess;
-  lUserTime: TFileTime;
-begin
-  for lRankedProcess in aRanked do
-  begin
-    lKey := MachineOverviewProcessIdentityKey(lRankedProcess.Metric.Identity);
-    if aResolved.ContainsKey(lKey) then
-      Continue;
-    aResolved.Add(lKey, True);
-    lIndex := FindCollectedProcessIndex(aProcesses,
-      lRankedProcess.Metric.Identity);
-    if lIndex < 0 then
-      Continue;
-    lProcess := aProcesses[lIndex];
-    lHandle := OpenProcess(cProcessQueryLimitedInformation, False,
-      lProcess.Identity.ProcessId);
-    if lHandle = 0 then
-    begin
-      lProcess.PathStatus := ClassifyMachineOverviewProcessPathFailure(
-        GetLastError, True);
-      aProcesses[lIndex] := lProcess;
-      Continue;
-    end;
-    try
-      lCreationTime := Default(TFileTime);
-      lExitTime := Default(TFileTime);
-      lKernelTime := Default(TFileTime);
-      lUserTime := Default(TFileTime);
-      if (not GetProcessTimes(lHandle, lCreationTime, lExitTime, lKernelTime,
-          lUserTime)) or
-        (FileTimeToUInt64(lCreationTime) <>
-          lProcess.Identity.CreationTime100ns) then
-      begin
-        lProcess.PathStatus := TMachineOverviewProcessPathStatus.Exited;
-        aProcesses[lIndex] := lProcess;
-        Continue;
-      end;
-      ResolveProcessPath(lHandle, lProcess.Identity, aNowMonotonicMs,
-        lProcess.Path, lProcess.PathStatus);
-      if lProcess.PathStatus = TMachineOverviewProcessPathStatus.Available then
-        lProcess.DisplayName := ExtractFileName(lProcess.Path);
-      aProcesses[lIndex] := lProcess;
-    finally
-      CloseHandle(lHandle);
-    end;
   end;
 end;
 
@@ -811,11 +711,10 @@ var
   lMeasurementList: TList<TMachineOverviewMeasurement>;
   lNowMonotonicMs: UInt64;
   lProcess: TMachineOverviewCollectedProcess;
-  lProcessEntries: TArray<TMachineOverviewProcessEntry>;
+  lProcessIds: TArray<Cardinal>;
   lProcessList: TList<TMachineOverviewCollectedProcess>;
   lRamMetrics: TArray<TMachineOverviewProcessMetric>;
   lRamRanked: TArray<TMachineOverviewRankedProcess>;
-  lResolvedPaths: TDictionary<string, Boolean>;
   lSeenIdentities: TDictionary<string, Boolean>;
   i: Integer;
 begin
@@ -825,7 +724,7 @@ begin
   aSample.State.CapturedAtUtc := TTimeZone.Local.ToUniversalTime(Now);
   lNowMonotonicMs := GetTickCount64;
   aSample.State.CapturedAtMonotonicMs := lNowMonotonicMs;
-  if not TryEnumerateProcesses(lProcessEntries, lErrorCode) then
+  if not TryEnumerateProcesses(lProcessIds, lErrorCode) then
   begin
     aSample.State.Status := TMachineOverviewProviderStatus.Unavailable;
     aSample.State.ErrorText := Format(
@@ -834,7 +733,6 @@ begin
   end;
   GC(lMeasurementList, TList<TMachineOverviewMeasurement>.Create, g);
   GC(lProcessList, TList<TMachineOverviewCollectedProcess>.Create, g);
-  GC(lResolvedPaths, TDictionary<string, Boolean>.Create, g);
   GC(lSeenIdentities, TDictionary<string, Boolean>.Create, g);
   if (fPreviousCapturedAtMonotonicMs > 0) and
     (lNowMonotonicMs >= fPreviousCapturedAtMonotonicMs) then
@@ -843,12 +741,11 @@ begin
     lElapsedMs := 0;
   lLogicalProcessorCount := GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
   lAccessDeniedCount := 0;
-  for i := 0 to Length(lProcessEntries) - 1 do
+  for i := 0 to High(lProcessIds) do
   begin
     lAccessDenied := False;
-    if CollectProcess(lProcessEntries[i].ProcessId, lNowMonotonicMs, lElapsedMs,
-      lLogicalProcessorCount, lSeenIdentities,
-      lProcessEntries[i].DisplayName, lProcess, lAccessDenied) then
+    if CollectProcess(lProcessIds[i], lNowMonotonicMs, lElapsedMs,
+      lLogicalProcessorCount, lSeenIdentities, lProcess, lAccessDenied) then
       lProcessList.Add(lProcess)
     else if lAccessDenied then
       Inc(lAccessDeniedCount);
@@ -883,12 +780,6 @@ begin
   LimitRankedProcesses(lCpuRanked, 5);
   LimitRankedProcesses(lRamRanked, 5);
   LimitRankedProcesses(lIoRanked, 5);
-  PopulateProcessPathsForRanking(lProcessList, lCpuRanked,
-    lNowMonotonicMs, lResolvedPaths);
-  PopulateProcessPathsForRanking(lProcessList, lRamRanked,
-    lNowMonotonicMs, lResolvedPaths);
-  PopulateProcessPathsForRanking(lProcessList, lIoRanked,
-    lNowMonotonicMs, lResolvedPaths);
   AddRankedMeasurements(lMeasurementList, 'process_cpu_rank', 'percent',
     lCpuRanked, lProcessList, lNowMonotonicMs);
   AddRankedMeasurements(lMeasurementList, 'process_ram_rank',

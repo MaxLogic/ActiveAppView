@@ -231,9 +231,24 @@ begin
   inherited Destroy;
 end;
 
+function CurrentThreadCpu100ns: UInt64;
+var
+  lCreationTime: TFileTime;
+  lExitTime: TFileTime;
+  lKernelTime: TFileTime;
+  lUserTime: TFileTime;
+begin
+  if GetThreadTimes(GetCurrentThread, lCreationTime, lExitTime, lKernelTime,
+    lUserTime) then
+    Result := UInt64(lKernelTime) + UInt64(lUserTime)
+  else
+    Result := 0;
+end;
+
 procedure TMachineOverviewSystemCollector.CollectOnce(
   var aProvider: IMachineOverviewProvider);
 var
+  lCpuStarted100ns: UInt64;
   lDurationMs: UInt64;
   lEnqueueResult: TMachineOverviewEnqueueResult;
   lMeasurement: TMachineOverviewMeasurement;
@@ -243,6 +258,7 @@ var
   lStartedMs: UInt64;
 begin
   lStartedMs := GetTickCount64;
+  lCpuStarted100ns := CurrentThreadCpu100ns;
   lProviderId := 'unknown';
   try
     if not Assigned(aProvider) then
@@ -271,8 +287,12 @@ begin
   lMeasurement.Available := True;
   lMeasurement.Value := lDurationMs;
   lMeasurementIndex := Length(lSample.Measurements);
-  SetLength(lSample.Measurements, lMeasurementIndex + 1);
+  SetLength(lSample.Measurements, lMeasurementIndex + 2);
   lSample.Measurements[lMeasurementIndex] := lMeasurement;
+  // thread CPU shows what each provider costs; wall time also counts waits
+  lMeasurement.Name := 'collector_cpu_ms:' + lProviderId;
+  lMeasurement.Value := (CurrentThreadCpu100ns - lCpuStarted100ns) / 10000;
+  lSample.Measurements[lMeasurementIndex + 1] := lMeasurement;
   TInterlocked.Exchange(fLastCollectDurationMs, Int64(lDurationMs));
   TInterlocked.Increment(fSamplesCollected);
   lEnqueueResult := fPipeline.EnqueueRaw(CreateMachineOverviewRawSample(lSample));

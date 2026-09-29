@@ -708,8 +708,6 @@ begin
     1.7, 'percent', True);
   AddPresentationMeasurement(lSource.Measurements, 'dwm_frames_missed_delta', '', '', '',
     '', 3, 'count', True);
-  AddPresentationMeasurement(lSource.Measurements, 'processor_queue_length', '', '', '',
-    '', 2, 'count', True);
   AddPresentationMeasurement(lSource.Measurements, 'process_count', '', '', '', '', 212,
     'count', True);
   AddPresentationMeasurement(lSource.Measurements, 'thread_count', '', '', '', '', 3112,
@@ -849,7 +847,7 @@ begin
        'chassis Unavailable'])) or
     (not TryFindMachineOverviewRow(lPresentation, 'responsiveness', lRow)) or
     (not PresentationContains(lRow.ValueText,
-      ['84 ms', '1.4 s', 'coverage 50%', '3.2%', '12.4%', '1.7%', '3', '2'])) or
+      ['84 ms', '1.4 s', 'coverage 50%', '3.2%', '12.4%', '1.7%', '3'])) or
     (not TryFindMachineOverviewRow(lPresentation, 'system-counts', lRow)) or
     (not PresentationContains(lRow.ValueText, ['212', '3,112', '98,214'])) or
     (not TryFindMachineOverviewRow(lPresentation, 'disk-summary', lRow)) or
@@ -864,7 +862,9 @@ begin
   if (not TryFindMachineOverviewRow(lPresentation, 'top-cpu:1', lRow)) or
     (not SameText(lRow.Category, 'Applications')) or
     (not PresentationContains(lRow.ValueText,
-      ['cl.exe', '18%', '12%', 'coverage 50%', '44%',
+      ['cl.exe', '18% (576% of one core) now',
+       '12% (384% of one core)', 'coverage 50%',
+       '44% (1408% of one core) peak',
        'PIDs 1234, 2345, 3456, 4567, 5678 (3 more)',
        'C:\Tools\cl.exe'])) or
     ContainsText(lRow.ValueText, '6789') or
@@ -1697,7 +1697,8 @@ begin
   if (not TryFindSystemProviderMeasurement(lSample, 'paging_bytes_per_sec', lMeasurement)) or
     (not TryFindSystemProviderMeasurement(lSample, 'dpc_percent', lMeasurement)) or
     (not TryFindSystemProviderMeasurement(lSample, 'interrupt_percent', lMeasurement)) or
-    (not TryFindSystemProviderMeasurement(lSample, 'processor_queue_length', lMeasurement)) or
+    // \System\Processor Queue Length costs ~50 ms CPU per collect; keep it out
+    TryFindSystemProviderMeasurement(lSample, 'processor_queue_length', lMeasurement) or
     (not TryFindSystemProviderMeasurement(lSample, 'foreground_status', lMeasurement)) or
     (not lMeasurement.Available) or
     (not TryFindSystemProviderMeasurement(lSample, 'dwm_frames_late_delta', lMeasurement)) then
@@ -1912,8 +1913,15 @@ function RunMachineOverviewSoakSelfTest: Integer;
 const
   cMaximumSteadyMemoryGrowthBytes = 32 * 1024 * 1024;
   cMinimumBudgetDurationSeconds = 300;
+  cProviderIds: array[0..4] of string = ('windows-core', 'disks', 'gpu',
+    'temperature', 'processes');
 var
   g: TGarbos;
+  lProviderCpuCounts: array[0..4] of UInt64;
+  lProviderCpuMs: UInt64;
+  lProviderCpuSums: array[0..4] of UInt64;
+  lProviderCpuText: string;
+  i: Integer;
   lBaselinePrivateBytes: UInt64;
   lBaselineSet: Boolean;
   lCpuDelta100ns: UInt64;
@@ -1993,6 +2001,8 @@ begin
     lPresentationCount := 0;
     lSawCommit := False;
     lSawSelfMetrics := False;
+    FillChar(lProviderCpuCounts, SizeOf(lProviderCpuCounts), 0);
+    FillChar(lProviderCpuSums, SizeOf(lProviderCpuSums), 0);
     lLastProgressSeconds := 0;
     lWarmupMs := (lSeconds * 1000) div 4;
     if lWarmupMs > 60000 then
@@ -2020,6 +2030,14 @@ begin
       begin
         lLatestSequence := lPresentation.Sequence;
         Inc(lPresentationCount);
+        for i := 0 to High(cProviderIds) do
+          if TryExtractMachineOverviewDiagnosticValue(
+              lPresentation.DiagnosticText,
+              'collector_cpu_ms:' + cProviderIds[i] + '=', lProviderCpuMs) then
+          begin
+            Inc(lProviderCpuSums[i], lProviderCpuMs);
+            Inc(lProviderCpuCounts[i]);
+          end;
         lSawSelfMetrics := lSawSelfMetrics or
           (not ContainsText(lPresentation.DiagnosticText,
             'monitor CPU=Unavailable'));
@@ -2107,6 +2125,13 @@ begin
        lMaximumHistoryDepth, lHistoryDropped, lMaximumCommitMs,
        lShutdownWatch.ElapsedMilliseconds, lService.ActiveWorkerCount],
       TFormatSettings.Invariant));
+    lProviderCpuText := '';
+    for i := 0 to High(cProviderIds) do
+      if lProviderCpuCounts[i] > 0 then
+        lProviderCpuText := lProviderCpuText + Format('; %s=%.1f',
+          [cProviderIds[i], lProviderCpuSums[i] / lProviderCpuCounts[i]],
+          TFormatSettings.Invariant);
+    Writeln('SOAK PROVIDER CPU MS PER COLLECTION' + lProviderCpuText);
     if (lShutdownResult <> TMachineOverviewShutdownResult.Stopped) or
       (lShutdownWatch.ElapsedMilliseconds > 5000) or lService.IsRunning or
       (lService.ActiveWorkerCount <> 0) then
