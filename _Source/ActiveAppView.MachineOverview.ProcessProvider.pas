@@ -136,7 +136,8 @@ const
   cMachineOverviewMaximumProcessPathChars = 32768;
   cMachineOverviewPathInactivityTimeoutMs = 300000;
   cMachineOverviewProcessRollingRetentionMs = 60000;
-  cMachineOverviewProcessExpectedIntervalMs = 2000;
+  // matches the default ProcessSampleIntervalMs; drives window coverage checks
+  cMachineOverviewProcessExpectedIntervalMs = 5000;
   cMachineOverviewMinimumCoveragePercent = 80.0;
   cProcessQueryLimitedInformation = $1000;
 

@@ -70,7 +70,7 @@ begin
   Result.DisplayRefreshIntervalMs := 10000;
   Result.PanelWidth := 420;
   Result.SystemSampleIntervalMs := 1000;
-  Result.ProcessSampleIntervalMs := 2000;
+  Result.ProcessSampleIntervalMs := 5000;
   Result.TemperatureSampleIntervalMs := 3000;
   Result.HistoryCommitIntervalMs := 10000;
   Result.HistoryEnabled := True;
