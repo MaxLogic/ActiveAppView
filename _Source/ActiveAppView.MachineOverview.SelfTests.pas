@@ -843,8 +843,8 @@ begin
     ContainsText(lRow.ValueText, 'temperature') or
     (not TryFindMachineOverviewRow(lPresentation, 'temperatures', lRow)) or
     (not PresentationContains(lRow.ValueText,
-      ['CPU 61.5 C', 'ACPI', 'GPU 58 C', 'NVAPI',
-       'chassis Unavailable'])) or
+      ['CPU 61.5 C', 'ACPI', 'GPU 58 C', 'NVAPI'])) or
+    ContainsText(lRow.ValueText, 'chassis') or
     (not TryFindMachineOverviewRow(lPresentation, 'responsiveness', lRow)) or
     (not PresentationContains(lRow.ValueText,
       ['84 ms', '1.4 s', 'coverage 50%', '3.2%', '12.4%', '1.7%', '3'])) or
@@ -902,6 +902,16 @@ begin
     ContainsText(lPresentation.DiagnosticText, 'private text') then
   begin
     Writeln('SELFTEST FAILED: full diagnostics are incomplete or expose forbidden data');
+    Exit;
+  end;
+
+  AddPresentationMeasurement(lSource.Measurements, 'chassis_temperature_c', '',
+    '', '', 'TZ00', 41, 'celsius', True);
+  lPresentation := BuildMachineOverviewPresentation(lSource);
+  if (not TryFindMachineOverviewRow(lPresentation, 'temperatures', lRow)) or
+    (not ContainsText(lRow.ValueText, 'chassis 41 C')) then
+  begin
+    Writeln('SELFTEST FAILED: available chassis temperature was hidden');
     Exit;
   end;
 

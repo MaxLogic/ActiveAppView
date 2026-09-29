@@ -706,15 +706,10 @@ begin
     lProbe.ChassisTemperatureCelsius.Value := lTemperature;
     lProbe.ChassisProviderName := lProviderName;
     lProbe.Status := TMachineOverviewProviderStatus.Available;
-  end else
-  begin
-    if lHasZones then
-      lProbe.ChassisErrorText := 'no non-CPU Windows thermal zone'
-    else
-      lProbe.ChassisErrorText := lZoneError;
-    AppendError(lProbe.ErrorText, 'chassis temperature: ' +
-      lProbe.ChassisErrorText);
-  end;
+  end else if lHasZones then
+    lProbe.ChassisErrorText := 'no non-CPU Windows thermal zone'
+  else
+    lProbe.ChassisErrorText := lZoneError;
   lNowMonotonicMs := GetTickCount64;
   BuildMachineOverviewTemperatureSample(lProbe,
     TTimeZone.Local.ToUniversalTime(Now), lNowMonotonicMs,

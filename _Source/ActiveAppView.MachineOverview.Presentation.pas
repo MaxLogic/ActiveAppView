@@ -367,11 +367,16 @@ end;
 function BuildTemperaturesText(
   const aSource: TMachineOverviewPresentationSource): string;
 var
+  lMeasurement: TMachineOverviewMeasurement;
   lState: TMachineOverviewProviderState;
 begin
   Result := TemperatureText(aSource, 'CPU', 'cpu_package_temperature_c') +
-    '; ' + TemperatureText(aSource, 'GPU', 'gpu_temperature_c') + '; ' +
-    TemperatureText(aSource, 'chassis', 'chassis_temperature_c');
+    '; ' + TemperatureText(aSource, 'GPU', 'gpu_temperature_c');
+  // most desktops expose no chassis sensor; mention it only when we have one
+  if TryFindMeasurement(aSource.Measurements, 'chassis_temperature_c',
+    lMeasurement) and lMeasurement.Available then
+    Result := Result + '; ' + TemperatureText(aSource, 'chassis',
+      'chassis_temperature_c');
   if TryFindProviderState(aSource.ProviderStates, 'temperature', lState) then
     Result := Result + '; provider ' + LowerCase(ProviderStatusText(
       lState.Status)) + '; age ' + FormatAge(lState.DataAgeMs);
