@@ -791,7 +791,7 @@ begin
 
   lPresentation := BuildMachineOverviewPresentation(lSource);
   lExpectedIds := TArray<string>.Create('overall', 'incidents', 'cpu', 'memory',
-    'gpu', 'responsiveness', 'system-counts', 'disk-summary',
+    'gpu', 'temperatures', 'responsiveness', 'system-counts', 'disk-summary',
     'disk:physical:0', 'disk:physical:1', 'top-cpu:1', 'top-cpu:2',
     'top-cpu:3', 'top-cpu:4', 'top-cpu:5', 'top-ram:1', 'top-ram:2',
     'top-ram:3', 'top-ram:4', 'top-ram:5', 'top-io:1', 'top-io:2',
@@ -816,6 +816,12 @@ begin
     begin
       Writeln('SELFTEST FAILED: only the incidents row must be actionable');
       Exit;
+    end else if (lPresentation.Rows[lIndex].Action <>
+      TMachineOverviewAction.None) <>
+      EndsText('*', lPresentation.Rows[lIndex].LabelText) then
+    begin
+      Writeln('SELFTEST FAILED: only actionable row labels must end with *');
+      Exit;
     end;
 
   if (not TryFindMachineOverviewRow(lPresentation, 'overall', lRow)) or
@@ -827,14 +833,20 @@ begin
     (not TryFindMachineOverviewRow(lPresentation, 'cpu', lRow)) or
     (not PresentationContains(lRow.ValueText,
       ['28.5%', '2 of 32', '5 s', '24.1%', '45.2%', 'Stale', 'coverage 40%',
-       '15 s', '60 s', '61.5'])) or
+       '15 s', '60 s'])) or
+    ContainsText(lRow.ValueText, 'temperature') or
     (not TryFindMachineOverviewRow(lPresentation, 'memory', lRow)) or
     (not PresentationContains(lRow.ValueText,
       ['48 GB', '75%', '68.2%', '2 MB/s', '5 MB/s', '8 GB', 'database.exe'])) or
     (not TryFindMachineOverviewRow(lPresentation, 'gpu', lRow)) or
     (not PresentationContains(lRow.ValueText,
-      ['42%', '3D', '5 s', 'coverage 40%', '15 s', '60 s', '3 GB', '58',
+      ['42%', '3D', '5 s', 'coverage 40%', '15 s', '60 s', '3 GB',
        'stale', '6.2 s'])) or
+    ContainsText(lRow.ValueText, 'temperature') or
+    (not TryFindMachineOverviewRow(lPresentation, 'temperatures', lRow)) or
+    (not PresentationContains(lRow.ValueText,
+      ['CPU 61.5 C', 'ACPI', 'GPU 58 C', 'NVAPI',
+       'chassis Unavailable'])) or
     (not TryFindMachineOverviewRow(lPresentation, 'responsiveness', lRow)) or
     (not PresentationContains(lRow.ValueText,
       ['84 ms', '1.4 s', 'coverage 50%', '3.2%', '12.4%', '1.7%', '3', '2'])) or
@@ -895,7 +907,7 @@ begin
 
   lSource := Default(TMachineOverviewPresentationSource);
   lUnavailable := BuildMachineOverviewPresentation(lSource);
-  if (Length(lUnavailable.Rows) <> 23) or
+  if (Length(lUnavailable.Rows) <> 24) or
     (not TryFindMachineOverviewRow(lUnavailable, 'gpu', lRow)) or
     (not ContainsText(lRow.ValueText, 'Unavailable')) or
     (lRow.Severity <> TMachineOverviewSeverity.Unavailable) or
@@ -2309,7 +2321,7 @@ begin
     Exit;
   end;
   lPresentation := lSnapshot.Presentation;
-  if (lPresentation.Sequence <> 1) or (Length(lPresentation.Rows) <> 23) or
+  if (lPresentation.Sequence <> 1) or (Length(lPresentation.Rows) <> 24) or
     (not ContainsText(lPresentation.DiagnosticText, 'system: Available')) then
   begin
     Writeln('SELFTEST FAILED: first pipeline snapshot omitted its presentation/provider state');

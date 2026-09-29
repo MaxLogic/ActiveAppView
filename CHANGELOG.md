@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- Machine Overview (F8) has a Temperatures row after GPU with CPU, GPU, and chassis readings; unavailable sensors say why. Rows that open more detail with Enter show `*` after their label.
 - Console instances now knows Claude sessions whose window title shows no marker, and Claude sessions waiting for input behind an idle title. It reads Claude Code's own session registry and finds `claude.exe`/`codex.exe` (also a self-updated `claude.exe.old.*`) below each terminal.
 - A Setup harnesses... button adds a state hook to Claude Code and Codex on Windows and in WSL, after a preview and with a backup. Hooked sessions report working, idle, and permission waits directly instead of through title guesses.
 - Console instances has a Non Codex/Claude filter (Ctrl+5) for terminals without an agent title marker. Switching any console filter now plays a short spoken confirmation of the selected filter.

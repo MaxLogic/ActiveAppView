@@ -161,6 +161,14 @@ begin
     Writeln('SELFTEST FAILED: CPU package thermal zone was not selected conservatively');
     Exit;
   end;
+  if (not TrySelectMachineOverviewChassisTemperature(lZones,
+      lTemperatureCelsius, lProviderName)) or
+    (Abs(lTemperatureCelsius - 50) > 0.0001) or
+    (not ContainsText(lProviderName, 'TZ00')) then
+  begin
+    Writeln('SELFTEST FAILED: chassis temperature must skip CPU thermal zones');
+    Exit;
+  end;
 
   SetLength(lZones, 1);
   lZones[0].Available := True;
@@ -170,6 +178,13 @@ begin
       lTemperatureCelsius, lProviderName) then
   begin
     Writeln('SELFTEST FAILED: ambiguous ACPI thermal zone was mislabeled as CPU package');
+    Exit;
+  end;
+  SetLength(lZones, 0);
+  if TrySelectMachineOverviewChassisTemperature(lZones,
+      lTemperatureCelsius, lProviderName) then
+  begin
+    Writeln('SELFTEST FAILED: chassis temperature reported without thermal zones');
     Exit;
   end;
   Result := 0;
@@ -278,7 +293,7 @@ begin
   lProvider.Collect(lSample);
   if (lProvider.ProviderId <> 'temperature') or
     (lSample.State.CapturedAtMonotonicMs = 0) or
-    (Length(lSample.Measurements) <> 3) then
+    (Length(lSample.Measurements) <> 4) then
   begin
     Writeln('SELFTEST FAILED: live optional temperature provider did not degrade safely');
     Exit;
@@ -370,7 +385,7 @@ begin
   BuildMachineOverviewTemperatureSample(lProbe, 1, 1000, 3000, lCache,
     lSample);
   if (lSample.State.Status <> TMachineOverviewProviderStatus.Unavailable) or
-    (Length(lSample.Measurements) <> 3) then
+    (Length(lSample.Measurements) <> 4) then
   begin
     Writeln('SELFTEST FAILED: missing optional runtime did not degrade explicitly');
     Exit;

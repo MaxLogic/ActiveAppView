@@ -291,7 +291,11 @@ begin
   SetLength(aPresentation.Rows, lIndex + 1);
   aPresentation.Rows[lIndex].RowId := aRowId;
   aPresentation.Rows[lIndex].Category := aCategory;
-  aPresentation.Rows[lIndex].LabelText := aLabelText;
+  // '*' tells the user that Enter opens more detail for this row
+  if aAction = TMachineOverviewAction.None then
+    aPresentation.Rows[lIndex].LabelText := aLabelText
+  else
+    aPresentation.Rows[lIndex].LabelText := aLabelText + '*';
   aPresentation.Rows[lIndex].ValueText := aValueText;
   aPresentation.Rows[lIndex].Severity := aSeverity;
   aPresentation.Rows[lIndex].Action := aAction;
@@ -333,8 +337,6 @@ end;
 
 function BuildCpuText(
   const aSource: TMachineOverviewPresentationSource): string;
-var
-  lTemperature: TMachineOverviewMeasurement;
 begin
   if not aSource.CpuAggregate.NowValue.Available then
     Exit('Unavailable; CPU provider has no current sample');
@@ -345,15 +347,34 @@ begin
      WindowText('5 s', aSource.CpuAggregate.Window5Seconds),
      WindowText('15 s', aSource.CpuAggregate.Window15Seconds),
      WindowText('60 s', aSource.CpuAggregate.Window60Seconds)]);
-  if TryFindMeasurement(aSource.Measurements, 'cpu_package_temperature_c',
-    lTemperature) and lTemperature.Available then
-  begin
-    Result := Result + '; package temperature ' +
-      InvariantFormat('0.#', lTemperature.Value) + ' C';
-    if not lTemperature.StatusText.IsEmpty then
-      Result := Result + ' (' + lTemperature.StatusText + ')';
-  end else
-    Result := Result + '; package temperature Unavailable';
+end;
+
+function TemperatureText(const aSource: TMachineOverviewPresentationSource;
+  const aCaption, aName: string): string;
+var
+  lMeasurement: TMachineOverviewMeasurement;
+begin
+  if not TryFindMeasurement(aSource.Measurements, aName, lMeasurement) then
+    Exit(aCaption + ' Unavailable');
+  if lMeasurement.Available then
+    Result := aCaption + ' ' + InvariantFormat('0.#', lMeasurement.Value) + ' C'
+  else
+    Result := aCaption + ' Unavailable';
+  if not lMeasurement.StatusText.IsEmpty then
+    Result := Result + ' (' + lMeasurement.StatusText + ')';
+end;
+
+function BuildTemperaturesText(
+  const aSource: TMachineOverviewPresentationSource): string;
+var
+  lState: TMachineOverviewProviderState;
+begin
+  Result := TemperatureText(aSource, 'CPU', 'cpu_package_temperature_c') +
+    '; ' + TemperatureText(aSource, 'GPU', 'gpu_temperature_c') + '; ' +
+    TemperatureText(aSource, 'chassis', 'chassis_temperature_c');
+  if TryFindProviderState(aSource.ProviderStates, 'temperature', lState) then
+    Result := Result + '; provider ' + LowerCase(ProviderStatusText(
+      lState.Status)) + '; age ' + FormatAge(lState.DataAgeMs);
 end;
 
 function TopProcessName(const aSource: TMachineOverviewPresentationSource;
@@ -409,15 +430,6 @@ begin
      MeasurementPercent(aSource, 'gpu_average_60s'),
      MeasurementPercent(aSource, 'gpu_peak_60s'),
      MeasurementBytes(aSource, 'gpu_dedicated_bytes')]);
-  if TryFindMeasurement(aSource.Measurements, 'gpu_temperature_c',
-    lMeasurement) and lMeasurement.Available then
-  begin
-    Result := Result + '; temperature ' + InvariantFormat('0.#',
-      lMeasurement.Value) + ' C';
-    if not lMeasurement.StatusText.IsEmpty then
-      Result := Result + ' (' + lMeasurement.StatusText + ')';
-  end else
-    Result := Result + '; temperature Unavailable';
   if TryFindMeasurement(aSource.Measurements, 'gpu_power_w',
     lMeasurement) and lMeasurement.Available then
     Result := Result + '; power ' + InvariantFormat('0.#',
@@ -427,10 +439,6 @@ begin
       lState.Status)) + '; age ' + FormatAge(lState.DataAgeMs)
   else
     Result := Result + '; provider status Unavailable';
-  if TryFindProviderState(aSource.ProviderStates, 'temperature', lState) then
-    Result := Result + '; optional temperature provider ' +
-      LowerCase(ProviderStatusText(lState.Status)) + '; age ' +
-      FormatAge(lState.DataAgeMs);
 end;
 
 function BuildResponsivenessText(
@@ -913,6 +921,15 @@ begin
     lSeverity := TMachineOverviewSeverity.Unavailable;
   AddRow(Result, 'gpu', 'System', 'GPU', BuildGpuText(aSource), lSeverity,
     TMachineOverviewAction.None);
+  lSeverity := TMachineOverviewSeverity.Unavailable;
+  for lMeasurement in aSource.Measurements do
+    if lMeasurement.Available and (SameText(lMeasurement.Name,
+        'cpu_package_temperature_c') or SameText(lMeasurement.Name,
+        'gpu_temperature_c') or SameText(lMeasurement.Name,
+        'chassis_temperature_c')) then
+      lSeverity := TMachineOverviewSeverity.Normal;
+  AddRow(Result, 'temperatures', 'System', 'Temperatures',
+    BuildTemperaturesText(aSource), lSeverity, TMachineOverviewAction.None);
   if TryFindMeasurement(aSource.Measurements, 'foreground_reply_ms',
       lMeasurement) and lMeasurement.Available then
     lSeverity := TMachineOverviewSeverity.Normal
