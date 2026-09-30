@@ -1639,9 +1639,15 @@ begin
 end;
 
 function RunSystemProviderLiveSelfTest: Integer;
+const
+  cCoverageDiagnostics: array[0..5] of string =
+    ('paging_bytes_per_sec', 'paging_bytes_per_sec_peak_60s',
+     'foreground_reply_ms', 'foreground_reply_max_60s',
+     'dpc_percent', 'dpc_percent_max_60s');
 var
   g: TGarbos;
   lCollectStartedMs: UInt64;
+  lDiagnosticName: string;
   lExpectedLogicalCount: Cardinal;
   lMeasurement: TMachineOverviewMeasurement;
   lProvider: IMachineOverviewProvider;
@@ -1740,6 +1746,18 @@ begin
     (not ContainsText(lMeasurement.StatusText, 'coverage')) then
   begin
     Writeln('SELFTEST FAILED: Windows rolling coverage status is missing');
+    Writeln(Format('SELFTEST DIAGNOSTIC: provider_status=%d; provider_error=%s; second_collect_ms=%d',
+      [Ord(lSample.State.Status), lSample.State.ErrorText,
+       GetTickCount64 - lCollectStartedMs]));
+    for lDiagnosticName in cCoverageDiagnostics do
+      if TryFindSystemProviderMeasurement(lSample, lDiagnosticName,
+        lMeasurement) then
+        Writeln(Format('SELFTEST DIAGNOSTIC: %s available=%d status=%s',
+          [lDiagnosticName, Ord(lMeasurement.Available),
+           lMeasurement.StatusText]))
+      else
+        Writeln('SELFTEST DIAGNOSTIC: missing measurement ' +
+          lDiagnosticName);
     Exit;
   end;
 
@@ -1825,6 +1843,7 @@ var
   g: TGarbos;
   lDeadlineMs: UInt64;
   lDatabaseFileName: string;
+  lInitialSequence: UInt64;
   lLatestSequence: UInt64;
   lPresentation: TMachineOverviewPresentation;
   lSawMergedPresentation: Boolean;
@@ -1867,6 +1886,7 @@ begin
     Exit;
   end;
   lLatestSequence := lPresentation.Sequence;
+  lInitialSequence := lLatestSequence;
   lSawMergedPresentation := False;
   lDeadlineMs := GetTickCount64 + 5000;
   repeat
@@ -1890,6 +1910,20 @@ begin
   if not lSawMergedPresentation then
   begin
     Writeln('SELFTEST FAILED: enabled service did not retain and merge all provider snapshots');
+    Writeln(Format('SELFTEST DIAGNOSTIC: initial_sequence=%d; final_sequence=%d; active_workers=%d',
+      [lInitialSequence, lLatestSequence, lService.ActiveWorkerCount]));
+    if not ContainsText(lPresentation.DiagnosticText, 'windows-core:') then
+      Writeln('SELFTEST DIAGNOSTIC: missing provider windows-core');
+    if not ContainsText(lPresentation.DiagnosticText, 'disks:') then
+      Writeln('SELFTEST DIAGNOSTIC: missing provider disks');
+    if not ContainsText(lPresentation.DiagnosticText, 'gpu:') then
+      Writeln('SELFTEST DIAGNOSTIC: missing provider gpu');
+    if not ContainsText(lPresentation.DiagnosticText, 'processes:') then
+      Writeln('SELFTEST DIAGNOSTIC: missing provider processes');
+    if not ContainsText(lPresentation.DiagnosticText, 'temperature:') then
+      Writeln('SELFTEST DIAGNOSTIC: missing provider temperature');
+    Writeln('SELFTEST DIAGNOSTIC: final presentation follows');
+    Writeln(lPresentation.DiagnosticText);
     Exit;
   end;
   if lService.Stop(2000) <> TMachineOverviewShutdownResult.Stopped then
