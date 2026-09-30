@@ -979,7 +979,9 @@ var
   lIndex: Integer;
 begin
   lIndex := 1;
-  while (lIndex <= Length(aCaption)) and IsCodexWorkingPrefixChar(aCaption[lIndex]) do
+  while (lIndex <= Length(aCaption)) and
+    (IsCodexWorkingPrefixChar(aCaption[lIndex]) or
+     (aCaption[lIndex] = Char($2733)) or (aCaption[lIndex] = Char($2731))) do
     Inc(lIndex);
 
   Result := TrimLeft(Copy(aCaption, lIndex, MaxInt));
@@ -4481,6 +4483,18 @@ begin
       if NormalizeConsoleSortCaption(Char($280F) + Char($2839) + '  ActiveAppView') <> 'ActiveAppView' then
       begin
         Writeln('SELFTEST FAILED: console sort normalizer did not strip Codex working prefix');
+        Result := 1;
+      end;
+
+      lItems.Clear;
+      lTitle := Char($2733) + ' Alpha';
+      lItems.AddObject('Bravo', TObject(2));
+      lItems.AddObject(lTitle, TObject(1));
+      SortConsoleItems(lItems);
+      if (lItems[0] <> lTitle) or (lItems.Objects[0] <> TObject(1)) or
+        (NormalizeConsoleSortCaption(Char($2731) + ' Claude Code') <> 'Claude Code') then
+      begin
+        Writeln('SELFTEST FAILED: console sort did not ignore Claude activity prefix');
         Result := 1;
       end;
 
