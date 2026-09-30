@@ -27,6 +27,9 @@ type
     Wnd: hWnd;
   end;
 
+  TListSyncStageTicks = array[0..4] of Int64;
+  PListSyncStageTicks = ^TListSyncStageTicks;
+
   TAppsViewMainFrm = class(TForm)
     lbApps: TListBox;
     pnlApps: TPanel;
@@ -130,6 +133,9 @@ type
     fWindowBatch: TWindowSnapshotBatch;
     // PIDs of the windows listed by the previous refresh; they identify vanished rows.
     fWindowPids: TDictionary<hWnd, Cardinal>;
+    fCaptureGuiApplyStages: Boolean;
+    fGuiApplyStageTicks: array[0..3] of Int64;
+    fGuiAppsSyncStageTicks: TListSyncStageTicks;
     fAuxListRefresh: iAsync;
     fHarnessChanges: THarnessChanges;
     fHarnessSetup: iAsync;
@@ -2455,7 +2461,8 @@ begin
 end;
 
 function SynchronizeListItems(const aListBox: TListBox; const aDesired: TStrings;
-  const aOwnsData: Boolean = False; const aGroupOf: TListRowGroupFunc = nil): TListSyncOutcome;
+  const aOwnsData: Boolean = False; const aGroupOf: TListRowGroupFunc = nil;
+  const aStageTicks: PListSyncStageTicks = nil): TListSyncOutcome;
 var
   lCounts: TDictionary<string, Integer>;
   lCount: Integer;
@@ -2472,6 +2479,8 @@ var
   lEqual: Boolean;
   i, j: Integer;
 begin
+  if Assigned(aStageTicks) then
+    aStageTicks^[0] := TStopwatch.GetTimeStamp;
   Result := Default(TListSyncOutcome);
   lEqual := aListBox.Items.Count = aDesired.Count;
   if lEqual then
@@ -2526,6 +2535,8 @@ begin
           aListBox.Items.Delete(i);
         end;
       end;
+      if Assigned(aStageTicks) then
+        aStageTicks^[1] := TStopwatch.GetTimeStamp;
       for i := 0 to aDesired.Count - 1 do
       begin
         lKey := ListRowKey(aDesired, i, aOwnsData);
@@ -2550,6 +2561,8 @@ begin
           aListBox.Items.InsertObject(i, aDesired[i], lData);
         end;
       end;
+      if Assigned(aStageTicks) then
+        aStageTicks^[2] := TStopwatch.GetTimeStamp;
       lSelectedIndex := -1;
       lTopIndex := -1;
       for i := 0 to aListBox.Items.Count - 1 do
@@ -2569,8 +2582,12 @@ begin
         lTopIndex := lOldTop;
       if (lTopIndex >= 0) and (lTopIndex < aListBox.Items.Count) then
         aListBox.TopIndex := lTopIndex;
+      if Assigned(aStageTicks) then
+        aStageTicks^[3] := TStopwatch.GetTimeStamp;
     finally
       aListBox.Items.EndUpdate;
+      if Assigned(aStageTicks) then
+        aStageTicks^[4] := TStopwatch.GetTimeStamp;
     end;
   finally
     lCounts.Free;
@@ -3757,7 +3774,13 @@ var
   lObservedList: TObservedListBox;
   lDetailWatch: TStopwatch;
   lMaxApplyMs: Double;
+  lFirstApplyMs: Double;
+  lLaterMaxApplyMs: Double;
   lApplyMs: Double;
+  lStageMs: array[0..2] of Double;
+  lStageIndex: Integer;
+  lSyncStageMs: array[0..3] of Double;
+  lSyncStageIndex: Integer;
   lNamedItems: TNamedValueArray;
   lOwnedData: TObject;
   lSample: Integer;
@@ -4072,6 +4095,7 @@ begin
     lTestForm := TAppsViewMainFrm.CreateNew(nil);
     try
       lTestForm.lbApps := TListBox.Create(lTestForm);
+      lTestForm.lbApps.Sorted := True;
       lTestForm.lbApps.Parent := lTestForm;
       lTestForm.pnlAppDetails := TPanel.Create(lTestForm);
       lTestForm.imgAppScreenshot := TImage.Create(lTestForm);
@@ -4126,22 +4150,53 @@ begin
         lTestForm.fWindowBatch.Windows[lIndex].FileName := 'fixture.exe';
       end;
       lMaxApplyMs := 0;
+      lFirstApplyMs := 0;
+      lLaterMaxApplyMs := 0;
+      lTestForm.fCaptureGuiApplyStages := True;
       for lSample := 1 to 30 do
       begin
         lDetailWatch := TStopwatch.StartNew;
         lTestForm.UpdateGui;
         lApplyMs := lDetailWatch.Elapsed.TotalMilliseconds;
+        if lSample = 1 then
+        begin
+          Writeln(Format('GUI FIXTURE sorted=%d', [Ord(lTestForm.lbApps.Sorted)]));
+          for lSyncStageIndex := 0 to High(lSyncStageMs) do
+            lSyncStageMs[lSyncStageIndex] := (lTestForm.fGuiAppsSyncStageTicks[lSyncStageIndex + 1] -
+              lTestForm.fGuiAppsSyncStageTicks[lSyncStageIndex]) * 1000 / TStopwatch.Frequency;
+          Writeln(Format('GUI APPS SYNC sample=1 prepare=%.3f insert=%.3f restore=%.3f end=%.3f',
+            [lSyncStageMs[0], lSyncStageMs[1], lSyncStageMs[2], lSyncStageMs[3]]));
+        end;
+        for lStageIndex := 0 to High(lStageMs) do
+          lStageMs[lStageIndex] := (lTestForm.fGuiApplyStageTicks[lStageIndex + 1] -
+            lTestForm.fGuiApplyStageTicks[lStageIndex]) * 1000 / TStopwatch.Frequency;
+        if (lSample <= 3) or (lApplyMs > 100) then
+          Writeln(Format('GUI STAGES sample=%d prepare=%.3f apps=%.3f rest=%.3f',
+            [lSample, lStageMs[0], lStageMs[1], lStageMs[2]]));
         if lSample <= 3 then
           Writeln(Format('GUI APPLY sample=%d ms=%.3f', [lSample, lApplyMs]));
+        if lSample = 1 then
+          lFirstApplyMs := lApplyMs
+        else if lApplyMs > lLaterMaxApplyMs then
+          lLaterMaxApplyMs := lApplyMs;
         if (lSample = 1) or (lApplyMs > lMaxApplyMs) then
           lMaxApplyMs := lApplyMs;
       end;
+      Writeln(Format('GUI APPLY first-ms=%.3f later-max-ms=%.3f', [lFirstApplyMs, lLaterMaxApplyMs]));
       Writeln(Format('GUI APPLY windows=500 samples=30 max-ms=%.3f', [lMaxApplyMs]));
       if (lMaxApplyMs > 100) or (lTestForm.lbApps.Items.Count <> 500) then
       begin
         Writeln('SELFTEST FAILED: snapshot rendering exceeded the GUI budget or lost rows');
         Result := 1;
       end;
+      if lTestForm.lbApps.Items.Count = 500 then
+        for lIndex := 0 to High(lTestForm.fWindowBatch.Windows) do
+          if NativeUInt(lTestForm.lbApps.Items.Objects[lIndex]) <> NativeUInt(lIndex + 1) then
+          begin
+            Writeln(Format('SELFTEST FAILED: 500-window GUI row identity/order changed at index %d', [lIndex]));
+            Result := 1;
+            Break;
+          end;
     finally
       lTestForm.Free;
     end;
@@ -5806,6 +5861,8 @@ var
   lTitle: string;
   lIsTerminal: Boolean;
 begin
+  if fCaptureGuiApplyStages then
+    fGuiApplyStageTicks[0] := TStopwatch.GetTimeStamp;
   if IsShuttingDown then
     Exit;
   ApplyLoadedWindowCaptionOverrideState;
@@ -5857,7 +5914,14 @@ begin
         lApps.AddObject(lTitle, TObject(lApp.Wnd));
     end;
     SortConsoleItems(lConsole);
-    lAppsOutcome := SynchronizeListItems(lbApps, lApps, False, lGroupOf);
+    if fCaptureGuiApplyStages then
+      fGuiApplyStageTicks[1] := TStopwatch.GetTimeStamp;
+    if fCaptureGuiApplyStages and (lbApps.Items.Count <> lApps.Count) then
+      lAppsOutcome := SynchronizeListItems(lbApps, lApps, False, lGroupOf, @fGuiAppsSyncStageTicks)
+    else
+      lAppsOutcome := SynchronizeListItems(lbApps, lApps, False, lGroupOf);
+    if fCaptureGuiApplyStages then
+      fGuiApplyStageTicks[2] := TStopwatch.GetTimeStamp;
     lConsoleOutcome := SynchronizeListItems(lbConsole, lConsole, False, lGroupOf);
     lExplorerOutcome := SynchronizeListItems(lbExplorer, lExplorer, False, lGroupOf);
     TraceWindowListSync(Self, lbApps, lAppsOutcome, lPids);
@@ -5872,6 +5936,8 @@ begin
     lExplorer.Free;
     lConsole.Free;
     lApps.Free;
+    if fCaptureGuiApplyStages then
+      fGuiApplyStageTicks[3] := TStopwatch.GetTimeStamp;
   end;
 end;
 
