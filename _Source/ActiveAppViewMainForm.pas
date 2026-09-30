@@ -987,6 +987,7 @@ begin
   lIndex := 1;
   while (lIndex <= Length(aCaption)) and
     (IsCodexWorkingPrefixChar(aCaption[lIndex]) or
+     ((Ord(aCaption[lIndex]) >= $25D0) and (Ord(aCaption[lIndex]) <= $25D3)) or
      (aCaption[lIndex] = Char($2733)) or (aCaption[lIndex] = Char($2731))) do
     Inc(lIndex);
 
@@ -4551,6 +4552,20 @@ begin
       begin
         Writeln('SELFTEST FAILED: console sort did not ignore Claude activity prefix');
         Result := 1;
+      end;
+
+      for lIndex := $25D0 to $25D3 do
+      begin
+        lItems.Clear;
+        lTitle := Char(lIndex) + ' better auth';
+        lItems.AddObject('Command Prompt', TObject(2));
+        lItems.AddObject(lTitle, TObject(1));
+        SortConsoleItems(lItems);
+        if (lItems[0] <> lTitle) or (lItems.Objects[0] <> TObject(1)) then
+        begin
+          Writeln(Format('SELFTEST FAILED: console sort did not ignore Claude working prefix U+%.4x', [lIndex]));
+          Result := 1;
+        end;
       end;
 
       lItems.Clear;
