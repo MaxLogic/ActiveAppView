@@ -351,6 +351,7 @@ begin
       lOutput.AddPair('state', cStateNames[lState]);
       lOutput.AddPair('event', lInput.GetValue<string>('hook_event_name', ''));
       lOutput.AddPair('cwd', lInput.GetValue<string>('cwd', ''));
+      lOutput.AddPair('transcript_path', lInput.GetValue<string>('transcript_path', ''));
       lOutput.AddPair('updated', DateToISO8601(TTimeZone.Local.ToUniversalTime(Now), True));
       lOutput.AddPair('anchor', ChainEntryToJson(SelectAnchor(aChain)));
       lChainJson := TJSONArray.Create;
@@ -407,6 +408,135 @@ begin
   end;
 end;
 
+function FindCodexTranscript(aJson: TJSONValue): string;
+var
+  lDate: TDateTime;
+  lDirectory: string;
+  lFiles: TArray<string>;
+  lHome: string;
+  lMilliseconds: Int64;
+  lSession: string;
+  i: Integer;
+begin
+  Result := JsonText(aJson, 'transcript_path');
+  lSession := JsonText(aJson, 'session');
+  if Result <> '' then
+  begin
+    if not EndsText('-' + lSession + '.jsonl', Result) then
+      Result := '';
+    Exit;
+  end;
+  // Older hook files lack a path. UUIDv7 identifies the session creation day,
+  // so we can find its rollout without walking the entire session archive.
+  if (Length(lSession) <> 36) or (SafeFilePart(lSession) <> lSession) or
+    (lSession[15] <> '7') or
+    not TryStrToInt64('$' + Copy(lSession, 1, 8) + Copy(lSession, 10, 4), lMilliseconds) or
+    (lMilliseconds < 0) or (lMilliseconds > 253402214400000) then
+    Exit;
+  lHome := GetEnvironmentVariable('CODEX_HOME');
+  if lHome = '' then
+    lHome := TPath.Combine(GetEnvironmentVariable('USERPROFILE'), '.codex');
+  lDate := UnixToDateTime(lMilliseconds div 1000, True);
+  try
+    for i := 0 to 1 do
+    begin
+      lDirectory := TPath.Combine(TPath.Combine(lHome, 'sessions'), FormatDateTime('yyyy\mm\dd', lDate));
+      if TDirectory.Exists(lDirectory) then
+      begin
+        lFiles := TDirectory.GetFiles(lDirectory, 'rollout-*-' + lSession + '.jsonl');
+        if Length(lFiles) = 1 then
+          Exit(lFiles[0]);
+      end;
+      if i = 0 then
+        lDate := TTimeZone.Local.ToLocalTime(lDate);
+    end;
+  except
+    // Missing or inaccessible session directories leave the hook state intact.
+    on EInOutError do
+      Exit('');
+    on EOSError do
+      Exit('');
+  end;
+end;
+
+function CodexTranscriptTail(const aFileName: string): string;
+const
+  cMaxTailBytes = 256 * 1024;
+var
+  lBytes: TBytes;
+  lOffset: Int64;
+  lSize: Int64;
+  lStream: TFileStream;
+begin
+  Result := '';
+  try
+    lStream := TFileStream.Create(aFileName, fmOpenRead or fmShareDenyNone);
+    try
+      lSize := lStream.Size;
+      lOffset := lSize - cMaxTailBytes;
+      if lOffset < 0 then
+        lOffset := 0;
+      lStream.Position := lOffset;
+      SetLength(lBytes, lSize - lOffset);
+      if Length(lBytes) = 0 then
+        Exit;
+      lStream.ReadBuffer(lBytes[0], Length(lBytes));
+    finally
+      lStream.Free;
+    end;
+  except
+    // A live writer may replace or truncate the rollout. Retry on the next poll.
+    on EStreamError do
+      Exit;
+  end;
+  // Do not let an older completion win while a newer record is half-written.
+  if lBytes[High(lBytes)] <> 10 then
+    Exit;
+  Result := TEncoding.UTF8.GetString(lBytes);
+  if lOffset > 0 then
+    Delete(Result, 1, Pos(#10, Result));
+end;
+
+function TryCodexTranscriptState(const aFileName, aUpdated: string; out aState: TAgentState): Boolean;
+var
+  lEvent: string;
+  lEventDate: TDateTime;
+  lHookDate: TDateTime;
+  lJson: TJSONValue;
+  lLines: TArray<string>;
+  i: Integer;
+begin
+  Result := False;
+  aState := asNone;
+  if (aFileName = '') or not TryISO8601ToDate(aUpdated, lHookDate, True) then
+    Exit;
+  lLines := CodexTranscriptTail(aFileName).Split([#10]);
+  for i := High(lLines) downto 0 do
+  begin
+    if Trim(lLines[i]) = '' then
+      Continue;
+    lJson := TJSONObject.ParseJSONValue(lLines[i]);
+    try
+      if not (lJson is TJSONObject) then
+        Exit;
+      if JsonText(lJson, 'type') <> 'event_msg' then
+        Continue;
+      lEvent := JsonText(lJson, 'payload.type');
+      if (lEvent <> 'task_started') and (lEvent <> 'task_complete') and (lEvent <> 'turn_aborted') then
+        Continue;
+      if not TryISO8601ToDate(JsonText(lJson, 'timestamp'), lEventDate, True) or (lEventDate <= lHookDate) then
+        Exit;
+      if lEvent = 'task_started' then
+        aState := asWorking
+      else
+        aState := asIdle;
+      Exit(True);
+    finally
+      lJson.Free;
+    end;
+  end;
+end;
+
 function ReadAgentStateFiles(const aStateDir: string): TArray<TAgentStateRecord>;
 var
   lFileName: string;
@@ -414,6 +544,7 @@ var
   lJson: TJSONValue;
   lList: TList<TAgentStateRecord>;
   lRecord: TAgentStateRecord;
+  lTranscriptState: TAgentState;
   lValue: TJSONValue;
 begin
   if not TDirectory.Exists(aStateDir) then
@@ -437,6 +568,9 @@ begin
         lRecord := Default(TAgentStateRecord);
         lRecord.FileName := lFileName;
         lRecord.State := StateFromName(lJson.GetValue<string>('state', ''));
+        if SameText(JsonText(lJson, 'harness'), 'codex') and
+          TryCodexTranscriptState(FindCodexTranscript(lJson), JsonText(lJson, 'updated'), lTranscriptState) then
+          lRecord.State := lTranscriptState;
         lRecord.Anchor := JsonToChainEntry(TJSONObject(lJson).GetValue('anchor'));
         lValue := TJSONObject(lJson).GetValue('chain');
         if lValue is TJSONArray then
@@ -590,6 +724,101 @@ begin
     raise Exception.Create(aMessage);
 end;
 
+procedure TestCodexCompletionFallback(const aDir: string);
+const
+  cComplete = '{"timestamp":"2026-10-04T05:08:06.098Z","type":"event_msg","payload":' +
+    '{"type":"task_complete","last_agent_message":null,"error":{"codex_error_info":"cyber_policy"}}}';
+  cStarted = '{"timestamp":"2026-10-04T05:09:00.000Z","type":"event_msg","payload":{"type":"task_started"}}';
+var
+  lHookDir: string;
+  lHome: string;
+  lInput: TJSONObject;
+  lJson: TJSONObject;
+  lRecords: TArray<TAgentStateRecord>;
+  lSessionDir: string;
+  lStateFile: string;
+  lTranscript: string;
+
+  procedure CheckState(const aText: string; const aExpected: TAgentState; const aMessage: string);
+  begin
+    TFile.WriteAllText(lTranscript, aText, TEncoding.UTF8);
+    lRecords := ReadAgentStateFiles(lHookDir);
+    Check((Length(lRecords) = 1) and (lRecords[0].State = aExpected), aMessage);
+  end;
+
+begin
+  lHookDir := TPath.Combine(aDir, 'completion');
+  lTranscript := TPath.Combine(lHookDir, 'rollout-fallback.jsonl');
+  lInput := TJSONObject.Create;
+  try
+    lInput.AddPair('session_id', 'fallback');
+    lInput.AddPair('hook_event_name', 'PostToolUse');
+    lInput.AddPair('transcript_path', lTranscript);
+    Check(WriteAgentHookState('codex', lInput.ToJSON, lHookDir,
+      [TestEntry(41, 800, 'codex.exe'), TestEntry(600, 600, 'alacritty.exe')]), 'Fallback hook fixture failed');
+  finally
+    lInput.Free;
+  end;
+  lStateFile := TPath.Combine(lHookDir, 'codex-fallback.json');
+  lJson := TJSONObject.ParseJSONValue(TFile.ReadAllText(lStateFile)) as TJSONObject;
+  try
+    Check(JsonText(lJson, 'transcript_path') = lTranscript, 'The hook must retain its transcript path');
+    lJson.RemovePair('updated').Free;
+    lJson.AddPair('updated', '2026-10-04T05:06:33.845Z');
+    TFile.WriteAllText(lStateFile, lJson.ToJSON, TEncoding.UTF8);
+  finally
+    lJson.Free;
+  end;
+  CheckState(cComplete + #10, asIdle, 'A cyber_policy completion must clear a stale working hook');
+  CheckState(cComplete + #10 + cStarted + #10, asWorking, 'A subsequent turn must restore working');
+  CheckState(StringReplace(cComplete, '05:08:06.098', '05:05:00.000', []) + #10,
+    asWorking, 'An older completion must not override a newer hook');
+  CheckState(cComplete + #10 + '{"timestamp":', asWorking, 'A partial latest record must preserve the hook');
+  CheckState(cComplete + #10 + 'invalid json' + #10, asWorking, 'Malformed latest input must preserve the hook');
+  CheckState(StringReplace(cComplete, 'task_complete', 'turn_aborted', []) + #10,
+    asIdle, 'An aborted turn must clear a stale working hook');
+  CheckState(StringOfChar('x', 300 * 1024) + #10 + cComplete + #10,
+    asIdle, 'A large transcript must resolve from its bounded tail');
+  CheckState(cComplete + #10 + '{"type":"event_msg","payload":{"type":"token_count","padding":"' +
+    StringOfChar('x', 300 * 1024) + '"}}' + #10, asWorking,
+    'A completion outside the read limit must preserve the hook');
+  TFile.Delete(lTranscript);
+  lRecords := ReadAgentStateFiles(lHookDir);
+  Check((Length(lRecords) = 1) and (lRecords[0].State = asWorking), 'A missing transcript must preserve the hook');
+  lHome := GetEnvironmentVariable('CODEX_HOME');
+  try
+    SetEnvironmentVariable('CODEX_HOME', PChar(lHookDir));
+    lSessionDir := TPath.Combine(lHookDir, 'sessions\2026\10\02');
+    ForceDirectories(lSessionDir);
+    lTranscript := TPath.Combine(lSessionDir, 'rollout-2026-10-02T22-20-35-01a0fe46-99c0-7650-8f66-94983191d8a7.jsonl');
+    lJson := TJSONObject.ParseJSONValue(TFile.ReadAllText(lStateFile)) as TJSONObject;
+    try
+      lJson.RemovePair('session').Free;
+      lJson.AddPair('session', '01a0fe46-99c0-7650-8f66-94983191d8a7');
+      lJson.RemovePair('transcript_path').Free;
+      TFile.WriteAllText(lStateFile, lJson.ToJSON, TEncoding.UTF8);
+    finally
+      lJson.Free;
+    end;
+    CheckState(cComplete + #10, asIdle, 'A legacy hook must find its own session rollout');
+    lJson := TJSONObject.ParseJSONValue(TFile.ReadAllText(lStateFile)) as TJSONObject;
+    try
+      lJson.RemovePair('transcript_path').Free;
+      lJson.AddPair('transcript_path', TPath.Combine(lSessionDir, 'rollout-other-session.jsonl'));
+      TFile.WriteAllText(JsonText(lJson, 'transcript_path'), cComplete + #10, TEncoding.UTF8);
+      TFile.WriteAllText(lStateFile, lJson.ToJSON, TEncoding.UTF8);
+    finally
+      lJson.Free;
+    end;
+    CheckState(cComplete + #10, asWorking, 'A different session path must not override the hook');
+  finally
+    if lHome = '' then
+      SetEnvironmentVariable('CODEX_HOME', nil)
+    else
+      SetEnvironmentVariable('CODEX_HOME', PChar(lHome));
+  end;
+end;
+
 function RunAgentStateSelfTests(const aArg: string): Integer;
 var
   lChain: TArray<TAgentChainEntry>;
@@ -700,6 +929,7 @@ begin
 
       Check(WriteAgentHookState('claude', '{"session_id":"s-1","hook_event_name":"SessionEnd"}', lDir, lChain) and
         (Length(ReadAgentStateFiles(lDir)) = 1), 'SessionEnd must remove the state file');
+      TestCodexCompletionFallback(lDir);
       Writeln('AGENT STATE PASS');
     except
       on lException: Exception do
