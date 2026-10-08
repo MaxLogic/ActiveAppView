@@ -117,6 +117,21 @@ object AppsViewMainFrm: TAppsViewMainFrm
       TabOrder = 1
       OnClick = chkChatNotificationSoundClick
     end
+    object cbAppsFilter: TComboBox
+      AlignWithMargins = True
+      Top = 75
+      Align = alTop
+      Style = csDropDownList
+      Height = 29
+      ItemIndex = 0
+      TabOrder = 2
+      Text = 'All (Ctrl+1)'
+      OnChange = AppsFilterChange
+      Items.Strings = (
+        'All (Ctrl+1)'
+        'New messages (Ctrl+2)'
+        'Non-responsive (Ctrl+3)')
+    end
     object lbApps: TListBox
       AlignWithMargins = True
       Left = 33
@@ -126,7 +141,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Align = alClient
       ItemHeight = 21
       Sorted = True
-      TabOrder = 2
+      TabOrder = 3
       OnClick = lbAppsClick
       OnDblClick = lbAppsDblClick
       OnKeyUp = lbAppsKeyUp
@@ -142,7 +157,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Color = clBlack
       ParentBackground = False
       ShowCaption = False
-      TabOrder = 3
+      TabOrder = 4
     end
     object pnlAppsFocusRight: TPanel
       AlignWithMargins = True
@@ -155,7 +170,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Color = clBlack
       ParentBackground = False
       ShowCaption = False
-      TabOrder = 4
+      TabOrder = 5
     end
     object pnlAppDetails: TPanel
       AlignWithMargins = True
@@ -168,7 +183,7 @@ object AppsViewMainFrm: TAppsViewMainFrm
       Color = clWindow
       ParentBackground = False
       ShowCaption = False
-      TabOrder = 5
+      TabOrder = 6
       object imgAppScreenshot: TImage
         AlignWithMargins = True
         Left = 4
@@ -537,7 +552,8 @@ object AppsViewMainFrm: TAppsViewMainFrm
         'Idle Codex/Claude (Ctrl+2)'
         'Working Codex/Claude (Ctrl+3)'
         'Action required (Codex/Claude) (Ctrl+4)'
-        'Non Codex/Claude (Ctrl+5)')
+        'Non Codex/Claude (Ctrl+5)'
+        'Non-responsive (Ctrl+6)')
     end
     object lbConsole: TListBox
       AlignWithMargins = True

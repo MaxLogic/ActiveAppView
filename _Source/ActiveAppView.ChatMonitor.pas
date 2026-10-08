@@ -77,6 +77,7 @@ type
     constructor Create(aSettings: TMemIniFile);
     destructor Destroy; override;
 
+    function GetUnreadWindows: TArray<HWND>;
     procedure Process;
     procedure ProcessSnapshot(const aApps: TArray<TChatAppSnapshot>);
     procedure UseConfigCache(aConfigCache: TConfigCache);
@@ -556,8 +557,65 @@ begin
   end;
 end;
 
+function RunUnreadWindowsSelfTest: Integer;
+var
+  lApps: TArray<TChatAppSnapshot>;
+  lDir: string;
+  lIniFile: TMemIniFile;
+  lMaskFileName: string;
+  lMonitor: TChatMonitor;
+  lUnread: TArray<HWND>;
+begin
+  Result := 0;
+  lDir := TPath.Combine(TPath.GetTempPath, TPath.GetGUIDFileName);
+  TDirectory.CreateDirectory(lDir);
+  lMaskFileName := TPath.Combine(lDir, 'chat-mask.txt');
+  try
+    TFile.WriteAllText(lMaskFileName, 'caption=*Teams*', TEncoding.UTF8);
+    lIniFile := TMemIniFile.Create(TPath.Combine(lDir, 'settings.ini'), TEncoding.UTF8, False);
+    try
+      lIniFile.WriteBool('ChatMonitor', 'Enabled', True);
+      lIniFile.WriteBool('ChatMonitor', 'SoundEnabled', False);
+      lIniFile.WriteString('ChatMonitor', 'ReviewMaskFile', lMaskFileName);
+      lMonitor := TChatMonitor.Create(lIniFile);
+      try
+        SetLength(lApps, 3);
+        lApps[0].Wnd := 100;
+        lApps[0].Caption := 'Teams (3)';
+        lApps[1].Wnd := 101;
+        lApps[1].Caption := 'Teams (0)';
+        lApps[2].Wnd := 102;
+        lApps[2].Caption := '(123) YouTube';
+        lMonitor.ProcessSnapshot(lApps);
+        lUnread := lMonitor.GetUnreadWindows;
+        if (Length(lUnread) <> 1) or (lUnread[0] <> 100) then
+          raise Exception.Create('Unread snapshot did not reuse configured chat detection with sounds off');
+        lApps[0].Caption := 'Teams (0)';
+        lMonitor.ProcessSnapshot(lApps);
+        if Length(lMonitor.GetUnreadWindows) <> 0 then
+          raise Exception.Create('Read chat remained in unread snapshot');
+        Writeln('CHAT UNREAD SNAPSHOT PASS');
+      finally
+        lMonitor.Free;
+      end;
+    finally
+      lIniFile.Free;
+    end;
+  except
+    on lException: Exception do
+    begin
+      Writeln('SELFTEST FAILED: ' + lException.Message);
+      Result := 1;
+    end;
+  end;
+  TFile.Delete(lMaskFileName);
+  TDirectory.Delete(lDir);
+end;
+
 function RunChatMonitorSelfTests(const aArg: string): Integer;
 begin
+  if SameText(aArg, '--self-test-chat-unread-snapshot') then
+    Exit(RunUnreadWindowsSelfTest);
   Result := -1;
   if SameText(aArg, cUnreadCaptionSelfTestArg) then
   begin
@@ -1046,6 +1104,23 @@ begin
     end;
   end;
   Result := lMetadata;
+end;
+
+function TChatMonitor.GetUnreadWindows: TArray<HWND>;
+var
+  lCount: Integer;
+  lEntry: TPair<HWND, TMonitoredAppState>;
+begin
+  // Copy only after ProcessSnapshot completes; the form publishes this immutable result.
+  SetLength(Result, fMonitoredApps.Count);
+  lCount := 0;
+  for lEntry in fMonitoredApps do
+    if lEntry.Value.HasUnreadMessages then
+    begin
+      Result[lCount] := lEntry.Key;
+      Inc(lCount);
+    end;
+  SetLength(Result, lCount);
 end;
 
 procedure TChatMonitor.Process;

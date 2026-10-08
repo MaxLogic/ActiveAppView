@@ -19,7 +19,8 @@ uses
   ActiveAppViewCore, ActiveAppView.RenameJournal, ActiveAppView.WindowSnapshots;
 
 type
-  TConsoleFilter = (cfAll, cfIdle, cfWorking, cfActionRequired, cfNonAgent);
+  TConsoleFilter = (cfAll, cfIdle, cfWorking, cfActionRequired, cfNonAgent, cfNonResponsive);
+  TAppsFilter = (afAll, afNewMessages, afNonResponsive);
 
   TWindowActionTarget = record
     DisplayCaption: string;
@@ -65,6 +66,7 @@ type
     lbConsole: TListBox;
     btnSetupHarnesses: TButton;
     cbConsoleFilter: TComboBox;
+    cbAppsFilter: TComboBox;
     pnlConsoleFocusLeft: TPanel;
     pnlConsoleFocusRight: TPanel;
     pnlDesktop: TPanel;
@@ -100,6 +102,7 @@ type
     procedure FormCreate(Sender: TObject);
     procedure btnSetupHarnessesClick(Sender: TObject);
     procedure ConsoleFilterChange(Sender: TObject);
+    procedure AppsFilterChange(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure FormActivate(Sender: TObject);
     procedure lbAppsDblClick(Sender: TObject);
@@ -149,6 +152,8 @@ type
     fChatMonitorTask: iAsync;
     fConfigCache: TConfigCache;
     fConsoleFilter: TConsoleFilter;
+    fAppsFilter: TAppsFilter;
+    fUnreadWindows: TArray<HWND>;
     fConsoleFilterAnnouncer: TProc<TConsoleFilter>;
     fFocusSoundFileName: string;
     fFocusSoundPlayer: TProc<string>;
@@ -234,6 +239,8 @@ type
     procedure RefreshConsoleList;
     procedure SelectConsoleFilter(const aFilter: TConsoleFilter);
     procedure ShowHarnessSetupPlan;
+    function MatchesAppsFilter(const aWindow: TWindowSnapshot): Boolean;
+    procedure SelectAppsFilter(const aFilter: TAppsFilter);
     procedure SetConsoleFilter(const aFilter: TConsoleFilter);
     procedure RunAuxListsRefresh;
     procedure RunChatMonitorSnapshot;
@@ -3391,6 +3398,13 @@ procedure TAppsViewMainFrm.FormKeyUp(Sender: TObject; var Key: Word;
 var
   lMachineOverviewCommand: TMachineOverviewCommand;
 begin
+  if (ActiveControl = lbApps) and (Shift = [ssCtrl]) and
+    (Key >= Ord('1')) and (Key <= Ord('1') + Ord(High(TAppsFilter))) then
+  begin
+    SelectAppsFilter(TAppsFilter(Key - Ord('1')));
+    Key := 0;
+    Exit;
+  end;
   if (ActiveControl = lbConsole) and (Shift = [ssCtrl]) and
     (Key >= Ord('1')) and (Key <= Ord('1') + Ord(High(TConsoleFilter))) then
   begin
@@ -3726,6 +3740,12 @@ end;
 
 procedure TAppsViewMainFrm.OnChatMonitorDone;
 begin
+  if Assigned(fChatMonitor) and (not IsShuttingDown) then
+  begin
+    fUnreadWindows := fChatMonitor.GetUnreadWindows;
+    if fAppsFilter = afNewMessages then
+      UpdateGui;
+  end;
   SetLength(fChatMonitorSnapshot, 0);
   TInterlocked.Exchange(fChatMonitorBusy, 0);
   if (TInterlocked.Exchange(fChatMonitorPending, 0) = 1) and (not IsShuttingDown) then
@@ -3841,6 +3861,193 @@ var
   lWasPruned: Boolean;
 begin
   Result := -1;
+  if SameText(aArg, '--self-test-window-filters') then
+  begin
+    Result := 0;
+    lTestForm := TAppsViewMainFrm.CreateNew(nil);
+    try
+      try
+        lTestForm.lbApps := TListBox.Create(lTestForm);
+        lTestForm.lbApps.Parent := lTestForm;
+        lTestForm.lbExplorer := TListBox.Create(lTestForm);
+        lTestForm.lbExplorer.Parent := lTestForm;
+        lTestForm.lbConsole := TListBox.Create(lTestForm);
+        lTestForm.lbConsole.Parent := lTestForm;
+        lTestForm.cbAppsFilter := TComboBox.Create(lTestForm);
+        lTestForm.cbAppsFilter.Parent := lTestForm;
+        lTestForm.cbAppsFilter.Items.AddStrings(['All', 'New messages', 'Non-responsive']);
+        lTestForm.cbAppsFilter.ItemIndex := 0;
+        lTestForm.cbAppsFilter.OnChange := lTestForm.AppsFilterChange;
+        lTestForm.cbConsoleFilter := TComboBox.Create(lTestForm);
+        lTestForm.cbConsoleFilter.Parent := lTestForm;
+        lTestForm.cbConsoleFilter.Items.AddStrings(['All', 'Idle', 'Working', 'Action required',
+          'Non-agent', 'Non-responsive']);
+        lTestForm.cbConsoleFilter.ItemIndex := 0;
+        lTestForm.cbConsoleFilter.OnChange := lTestForm.ConsoleFilterChange;
+        lAnnounced := '';
+        lTestForm.fConsoleFilterAnnouncer :=
+          procedure(aFilter: TConsoleFilter)
+          begin
+            lAnnounced := IntToStr(Ord(aFilter));
+          end;
+        lTestForm.pnlAppDetails := TPanel.Create(lTestForm);
+        lTestForm.edAppCaption := TEdit.Create(lTestForm);
+        lTestForm.edAppCaption.Parent := lTestForm.pnlAppDetails;
+        lTestForm.edPid := TEdit.Create(lTestForm);
+        lTestForm.edPid.Parent := lTestForm.pnlAppDetails;
+        lTestForm.edAppFileName := TEdit.Create(lTestForm);
+        lTestForm.edAppFileName.Parent := lTestForm.pnlAppDetails;
+        lTestForm.edCommandLineParams := TEdit.Create(lTestForm);
+        lTestForm.edCommandLineParams.Parent := lTestForm.pnlAppDetails;
+        lTestForm.edRelaunchCommand := TEdit.Create(lTestForm);
+        lTestForm.edRelaunchCommand.Parent := lTestForm.pnlAppDetails;
+        lTestForm.edAppUserModelID := TEdit.Create(lTestForm);
+        lTestForm.edAppUserModelID.Parent := lTestForm.pnlAppDetails;
+        lTestForm.imgAppScreenshot := TImage.Create(lTestForm);
+        lTestForm.imgAppScreenshot.Parent := lTestForm.pnlAppDetails;
+        lTestForm.fStartupDataReady := 1;
+        lTestForm.fWindowBatch.TerminalPatterns := ['*alacritty.exe'];
+        SetLength(lTestForm.fWindowBatch.Windows, 4);
+        for lIndex := 0 to 3 do
+        begin
+          lTestForm.fWindowBatch.Windows[lIndex].Wnd := HWND(100 + lIndex);
+          lTestForm.fWindowBatch.Windows[lIndex].PID := Cardinal(100 + lIndex);
+          lTestForm.fWindowBatch.Windows[lIndex].FileName := 'C:\Tools\app.exe';
+          lTestForm.fWindowBatch.Windows[lIndex].Caption := 'Application ' + IntToStr(lIndex);
+        end;
+        lTestForm.fWindowBatch.Windows[0].Caption := 'Teams (3)';
+        lTestForm.fWindowBatch.Windows[1].Caption := '(123) YouTube';
+        lTestForm.fWindowBatch.Windows[1].NonResponsive := True;
+        lTestForm.fWindowBatch.Windows[2].FileName := 'C:\Tools\alacritty.exe';
+        lTestForm.fWindowBatch.Windows[3].FileName := 'C:\Tools\alacritty.exe';
+        lTestForm.fWindowBatch.Windows[3].NonResponsive := True;
+        lTestForm.fUnreadWindows := [HWND(100)];
+        lTestForm.UpdateGui;
+        if (lTestForm.lbApps.Count <> 2) or (lTestForm.lbConsole.Count <> 2) then
+          raise Exception.Create('Default filters did not show all applications and terminals');
+        lTestForm.lbApps.ItemIndex := lTestForm.lbApps.Items.IndexOfObject(TObject(100));
+        lTestForm.ActiveControl := lTestForm.lbApps;
+        lFilterKey := Ord('2');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if (lFilterKey <> 0) or (lTestForm.cbAppsFilter.ItemIndex <> 1) or
+          (lTestForm.lbApps.Count <> 1) or (lTestForm.GetWnd(lTestForm.lbApps) <> 100) or
+          (lTestForm.lbConsole.Count <> 2) then
+          raise Exception.CreateFmt('F1 Ctrl+2: key=%d combo=%d apps=%d selected=%d consoles=%d',
+            [lFilterKey, lTestForm.cbAppsFilter.ItemIndex, lTestForm.lbApps.Count,
+             NativeUInt(lTestForm.GetWnd(lTestForm.lbApps)), lTestForm.lbConsole.Count]);
+        lTestForm.fUnreadWindows := [];
+        lTestForm.UpdateGui;
+        if lTestForm.lbApps.Count <> 0 then
+          raise Exception.Create('Read messages remained in F1 new-message filter');
+        lFilterKey := Ord('3');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if (lFilterKey <> 0) or (lTestForm.cbAppsFilter.ItemIndex <> 2) or
+          (lTestForm.lbApps.Count <> 1) or (lTestForm.lbApps.Items.IndexOfObject(TObject(101)) <> 0) then
+          raise Exception.Create('F1 Ctrl+3 did not show only non-responsive applications');
+        lFilterKey := Ord('1');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if (lFilterKey <> 0) or (lTestForm.cbAppsFilter.ItemIndex <> 0) or (lTestForm.lbApps.Count <> 2) then
+          raise Exception.Create('F1 Ctrl+1 did not restore all applications');
+        lTestForm.lbConsole.ItemIndex := lTestForm.lbConsole.Items.IndexOfObject(TObject(103));
+        lTestForm.ActiveControl := lTestForm.lbConsole;
+        lFilterKey := Ord('6');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if (lFilterKey <> 0) or (lTestForm.cbConsoleFilter.ItemIndex <> 5) or (lAnnounced <> '5') or
+          (lTestForm.lbConsole.Count <> 1) or (lTestForm.GetWnd(lTestForm.lbConsole) <> 103) or
+          (lTestForm.lbApps.Count <> 2) then
+          raise Exception.Create('F4 Ctrl+6 did not show only non-responsive terminals');
+        lTestForm.fWindowBatch.Windows[3].NonResponsive := False;
+        lTestForm.UpdateGui;
+        if lTestForm.lbConsole.Count <> 0 then
+          raise Exception.Create('Recovered terminal remained in non-responsive filter');
+        lTestForm.ActiveControl := lTestForm.lbExplorer;
+        lFilterKey := Ord('3');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
+        if (lFilterKey <> Ord('3')) or (lTestForm.cbAppsFilter.ItemIndex <> 0) then
+          raise Exception.Create('F1 shortcut escaped its focused list');
+        lTestForm.cbAppsFilter.ItemIndex := 2;
+        lTestForm.AppsFilterChange(lTestForm.cbAppsFilter);
+        if (lTestForm.lbApps.Count <> 1) or (lTestForm.lbApps.Items.IndexOfObject(TObject(101)) <> 0) then
+          raise Exception.Create('F1 dropdown did not apply non-responsive filter');
+        lTestForm.fWindowBatch.Windows[1].NonResponsive := False;
+        lTestForm.UpdateGui;
+        if lTestForm.lbApps.Count <> 0 then
+          raise Exception.Create('Recovered application remained in non-responsive filter');
+        lTestForm.cbConsoleFilter.ItemIndex := 0;
+        lTestForm.ConsoleFilterChange(lTestForm.cbConsoleFilter);
+        if lTestForm.lbConsole.Count <> 2 then
+          raise Exception.Create('F4 dropdown did not restore all terminals');
+        lTestForm.ActiveControl := lTestForm.lbApps;
+        lFilterKey := Ord('2');
+        lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl, ssShift]);
+        if (lFilterKey <> Ord('2')) or (lTestForm.cbAppsFilter.ItemIndex <> 2) then
+          raise Exception.Create('Modified F1 shortcut changed filter');
+        lTempDir := TPath.Combine(TPath.GetTempPath, TPath.GetGUIDFileName);
+        TDirectory.CreateDirectory(lTempDir);
+        try
+          TFile.WriteAllText(TPath.Combine(lTempDir, 'chat-mask.txt'), 'caption=*Teams*', TEncoding.UTF8);
+          lTestSettings := TMemIniFile.Create(TPath.Combine(lTempDir, 'settings.ini'), TEncoding.UTF8, False);
+          try
+            lTestSettings.WriteBool('ChatMonitor', 'Enabled', True);
+            lTestSettings.WriteBool('ChatMonitor', 'SoundEnabled', False);
+            lTestSettings.WriteString('ChatMonitor', 'ReviewMaskFile', TPath.Combine(lTempDir, 'chat-mask.txt'));
+            lTestForm.fChatMonitor := TChatMonitor.Create(lTestSettings);
+            lTestForm.fUnreadWindows := [];
+            lTestForm.SelectAppsFilter(afNewMessages);
+            SetLength(lTestForm.fSharedAppsSnapshot, 1);
+            lTestForm.fSharedAppsSnapshot[0].Wnd := 100;
+            lTestForm.fSharedAppsSnapshot[0].Caption := 'Teams (3)';
+            lTestForm.fSharedAppsSnapshotTick := GetTickCount64;
+            lTestForm.StartChatMonitorProcessing;
+            lDetailWatch := TStopwatch.StartNew;
+            while TInterlocked.CompareExchange(lTestForm.fChatMonitorBusy, 0, 0) <> 0 do
+            begin
+              if lDetailWatch.ElapsedMilliseconds > 5000 then
+                raise Exception.Create('Async unread publication did not complete');
+              Application.ProcessMessages;
+              Sleep(10);
+            end;
+            if (lTestForm.lbApps.Count <> 1) or
+              (lTestForm.lbApps.Items.IndexOfObject(TObject(100)) <> 0) then
+              raise Exception.Create('Async chat completion did not publish new messages to F1');
+            lTestForm.fSharedAppsSnapshot[0].Caption := 'Teams (0)';
+            lTestForm.fSharedAppsSnapshotTick := GetTickCount64;
+            lTestForm.StartChatMonitorProcessing;
+            lDetailWatch := TStopwatch.StartNew;
+            while TInterlocked.CompareExchange(lTestForm.fChatMonitorBusy, 0, 0) <> 0 do
+            begin
+              if lDetailWatch.ElapsedMilliseconds > 5000 then
+                raise Exception.Create('Async read-message publication did not complete');
+              Application.ProcessMessages;
+              Sleep(10);
+            end;
+            if lTestForm.lbApps.Count <> 0 then
+              raise Exception.Create('Async chat completion retained read messages in F1');
+          finally
+            lTestForm.WaitAsyncWithShutdown(lTestForm.fChatMonitorTask, 5000);
+            lTestForm.fChatMonitorTask := nil;
+            FreeAndNil(lTestForm.fChatMonitor);
+            lTestSettings.Free;
+          end;
+        finally
+          TFile.Delete(TPath.Combine(lTempDir, 'chat-mask.txt'));
+          TDirectory.Delete(lTempDir);
+        end;
+        Writeln('WINDOW FILTERS PASS');
+      except
+        on lException: Exception do
+        begin
+          Writeln('SELFTEST FAILED: ' + lException.Message);
+          Result := 1;
+        end;
+      end;
+    finally
+      lTestForm.fStartupDataReady := 0;
+      lTestForm.Free;
+    end;
+    Exit;
+  end;
+
   if SameText(aArg, '--self-test-console-filter') then
   begin
     Result := 0;
@@ -3931,11 +4138,13 @@ begin
           begin
             lFilterKey := lExpectedFilterKey;
             lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
-            if (lFilterKey <> lExpectedFilterKey) or
+            if ((lIndex = 0) and (lExpectedFilterKey <= Ord('3')) and (lFilterKey <> 0)) or
+              (((lIndex <> 0) or (lExpectedFilterKey > Ord('3'))) and (lFilterKey <> lExpectedFilterKey)) or
               (lTestForm.cbConsoleFilter.ItemIndex <> 0) or (lTestForm.lbConsole.Count <> 1) then
-              raise Exception.Create('Console shortcut was handled while another control had focus');
+              raise Exception.Create('Focus-scoped filter shortcut changed another list');
           end;
         end;
+        lTestForm.fAppsFilter := afAll;
         lTestForm.ActiveControl := lTestForm.lbConsole;
         lFilterKey := Ord('2');
         lTestForm.FormKeyUp(lTestForm, lFilterKey, [ssCtrl]);
@@ -5686,11 +5895,50 @@ begin
   QueueGuiRefresh;
 end;
 
+function TAppsViewMainFrm.MatchesAppsFilter(const aWindow: TWindowSnapshot): Boolean;
+var
+  lWnd: HWND;
+begin
+  case fAppsFilter of
+    afNonResponsive: Exit(aWindow.NonResponsive);
+    afNewMessages:
+      begin
+        for lWnd in fUnreadWindows do
+          if lWnd = aWindow.Wnd then
+            Exit(True);
+        Exit(False);
+      end;
+  else
+    Result := True;
+  end;
+end;
+
+procedure TAppsViewMainFrm.SelectAppsFilter(const aFilter: TAppsFilter);
+begin
+  fAppsFilter := aFilter;
+  if Assigned(cbAppsFilter) then
+  begin
+    cbAppsFilter.ItemIndex := Ord(aFilter);
+    NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, cbAppsFilter.Handle, OBJID_CLIENT, CHILDID_SELF);
+  end;
+  UpdateGui;
+end;
+
+procedure TAppsViewMainFrm.AppsFilterChange(Sender: TObject);
+begin
+  if (cbAppsFilter.ItemIndex >= 0) and (cbAppsFilter.ItemIndex <= Ord(High(TAppsFilter))) then
+    SelectAppsFilter(TAppsFilter(cbAppsFilter.ItemIndex));
+end;
+
 procedure TAppsViewMainFrm.SetConsoleFilter(const aFilter: TConsoleFilter);
 begin
   fConsoleFilter := aFilter;
   if Assigned(cbConsoleFilter) then
+  begin
     cbConsoleFilter.ItemIndex := Ord(aFilter);
+    if aFilter = cfNonResponsive then
+      NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, cbConsoleFilter.Handle, OBJID_CLIENT, CHILDID_SELF);
+  end;
   UpdateGui;
 end;
 
@@ -5698,12 +5946,12 @@ procedure TAppsViewMainFrm.SelectConsoleFilter(const aFilter: TConsoleFilter);
 const
   // WAVE resources from ConsoleFilterSounds.rc (ElevenLabs Bella voice).
   cSounds: array[TConsoleFilter] of string = ('CONSOLE_FILTER_ALL', 'CONSOLE_FILTER_IDLE',
-    'CONSOLE_FILTER_WORKING', 'CONSOLE_FILTER_ACTION', 'CONSOLE_FILTER_NON_AGENT');
+    'CONSOLE_FILTER_WORKING', 'CONSOLE_FILTER_ACTION', 'CONSOLE_FILTER_NON_AGENT', '');
 begin
   SetConsoleFilter(aFilter);
   if Assigned(fConsoleFilterAnnouncer) then
     fConsoleFilterAnnouncer(aFilter)
-  else
+  else if cSounds[aFilter] <> '' then
     PlaySound(PChar(cSounds[aFilter]), HInstance, SND_RESOURCE or SND_ASYNC or SND_NODEFAULT);
 end;
 
@@ -5770,7 +6018,7 @@ end;
 
 procedure TAppsViewMainFrm.ConsoleFilterChange(Sender: TObject);
 begin
-  if cbConsoleFilter.ItemIndex >= 0 then
+  if (cbConsoleFilter.ItemIndex >= 0) and (cbConsoleFilter.ItemIndex <= Ord(High(TConsoleFilter))) then
     SelectConsoleFilter(TConsoleFilter(cbConsoleFilter.ItemIndex));
 end;
 
@@ -5923,9 +6171,11 @@ begin
         (not lIsTerminal) and (lApp.MetadataReady or (wmIdentity in lApp.AvailableMetadata)));
       if lIsTerminal then
       begin
-        if MatchesConsoleFilter(lApp.Caption, fConsoleFilter, lApp.AgentState, lApp.AgentAuthoritative) then
+        if ((fConsoleFilter = cfNonResponsive) and lApp.NonResponsive) or
+          ((fConsoleFilter <> cfNonResponsive) and
+          MatchesConsoleFilter(lApp.Caption, fConsoleFilter, lApp.AgentState, lApp.AgentAuthoritative)) then
           lConsole.AddObject(lTitle, TObject(lApp.Wnd));
-      end else
+      end else if MatchesAppsFilter(lApp) then
         lApps.AddObject(lTitle, TObject(lApp.Wnd));
     end;
     SortConsoleItems(lConsole);

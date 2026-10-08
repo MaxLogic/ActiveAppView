@@ -21,6 +21,7 @@ type
     ProcessStartedAt: Int64;
     Caption: string;
     FileName: string;
+    NonResponsive: Boolean;
     // Terminal windows only; filled from the process tree and harness hooks.
     AgentState: TAgentState;
     AgentAuthoritative: Boolean;
@@ -180,7 +181,42 @@ type
   public
     fWindows: TList<TWindowSnapshot>;
     fErrorText: string;
+    fIndexes: TDictionary<HWND, Integer>;
+    constructor Create;
+    destructor Destroy; override;
+    procedure AddWindow(const aWindow: TWindowSnapshot);
   end;
+
+constructor TWindowCollector.Create;
+begin
+  inherited Create;
+  fWindows := TList<TWindowSnapshot>.Create;
+  fIndexes := TDictionary<HWND, Integer>.Create;
+end;
+
+destructor TWindowCollector.Destroy;
+begin
+  fIndexes.Free;
+  fWindows.Free;
+  inherited;
+end;
+
+procedure TWindowCollector.AddWindow(const aWindow: TWindowSnapshot);
+var
+  lIndex: Integer;
+begin
+  // A window can disappear during identity lookup; never publish a PID-zero row.
+  if (aWindow.PID = 0) or (aWindow.Wnd = 0) then
+    Exit;
+  if fIndexes.TryGetValue(aWindow.Wnd, lIndex) then
+  begin
+    if (not SameWindowSnapshotIdentity(fWindows[lIndex], aWindow)) or aWindow.NonResponsive then
+      fWindows[lIndex] := aWindow;
+  end else begin
+    fIndexes.Add(aWindow.Wnd, fWindows.Count);
+    fWindows.Add(aWindow);
+  end;
+end;
 
 function RetainLastKnownCaptions(const aWindows, aPrevious: TWindowSnapshots): TWindowSnapshots;
 var
@@ -203,6 +239,7 @@ begin
       if (lOld.Wnd = aWindows[i].Wnd) and (lOld.PID = aWindows[i].PID) and (lOld.Caption <> '') then
       begin
         Result[lCount] := lOld;
+        Result[lCount].NonResponsive := aWindows[i].NonResponsive;
         Inc(lCount);
         Break;
       end;
@@ -259,35 +296,124 @@ begin
   end;
 end;
 
+function HungWindowFromGhostWindow(aWnd: HWND): HWND; stdcall; external user32;
+function GhostWindowFromHungWindow(aWnd: HWND): HWND; stdcall; external user32;
+function IsHungAppWindow(aWnd: HWND): BOOL; stdcall; external user32;
+
+procedure ResolveWindowIdentity(var aWindow: TWindowSnapshot; const aOriginalWnd: HWND);
+var
+  lPID: Cardinal;
+  lStartedAt: Int64;
+begin
+  // Ghost HWNDs belong to DWM; use the original HWND for identity, metadata and actions.
+  aWindow.NonResponsive := aOriginalWnd <> 0;
+  if aWindow.NonResponsive then
+    aWindow.Wnd := aOriginalWnd
+  else
+    aWindow.NonResponsive := IsHungAppWindow(aWindow.Wnd);
+  if GetWindowThreadProcessId(aWindow.Wnd, lPID) = 0 then
+  begin
+    aWindow.PID := 0;
+    aWindow.FileName := '';
+    aWindow.ProcessStartedAt := 0;
+    Exit;
+  end;
+  aWindow.PID := lPID;
+  aWindow.FileName := maxLogic.Windows.Desktop.GetFileName(aWindow.Wnd);
+  if TryGetProcessStartedAtUtcMilliseconds(lPID, lStartedAt) then
+    aWindow.ProcessStartedAt := lStartedAt
+  else
+    aWindow.ProcessStartedAt := 0;
+end;
+
+function RunGhostIdentitySelfTest: Integer;
+var
+  lCollector: TWindowCollector;
+  lWindow: TWindowSnapshot;
+  lWnd: HWND;
+begin
+  Result := 0;
+  lWnd := CreateWindowEx(0, 'STATIC', 'Ghost identity fixture', WS_POPUP,
+    0, 0, 0, 0, 0, 0, HInstance, nil);
+  try
+    if lWnd = 0 then
+      raise Exception.Create('Ghost identity fixture could not create original window');
+    lWindow := Default(TWindowSnapshot);
+    lWindow.Wnd := HWND(1);
+    lWindow.PID := 1;
+    ResolveWindowIdentity(lWindow, lWnd);
+    if (lWindow.Wnd <> lWnd) or (lWindow.PID <> GetCurrentProcessId) or
+      (not SameText(lWindow.FileName, ParamStr(0))) or (not lWindow.NonResponsive) then
+      raise Exception.Create('Ghost identity did not resolve original HWND, PID and filename');
+    lWindow := Default(TWindowSnapshot);
+    lWindow.Wnd := lWnd;
+    ResolveWindowIdentity(lWindow, 0);
+    if (lWindow.Wnd <> lWnd) or (lWindow.PID <> GetCurrentProcessId) or lWindow.NonResponsive then
+      raise Exception.Create('Responsive window identity changed');
+    lCollector := TWindowCollector.Create;
+    try
+      lWindow.Wnd := 0;
+      lWindow.Caption := 'Expired ghost';
+      ResolveWindowIdentity(lWindow, 0);
+      lCollector.AddWindow(lWindow);
+      if lCollector.fWindows.Count <> 0 then
+        raise Exception.Create('Expired identity published a PID-zero application row');
+      lWindow.Wnd := lWnd;
+      ResolveWindowIdentity(lWindow, 0);
+      lCollector.AddWindow(lWindow);
+      lWindow.NonResponsive := True;
+      lCollector.AddWindow(lWindow);
+      if (lCollector.fWindows.Count <> 1) or (not lCollector.fWindows[0].NonResponsive) then
+        raise Exception.Create('Canonical ghost/original deduplication lost non-responsive state');
+    finally
+      lCollector.Free;
+    end;
+    Writeln('GHOST IDENTITY PASS');
+  except
+    on lException: Exception do
+    begin
+      Writeln('SELFTEST FAILED: ' + lException.Message);
+      Result := 1;
+    end;
+  end;
+  DestroyWindow(lWnd);
+end;
+
 function CollectWindow(aWnd: HWND; aParam: LPARAM): BOOL; stdcall;
 var
   lCollector: TWindowCollector;
-  lPID: Cardinal;
   lWindow: TWindowSnapshot;
+  lOriginalWnd: HWND;
+  lPID: Cardinal;
 begin
   Result := True;
   lCollector := TWindowCollector(aParam);
   try
     lWindow := Default(TWindowSnapshot);
     lWindow.Wnd := aWnd;
-    if GetWindowThreadProcessId(aWnd, lPID) = 0 then
+    lOriginalWnd := HungWindowFromGhostWindow(aWnd);
+    if lOriginalWnd <> 0 then
+      lWindow.Wnd := lOriginalWnd;
+    if GetWindowThreadProcessId(lWindow.Wnd, lPID) = 0 then
       Exit;
     lWindow.PID := lPID;
-    // Do not send same-process caption messages while our VCL thread may be joining us.
+    // IsWndValid also reads the caption: exclude our own process before either call.
     if (lWindow.PID = GetCurrentProcessId) or (not IsWindowVisible(aWnd)) or
       (not maxLogic.Windows.Desktop.IsWndValid(aWnd)) then
       Exit;
+    // Collect the ghost once; its original window can also occur in EnumWindows.
+    if (lOriginalWnd = 0) and (GhostWindowFromHungWindow(aWnd) <> 0) then
+      Exit;
+    lWindow.NonResponsive := (lOriginalWnd <> 0) or IsHungAppWindow(lWindow.Wnd);
     lWindow.Caption := maxLogic.Windows.Desktop.GetWinCaption(aWnd);
     // Keep an untitled window only as a candidate for its last known caption; Collect drops the rest.
     if lWindow.Caption = '' then
     begin
-      lCollector.fWindows.Add(lWindow);
+      lCollector.AddWindow(lWindow);
       Exit;
     end;
-    lWindow.FileName := maxLogic.Windows.Desktop.GetFileName(aWnd);
-    if not TryGetProcessStartedAtUtcMilliseconds(lWindow.PID, lWindow.ProcessStartedAt) then
-      lWindow.ProcessStartedAt := 0;
-    lCollector.fWindows.Add(lWindow);
+    ResolveWindowIdentity(lWindow, lOriginalWnd);
+    lCollector.AddWindow(lWindow);
   except
     on lException: Exception do
     begin
@@ -578,14 +704,12 @@ begin
         lBatch.CollectedAt := GetTickCount64;
         lCollector := TWindowCollector.Create;
         try
-          lCollector.fWindows := TList<TWindowSnapshot>.Create;
-          EnumWindows(@CollectWindow, LPARAM(lCollector));
+            EnumWindows(@CollectWindow, LPARAM(lCollector));
           if lCollector.fErrorText <> '' then
             raise Exception.Create(lCollector.fErrorText);
           lBatch.Windows := lCollector.fWindows.ToArray;
           ApplyTerminalAgentStates(lBatch);
         finally
-          lCollector.fWindows.Free;
           lCollector.Free;
         end;
       except
@@ -1012,6 +1136,8 @@ var
   lWindow: TWindowSnapshot;
   i: Integer;
 begin
+  if SameText(aArg, '--self-test-window-ghost-identity') then
+    Exit(RunGhostIdentitySelfTest);
   if SameText(aArg, '--self-test-window-metadata-policy') then
     Exit(RunMetadataPolicySelfTest);
   if SameText(aArg, cRestrictedFileNameSelfTestArg) then
