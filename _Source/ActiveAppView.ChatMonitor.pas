@@ -4,7 +4,7 @@ interface
 
 uses
   Winapi.Windows, System.Character, System.Classes, System.Generics.Collections, System.IniFiles,
-  System.SysUtils,
+  System.SyncObjs, System.SysUtils,
   MaxLogic.Cache,
   ActiveAppView.ConfigCache;
 
@@ -35,6 +35,7 @@ type
         LastSoundPlayed: TDateTime;
       end;
   private
+    fCancel: TEvent;
     fConfigCache: TConfigCache;
     fEnabled: Boolean;
     fMetadataCache: IMaxCache;
@@ -80,6 +81,7 @@ type
     function GetUnreadWindows: TArray<HWND>;
     procedure Process;
     procedure ProcessSnapshot(const aApps: TArray<TChatAppSnapshot>);
+    procedure RequestStop;
     procedure UseConfigCache(aConfigCache: TConfigCache);
     property SoundEnabled: Boolean read fSoundEnabled write SetSoundEnabled;
   end;
@@ -87,10 +89,10 @@ type
 implementation
 
 uses
-  System.DateUtils, System.IOUtils, System.StrUtils,
+  System.DateUtils, System.IOUtils, System.JSON, System.StrUtils,
   Winapi.MMSystem,
-  maxLogic.StrUtils, maxLogic.Windows.Desktop,
-  ActiveAppViewCore;
+  maxLogic.StrUtils, maxLogic.Windows.Desktop, MaxLogic.Windows.Identity,
+  ActiveAppView.MachineOverview.BoundedProcess, ActiveAppViewCore;
 
 type
   TChatAppMetadata = class(TInterfacedObject, IChatAppMetadata)
@@ -753,6 +755,7 @@ var
   lCacheConfig: TMaxCacheConfig;
 begin
   inherited Create;
+  fCancel := TEvent.Create(nil, True, False, '');
   fMonitoredApps := TDictionary<hWnd, TMonitoredAppState>.Create;
   fSoundThrottling := TDictionary<string, TDateTime>.Create;
   fOwnConfigCache := True;
@@ -768,11 +771,17 @@ end;
 
 destructor TChatMonitor.Destroy;
 begin
+  fCancel.Free;
   fSoundThrottling.Free;
   fMonitoredApps.Free;
   if fOwnConfigCache and Assigned(fConfigCache) then
     fConfigCache.Free;
   inherited;
+end;
+
+procedure TChatMonitor.RequestStop;
+begin
+  fCancel.SetEvent;
 end;
 
 function TChatMonitor.GetMetadataCached(const aWnd: hWnd): IChatAppMetadata;
@@ -783,6 +792,8 @@ var
   lPid: Cardinal;
   lWndKey: string;
 begin
+  if fCancel.WaitFor(0) = wrSignaled then
+    Exit(nil);
   lWndKey := IntToHex(NativeInt(aWnd), SizeOf(NativeInt) * 2);
   lOptions := TMaxCacheOptions.Create;
   try
@@ -795,13 +806,15 @@ begin
         function: IInterface
         var
           lAppUserModelID: string;
-          lCommandLine: string;
           lCommandLineParams: string;
+          lData: TJSONValue;
           lFileName: string;
+          lMask: Integer;
+          lProcessResult: TMachineOverviewProcessResult;
+          lStartedAt: Int64;
         begin
           lFileName := '';
           lAppUserModelID := '';
-          lCommandLine := '';
           lCommandLineParams := '';
 
           try
@@ -810,23 +823,46 @@ begin
             lFileName := '';
           end;
 
-          try
-            lAppUserModelID := maxLogic.Windows.Desktop.RetrieveAppUserModelID(aWnd);
-          except
-            lAppUserModelID := '';
+          lPid := maxLogic.Windows.Desktop.RetrievePID(aWnd);
+          if (lPid <> 0) and (fCancel.WaitFor(0) <> wrSignaled) and
+            TryGetProcessStartedAtUtcMilliseconds(lPid, lStartedAt) then
+          begin
+            // Keep WMI and shell COM calls outside our process so shutdown can cancel them.
+            // Identity remains usable even when the independent command-line query fails.
+            for lMask := 1 to 2 do
+            begin
+              if fCancel.WaitFor(0) = wrSignaled then
+                Break;
+              try
+                lProcessResult := RunMachineOverviewBoundedProcessCancelable(ParamStr(0),
+                  Format('--window-metadata %s %d %d %d',
+                    [UIntToStr(NativeUInt(aWnd)), lPid, lStartedAt, lMask]),
+                  15000, 262144, fCancel.Handle);
+                if lProcessResult.Cancelled then
+                  Break;
+                if lProcessResult.Started and (lProcessResult.ExitCode = 0) then
+                begin
+                  lData := TJSONObject.ParseJSONValue(lProcessResult.OutputText);
+                  try
+                    if lData is TJSONObject then
+                    begin
+                      if lMask = 1 then
+                        lAppUserModelID := lData.GetValue<string>('appUserModelId', '')
+                      else
+                        lCommandLineParams := lData.GetValue<string>('commandLineParams', '');
+                    end;
+                  finally
+                    lData.Free;
+                  end;
+                end else
+                  OutputDebugString(PChar(Format('Chat monitor metadata: pid=%d fields=%d exit=%d %s',
+                    [lPid, lMask, lProcessResult.ExitCode, lProcessResult.ErrorText])));
+              except
+                on lException: Exception do
+                  OutputDebugString(PChar('Chat monitor metadata: ' + lException.Message));
+              end;
+            end;
           end;
-
-          try
-            lPid := maxLogic.Windows.Desktop.RetrievePID(aWnd);
-            if lPid = 0 then
-              lCommandLine := ''
-            else
-              lCommandLine := maxLogic.Windows.Desktop.RetrieveCommandLine(lPid);
-          except
-            lCommandLine := '';
-          end;
-
-          lCommandLineParams := ParseCommandLineParams(lCommandLine);
           Result := TChatAppMetadata.Create(lFileName, lAppUserModelID, lCommandLineParams);
         end,
         lOptions);
@@ -1097,6 +1133,8 @@ begin
 
   for lIndex := 0 to High(aApps) do
   begin
+    if fCancel.WaitFor(0) = wrSignaled then
+      Break;
     try
       lMetadata[lIndex] := GetMetadataCached(aApps[lIndex].Wnd);
     except
@@ -1159,7 +1197,7 @@ var
   lReviewRules: TReviewRuleArray;
   lWnd: hWnd;
 begin
-  if not fEnabled then
+  if (not fEnabled) or (fCancel.WaitFor(0) = wrSignaled) then
     Exit;
 
   lReviewRules := fConfigCache.GetReviewRules(fReviewMaskFileName);
@@ -1167,6 +1205,8 @@ begin
   SetLength(lMetadata, 0);
   if lRequiresMetadata then
     lMetadata := PrefetchMetadataInParallel(aApps);
+  if fCancel.WaitFor(0) = wrSignaled then
+    Exit;
 
   lFoundApps := TDictionary<hWnd, TMonitoredAppState>.Create;
   try

@@ -464,6 +464,7 @@ const
   cMaxTailBytes = 256 * 1024;
 var
   lBytes: TBytes;
+  lFirst: Integer;
   lOffset: Int64;
   lSize: Int64;
   lStream: TFileStream;
@@ -492,9 +493,17 @@ begin
   // Do not let an older completion win while a newer record is half-written.
   if lBytes[High(lBytes)] <> 10 then
     Exit;
-  Result := TEncoding.UTF8.GetString(lBytes);
+  lFirst := 0;
   if lOffset > 0 then
-    Delete(Result, 1, Pos(#10, Result));
+  begin
+    // The bounded read can start inside a UTF-8 scalar. Drop the partial JSONL record before decoding.
+    while (lFirst < Length(lBytes)) and (lBytes[lFirst] <> 10) do
+      Inc(lFirst);
+    if lFirst = Length(lBytes) then
+      Exit;
+    Inc(lFirst);
+  end;
+  Result := TEncoding.UTF8.GetString(lBytes, lFirst, Length(lBytes) - lFirst);
 end;
 
 function TryCodexTranscriptState(const aFileName, aUpdated: string; out aState: TAgentState): Boolean;
@@ -623,8 +632,10 @@ begin
       if IsHarnessProcessName(lProcess.Name) then
       begin
         lPid := lProcess.ParentPID;
-        for lDepth := 1 to cMaxAncestorDepth do
+        lDepth := 0;
+        while lDepth < cMaxAncestorDepth do
         begin
+          Inc(lDepth);
           if lTerminalIndex.TryGetValue(lPid, i) then
           begin
             if lStates[i] < asAgent then
@@ -779,6 +790,9 @@ begin
     asIdle, 'An aborted turn must clear a stale working hook');
   CheckState(StringOfChar('x', 300 * 1024) + #10 + cComplete + #10,
     asIdle, 'A large transcript must resolve from its bounded tail');
+  CheckState(StringOfChar('x', 300 * 1024) + #$20AC +
+    StringOfChar('x', 256 * 1024 - Length(cComplete) - 4) + #10 + cComplete + #10,
+    asIdle, 'A tail starting inside a UTF-8 character must resolve the next complete record');
   CheckState(cComplete + #10 + '{"type":"event_msg","payload":{"type":"token_count","padding":"' +
     StringOfChar('x', 300 * 1024) + '"}}' + #10, asWorking,
     'A completion outside the read limit must preserve the hook');
@@ -870,7 +884,8 @@ begin
       Check(not HookEventToAgentState('PreToolUse', '', '', lState, lEnds), 'PreToolUse must be ignored');
       Check(not HookEventToAgentState('Notification', 'auth_success', '', lState, lEnds),
         'Unrelated notifications must be ignored');
-      Check(HookEventToAgentState('SessionEnd', '', '', lState, lEnds) and lEnds, 'SessionEnd must end the session');
+      Check(HookEventToAgentState('SessionEnd', '', '', lState, lEnds) and lEnds and (lState = asNone),
+        'SessionEnd must end the session without reporting an active state');
 
       // Windows Claude: hook <- bash <- claude.exe <- pwsh <- alacritty (terminal 500).
       lChain := [TestEntry(10, 900, 'bash.exe'), TestEntry(20, 800, 'claude.exe'), TestEntry(30, 700, 'pwsh.exe'),

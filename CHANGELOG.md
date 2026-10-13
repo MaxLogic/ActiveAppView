@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- VMware Player and Workstation windows now have a `VM - ` prefix in Applications.
 - Applications (F1) now has All, New messages, and Non-responsive filters, selected with Ctrl+1/2/3 while the list has focus.
 - Console instances (F4) now has a Non-responsive filter (Ctrl+6).
 - Machine Overview (F8) has a Temperatures row after GPU with CPU, GPU, and chassis readings; unavailable sensors say why. Rows that open more detail with Enter show `*` after their label.
@@ -21,6 +22,8 @@ All notable changes to this project are documented in this file.
 - `Scripts\Copy-MarkdownAsRichText.ps1` now converts markdown from the clipboard (a copied `.md` file, a path to one, or the text itself) into HTML, RTF, or pandoc plain text and puts it back on the clipboard for Jira, Outlook, Thunderbird, and other rich editors. Running it without `-Format` asks which flavor to use first; no temporary files are left behind.
 
 ### Fixed
+- Closing ActiveAppView now cancels chat-monitor metadata queries, so a stalled WMI provider cannot hold shutdown open.
+- Applications and File Explorer lists now populate when a bounded Codex session-log read starts inside a UTF-8 character.
 - Windows ghost windows now resolve to the original application HWND, PID, and filename, so unresponsive terminals stay in Console instances and do not create duplicate application rows.
 - Console instances (F4) recovers idle Codex sessions after a refusal or other turn completion misses the Stop hook, using newer session-log events; a subsequent turn restores working state.
 - Console instances (F4) now sorts Claude Code titles by their readable text when a Claude idle symbol or working spinner prefixes the title.

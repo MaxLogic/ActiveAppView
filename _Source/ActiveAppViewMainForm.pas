@@ -3351,6 +3351,8 @@ begin
   if Assigned(fShutdownToken) then
     fShutdownToken.Cancel;
   tmrChatMonitor.Enabled := False;
+  if Assigned(fChatMonitor) then
+    fChatMonitor.RequestStop;
   FreeAndNil(fWindowService);
   TInterlocked.Exchange(fChatMonitorPending, 0);
   TInterlocked.Exchange(fAuxListRefreshPending, 0);
