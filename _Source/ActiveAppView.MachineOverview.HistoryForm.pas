@@ -337,6 +337,8 @@ begin
   else
     labStatus.Caption := Format(rsIncidentHistoryCount,
       [Length(fIncidents)]);
+  if not lError.IsEmpty then
+    labStatus.Caption := labStatus.Caption + '. ' + lError;
 end;
 
 procedure TMachineOverviewHistoryFrm.BeginRefresh(

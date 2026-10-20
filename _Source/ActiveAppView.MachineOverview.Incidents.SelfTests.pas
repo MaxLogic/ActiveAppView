@@ -10,7 +10,7 @@ uses
   System.DateUtils, System.IOUtils, System.Math, System.StrUtils,
   System.SysUtils,
   Winapi.Windows,
-  AutoFree,
+  AutoFree, FireDAC.Comp.Client,
   ActiveAppView.MachineOverview.History,
   ActiveAppView.MachineOverview.Incidents,
   ActiveAppView.MachineOverview.Pipeline,
@@ -402,6 +402,54 @@ begin
   Result := 0;
 end;
 
+function CheckIncidentLegacyContext(const aDatabaseFileName: string;
+  const aStableId, aOperation: string): Boolean;
+var
+  g: TGarbos;
+  lConnection: TFDConnection;
+  lContextText: string;
+  lPostContext: string;
+  lPreContext: string;
+  lQuery: TFDQuery;
+begin
+  g := Default(TGarbos);
+  GC(lConnection, TFDConnection.Create(nil), g);
+  lConnection.LoginPrompt := False;
+  lConnection.ResourceOptions.SilentMode := True;
+  lConnection.Params.Values['DriverID'] := 'SQLite';
+  lConnection.Params.Values['Database'] := aDatabaseFileName;
+  lConnection.Params.Values['OpenMode'] := 'ReadOnly';
+  lConnection.Params.Values['LockingMode'] := 'Normal';
+  lConnection.Params.Values['JournalMode'] := 'WAL';
+  lConnection.Params.Values['SharedCache'] := 'False';
+  lConnection.Params.Values['BusyTimeout'] := '100';
+  lConnection.Connected := True;
+  lConnection.ExecSQL('PRAGMA query_only=ON');
+  GC(lQuery, TFDQuery.Create(nil), g);
+  lQuery.Connection := lConnection;
+  lQuery.SQL.Text := 'SELECT pre_context_json, post_context_json, ' +
+    'context_text FROM incident WHERE incident_key=:stable_id';
+  lQuery.ParamByName('stable_id').AsWideString := aStableId;
+  lQuery.Open;
+  if lQuery.Eof then
+  begin
+    Writeln('SELFTEST FAILED: raw incident missing after ' + aOperation);
+    Exit(False);
+  end;
+  lPreContext := lQuery.FieldByName('pre_context_json').AsWideString;
+  lPostContext := lQuery.FieldByName('post_context_json').AsWideString;
+  lContextText := lQuery.FieldByName('context_text').AsWideString;
+  Result := (lPreContext = '[]') and (lPostContext = '[]') and
+    (lContextText = '');
+  if Result then
+    Writeln('Raw incident legacy context empty after ' + aOperation)
+  else begin
+    Writeln(Format('SELFTEST FAILED: raw incident legacy context after %s: ' +
+      'pre=%s post=%s context_text_length=%d',
+      [aOperation, lPreContext, lPostContext, Length(lContextText)]));
+  end;
+end;
+
 function RunIncidentPersistenceRestartSelfTest: Integer;
 var
   g: TGarbos;
@@ -412,14 +460,16 @@ var
   lDirectory: string;
   lError: string;
   lIncidents: TArray<TMachineOverviewIncident>;
+  lInsertContextEmpty: Boolean;
   lRestartService: TMachineOverviewHistoryService;
   lService: TMachineOverviewHistoryService;
   lSignals: TMachineOverviewIncidentSignals;
+  lUpsertContextEmpty: Boolean;
 begin
   g := Default(TGarbos);
   Result := 1;
   lDirectory := TPath.Combine(TPath.GetTempPath,
-    'ActiveAppView-MachineOverview\incident-tests');
+    'ActiveAppView-MachineOverview\history-tests');
   TDirectory.CreateDirectory(lDirectory);
   lDatabaseFileName := TPath.Combine(lDirectory,
     Format('incident-%d-%d.db', [GetCurrentProcessId, GetTickCount64]));
@@ -435,7 +485,15 @@ begin
       'Initial persisted summary');
     lChange.Incident.PeakValue := 42.5;
     lChange.Incident.PostContext := Copy(lChange.Incident.PreContext);
+    if lChange.Incident.Explanation.IsEmpty or
+      (Length(lChange.Incident.PreContext) = 0) or
+      (Length(lChange.Incident.PostContext) = 0) then
+    begin
+      Writeln('SELFTEST FAILED: incident context input must be nonempty');
+      Exit;
+    end;
     lConfig := Default(TMachineOverviewHistoryConfig);
+    lConfig.DiskFreeBytesOverride := -1;
     lConfig.Enabled := True;
     lConfig.DatabaseFileName := lDatabaseFileName;
     lConfig.CommitIntervalMs := 60000;
@@ -452,7 +510,16 @@ begin
       (lService.EnqueueIncident(lChange) <>
        TMachineOverviewHistoryEnqueueResult.Queued) then
       Exit;
+    if not lService.Flush(5000) then
+    begin
+      Writeln('SELFTEST FAILED: incident INSERT flush: ' +
+        lService.Diagnostics.LastError);
+      Exit;
+    end;
+    lInsertContextEmpty := CheckIncidentLegacyContext(lDatabaseFileName,
+      lChange.Incident.StableId, 'INSERT');
     lChange.Kind := TMachineOverviewIncidentChangeKind.Updated;
+    lChange.Incident.Explanation := 'Updated nonempty incident explanation';
     lChange.Incident.Summary := 'Updated persisted summary';
     lChange.Incident.PeakValue := 55.5;
     if lService.EnqueueIncident(lChange) <>
@@ -464,6 +531,10 @@ begin
         lService.Diagnostics.LastError);
       Exit;
     end;
+    lUpsertContextEmpty := CheckIncidentLegacyContext(lDatabaseFileName,
+      lChange.Incident.StableId, 'UPSERT');
+    if (not lInsertContextEmpty) or (not lUpsertContextEmpty) then
+      Exit;
     if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
       Exit;
     lRestartService := TMachineOverviewHistoryService.Create(nil, lConfig);
@@ -486,8 +557,8 @@ begin
        TMachineOverviewIncidentOrigin.UserMarked) or
       (Length(lIncidents[0].RelatedEntityIds) <> 2) or
       (Length(lIncidents[0].RelatedExecutablePaths) <> 1) or
-      (Length(lIncidents[0].PreContext) <> 1) or
-      (Length(lIncidents[0].PostContext) <> 1) then
+      (Length(lIncidents[0].PreContext) <> 0) or
+      (Length(lIncidents[0].PostContext) <> 0) then
     begin
       Writeln(Format('SELFTEST FAILED: incident did not survive persistence ' +
         'restart and stable-ID upsert: count=%d error=%s',
@@ -687,7 +758,7 @@ var
 begin
   Result := 1;
   lDirectory := TPath.Combine(TPath.GetTempPath,
-    'ActiveAppView-MachineOverview\incident-tests');
+    'ActiveAppView-MachineOverview\history-tests');
   TDirectory.CreateDirectory(lDirectory);
   lDatabaseFileName := TPath.Combine(lDirectory,
     Format('pipeline-incident-%d-%d.db',
@@ -698,6 +769,7 @@ begin
   lRestartHistory := nil;
   try
     lConfig := Default(TMachineOverviewHistoryConfig);
+    lConfig.DiskFreeBytesOverride := -1;
     lConfig.Enabled := True;
     lConfig.DatabaseFileName := lDatabaseFileName;
     lConfig.CommitIntervalMs := 60000;

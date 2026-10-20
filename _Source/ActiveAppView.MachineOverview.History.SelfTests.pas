@@ -456,7 +456,7 @@ begin
     Exit;
   lQuery.Close;
   lQuery.Open('PRAGMA user_version');
-  if lQuery.Fields[0].AsInteger <> 2 then
+  if lQuery.Fields[0].AsInteger <> 3 then
     Exit;
   lQuery.Close;
   lQuery.Open('SELECT cpu_total, logical_cpu_blob FROM system_sample_raw ' +
@@ -538,6 +538,7 @@ begin
     try
       lStage := 'configure';
       lConfig := Default(TMachineOverviewHistoryConfig);
+    lConfig.DiskFreeBytesOverride := -1;
     lConfig.Enabled := True;
     lConfig.DatabaseFileName := lDatabaseFileName;
     lConfig.CommitIntervalMs := 60000;
@@ -700,6 +701,7 @@ begin
     lConnection.ExecSQL('PRAGMA user_version=0');
     lConnection.Connected := False;
     lConfig := Default(TMachineOverviewHistoryConfig);
+    lConfig.DiskFreeBytesOverride := -1;
     lConfig.Enabled := True;
     lConfig.DatabaseFileName := lDatabaseFileName;
     lConfig.CommitIntervalMs := 10000;
@@ -718,6 +720,8 @@ begin
       Writeln('SELFTEST FAILED: schema-v0 history migration did not complete');
       Exit;
     end;
+    lBackupFileName := TDirectory.GetFiles(lDirectory,
+      ExtractFileName(lDatabaseFileName) + '.pre-migration-*.bak')[0];
     if not TFile.Exists(lBackupFileName) then
     begin
       Writeln('SELFTEST FAILED: schema-v0 history migration made no prior-file backup');
@@ -736,7 +740,7 @@ begin
     lConnection.Connected := False;
     lConnection.Params.Values['Database'] := lDatabaseFileName;
     lConnection.Connected := True;
-    if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 2) or
+    if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 3) or
       (QueryHistoryInt64(lConnection,
         'SELECT COUNT(*) FROM legacy_sentinel WHERE value=''preserve-me''') <> 1) then
     begin
@@ -764,6 +768,7 @@ function CreateHistoryReliabilityConfig(const aDatabaseFileName: string;
   TMachineOverviewHistoryConfig;
 begin
   Result := Default(TMachineOverviewHistoryConfig);
+  Result.DiskFreeBytesOverride := -1;
   Result.Enabled := True;
   Result.DatabaseFileName := aDatabaseFileName;
   Result.CommitIntervalMs := 60000;
@@ -776,6 +781,8 @@ begin
 end;
 
 procedure DeleteHistoryReliabilityFiles(const aDatabaseFileName: string);
+var
+  lFileName: string;
 begin
   if TFile.Exists(aDatabaseFileName + '-shm') then
     TFile.Delete(aDatabaseFileName + '-shm');
@@ -783,6 +790,9 @@ begin
     TFile.Delete(aDatabaseFileName + '-wal');
   if TFile.Exists(aDatabaseFileName) then
     TFile.Delete(aDatabaseFileName);
+  for lFileName in TDirectory.GetFiles(ExtractFilePath(aDatabaseFileName),
+    ExtractFileName(aDatabaseFileName) + '.pre-migration-*') do
+    TFile.Delete(lFileName);
 end;
 
 function RunHistoryBusyBacklogSelfTest: Integer;
@@ -934,6 +944,8 @@ begin
       (not lService.Diagnostics.Available) or
       (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
       Exit;
+    lBackupFileName := TDirectory.GetFiles(lDirectory,
+      ExtractFileName(lDatabaseFileName) + '.pre-migration-*.bak')[0];
     if not TFile.Exists(lBackupFileName) then
     begin
       Writeln('SELFTEST FAILED: schema-v1 migration made no prior-file backup');
@@ -948,7 +960,7 @@ begin
     lConnection.Connected := False;
     lConnection.Params.Values['Database'] := lDatabaseFileName;
     lConnection.Connected := True;
-    if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 2) or
+    if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 3) or
       (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM ' +
        'pragma_table_info(''incident'') WHERE name=''pre_context_json''') <> 1) then
     begin
@@ -1271,6 +1283,493 @@ begin
   end;
 end;
 
+procedure CreateHistoryV2Fixture(const aFileName: string; const aCount: Integer);
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lService: TMachineOverviewHistoryService;
+begin
+  g := Default(TGarbos);
+  lConfig := CreateHistoryReliabilityConfig(aFileName, 16, 32 * 1024 * 1024);
+  GC(lService, TMachineOverviewHistoryService.Create(nil, lConfig), g);
+  lService.Start;
+  if (not lService.WaitUntilInitialized(5000)) or
+    (not lService.Diagnostics.Available) or
+    (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+    raise Exception.Create('v2 fixture initialization failed: ' + lService.Diagnostics.LastError);
+  GC(lConnection, TFDConnection.Create(nil), g);
+  ConfigureHistoryTestConnection(aFileName, lConnection);
+  lConnection.ExecSQL('WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL ' +
+    'SELECT n+1 FROM rows WHERE n<?) INSERT INTO incident(' +
+    'incident_key, started_utc_ms, peak_utc_ms, ended_utc_ms, category, severity, origin, ' +
+    'local_display_time, summary, explanation, threshold_text, peak_value, provider_id, ' +
+    'provider_freshness_ms, related_entity_ids_json, related_executable_paths_json, ' +
+    'trace_status, pre_context_json, post_context_json, context_text, evidence_state) ' +
+    'SELECT ''legacy-''||n, 1792519200000+n, 1792519200000+n, 1792519201000+n, ' +
+    '0,2,0,'''',''headline-''||n,''explanation'',''threshold'',42,''test'',0,' +
+    '''[]'',''[]'',2,''["original"]'',''[]'',''original legacy context'',0 FROM rows', [aCount]);
+  lConnection.ExecSQL('DROP TABLE incident_evidence');
+  lConnection.ExecSQL('DROP TABLE history_status');
+  lConnection.ExecSQL('PRAGMA user_version=2');
+  lConnection.ExecSQL('PRAGMA wal_checkpoint(TRUNCATE)');
+  lConnection.Connected := False;
+end;
+
+function NewHistoryMigrationFile(const aPrefix: string): string;
+var
+  lDirectory: string;
+begin
+  lDirectory := TPath.Combine(TPath.GetTempPath,
+    'ActiveAppView-MachineOverview\history-tests');
+  TDirectory.CreateDirectory(lDirectory);
+  Result := TPath.Combine(lDirectory, Format('%s-%d-%d.db',
+    [aPrefix, GetCurrentProcessId, GetTickCount64]));
+end;
+
+procedure AssertHistoryBackupSourceUnchanged(const aFileName: string; const aCount: Integer);
+var
+  g: TGarbos;
+  lConnection: TFDConnection;
+begin
+  g := Default(TGarbos);
+  GC(lConnection, TFDConnection.Create(nil), g);
+  lConnection.Params.Values['DriverID'] := 'SQLite';
+  lConnection.Params.Values['Database'] := aFileName;
+  lConnection.Params.Values['OpenMode'] := 'ReadOnly';
+  lConnection.Params.Values['JournalMode'] := 'WAL';
+  lConnection.Params.Values['LockingMode'] := 'Normal';
+  lConnection.Params.Values['SharedCache'] := 'False';
+  lConnection.LoginPrompt := False;
+  lConnection.Connected := True;
+  lConnection.ExecSQL('PRAGMA query_only=ON');
+  if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 2) or
+    (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident') <> aCount) or
+    (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE ' +
+      'summary=''headline-''||id AND explanation=''explanation'' AND threshold_text=''threshold'' ' +
+      'AND peak_value=42 AND trace_status=2 AND context_text=''original legacy context''') <> aCount) then
+    raise Exception.Create('Source incidents changed before backup verification');
+end;
+
+function RunHistoryMigrationBackupSpaceSelfTest: Integer;
+var
+  lBefore: TBytes;
+  lAfter: TBytes;
+  lConfig: TMachineOverviewHistoryConfig;
+  lFileName: string;
+  lService: TMachineOverviewHistoryService;
+  lStamp: TDateTime;
+begin
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('backup-space');
+  lService := nil;
+  try
+    CreateHistoryV2Fixture(lFileName, 3);
+    lBefore := TFile.ReadAllBytes(lFileName);
+    lStamp := TFile.GetLastWriteTimeUtc(lFileName);
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 16, 32 * 1024 * 1024);
+    lConfig.DiskFreeBytesOverride := Length(lBefore) + 256 * 1024 * 1024 - 1;
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(5000)) or lService.Diagnostics.Available or
+      (not ContainsText(lService.Diagnostics.LastError, 'MigrationBlocked')) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Insufficient backup space was not refused: ' + lService.Diagnostics.LastError);
+    lAfter := TFile.ReadAllBytes(lFileName);
+    if (Length(lAfter) <> Length(lBefore)) or
+      (not CompareMem(@lBefore[0], @lAfter[0], Length(lBefore))) or
+      (lStamp <> TFile.GetLastWriteTimeUtc(lFileName)) or
+      (Length(TDirectory.GetFiles(ExtractFilePath(lFileName),
+        ExtractFileName(lFileName) + '.pre-migration-*')) <> 0) then
+      raise Exception.Create('Backup space refusal changed source bytes/time or created backup');
+    Writeln('PASS RunHistoryMigrationBackupSpaceSelfTest: source bytes/time unchanged, no backup');
+    Result := 0;
+  finally
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryMigrationResumeSelfTest: Integer;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lFileName: string;
+  lService: TMachineOverviewHistoryService;
+  lVerified: Boolean;
+  lChunks: Integer;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('migration-resume');
+  lService := nil;
+  lVerified := False;
+  lChunks := 0;
+  try
+    CreateHistoryV2Fixture(lFileName, 450);
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 16, 32 * 1024 * 1024);
+    lConfig.MigrationObserver :=
+      procedure(aStage: string)
+      begin
+        if aStage = 'BackupVerified' then
+        begin
+          AssertHistoryBackupSourceUnchanged(lFileName, 450);
+          lVerified := True;
+        end;
+        if aStage = 'CleanupChunkCommitted' then
+        begin
+          Inc(lChunks);
+          if not Assigned(lService) then
+            raise Exception.Create('Cleanup observer has no active service');
+          if lService.Stop(0) <> TMachineOverviewShutdownResult.TimedOut then
+            raise Exception.Create('Writer cancellation did not set the stopping state');
+        end;
+      end;
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(10000)) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) or
+      (not lVerified) or (lChunks <> 1) then
+      raise Exception.Create('Migration did not stop after one verified cleanup chunk');
+    FreeAndNil(lService);
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 3) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE evidence_state=5') <> 200) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE evidence_state=0') <> 250) then
+      raise Exception.Create('Migration chunk was not durable and bounded at 200 rows');
+    lConnection.Connected := False;
+    lConfig.MigrationObserver := nil;
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(10000)) or (not lService.Diagnostics.Available) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Migration resume failed: ' + lService.Diagnostics.LastError);
+    lConnection.Connected := True;
+    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE evidence_state=5 ' +
+      'AND summary=''headline-''||id AND context_text='''' AND trace_status=2') <> 450) or
+      (Length(TDirectory.GetFiles(ExtractFilePath(lFileName),
+        ExtractFileName(lFileName) + '.pre-migration-*.bak')) <> 1) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_status WHERE migration_backup_path<>''''') <> 1) then
+      raise Exception.Create('Migration resume lost headlines/backup path or made a second backup');
+    lConnection.Connected := False;
+    Writeln('PASS RunHistoryMigrationResumeSelfTest: verified source unchanged, 200+250 rows, one backup');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryMigrationCopyCancelSelfTest: Integer;
+var
+  lConfig: TMachineOverviewHistoryConfig;
+  lFileName: string;
+  lSentinel: string;
+  lService: TMachineOverviewHistoryService;
+  lCancelled: Boolean;
+begin
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('migration-copy-cancel');
+  lService := nil;
+  lCancelled := False;
+  lSentinel := lFileName + '.pre-migration-v2-existing.bak';
+  try
+    CreateHistoryV2Fixture(lFileName, 3);
+    TFile.WriteAllText(lSentinel, 'existing backup must remain');
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 16, 32 * 1024 * 1024);
+    lConfig.MigrationObserver :=
+      procedure(aStage: string)
+      begin
+        if aStage = 'CopyProgress' then
+        begin
+          lCancelled := True;
+          if not Assigned(lService) then
+            raise Exception.Create('Copy observer has no active service');
+          if lService.Stop(0) <> TMachineOverviewShutdownResult.TimedOut then
+            raise Exception.Create('Writer cancellation did not set the stopping state');
+        end;
+      end;
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(10000)) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) or
+      lService.Diagnostics.Available or (not lCancelled) then
+      raise Exception.Create('CopyFileEx cancellation did not abort migration');
+    AssertHistoryBackupSourceUnchanged(lFileName, 3);
+    if (TFile.ReadAllText(lSentinel) <> 'existing backup must remain') or
+      (Length(TDirectory.GetFiles(ExtractFilePath(lFileName),
+        ExtractFileName(lFileName) + '.pre-migration-*')) <> 1) then
+      raise Exception.Create('Cancellation retained a partial file or touched an existing backup');
+    Writeln('PASS RunHistoryMigrationCopyCancelSelfTest: partial copy removed, prior backup preserved');
+    Result := 0;
+  finally
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryReopenPartialSelfTest: Integer;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lFileName: string;
+  lService: TMachineOverviewHistoryService;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('reopen-partial');
+  lService := nil;
+  try
+    CreateHistoryV2Fixture(lFileName, 3);
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 16, 32 * 1024 * 1024);
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(5000)) or (not lService.Diagnostics.Available) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Partial fixture migration failed');
+    FreeAndNil(lService);
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    lConnection.ExecSQL('UPDATE incident SET evidence_state=1 WHERE id=1');
+    lConnection.ExecSQL('UPDATE incident SET ended_utc_ms=0 WHERE id=2');
+    lConnection.ExecSQL('INSERT INTO incident_evidence VALUES ' +
+      '(''legacy-1'',1,1,1,2,''{}''),(''legacy-2'',2,2,2,2,''{}''),(''legacy-3'',3,3,2,2,''{}'')');
+    lConnection.Connected := False;
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(5000)) or (not lService.Diagnostics.Available) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Partial recovery reopen failed');
+    lConnection.Connected := True;
+    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE evidence_state=3') <> 2) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence WHERE state=3') <> 2) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence WHERE state=2') <> 1) then
+      raise Exception.Create('Collecting/unended recovery damaged completion states');
+    lConnection.Connected := False;
+    Writeln('PASS RunHistoryReopenPartialSelfTest: Collecting/unended Partial, Complete preserved');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryIncidentHeavyLegacySelfTest: Integer;
+var
+  g: TGarbos;
+  i: Int64;
+  lBackupFiles: TArray<string>;
+  lChange: TMachineOverviewIncidentChange;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lDatabaseFileName: string;
+  lDirectory: string;
+  lFileBytes: Int64;
+  lService: TMachineOverviewHistoryService;
+  lTestUtc: TDateTime;
+  lUsedBytes: Int64;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lDirectory := TPath.Combine(TPath.GetTempPath,
+    'ActiveAppView-MachineOverview\history-tests');
+  TDirectory.CreateDirectory(lDirectory);
+  lDatabaseFileName := TPath.Combine(lDirectory,
+    Format('heavy-legacy-%d-%d.db', [GetCurrentProcessId, GetTickCount64]));
+  lService := nil;
+  lConnection := nil;
+  try
+    lConfig := CreateHistoryReliabilityConfig(lDatabaseFileName, 64,
+      32 * 1024 * 1024);
+    lTestUtc := EncodeDate(2026, 10, 20) + EncodeTime(18, 0, 0, 0);
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(5000)) or
+      (not lService.Diagnostics.Available) then
+      raise Exception.Create('heavy legacy fixture initialization failed: ' +
+        lService.Diagnostics.LastError);
+    for i := 1 to 40 do
+    begin
+      lChange := Default(TMachineOverviewIncidentChange);
+      lChange.Incident.StableId := 'heavy-legacy-' + IntToStr(i);
+      lChange.Incident.StartedAtUtc := IncMinute(lTestUtc, -i);
+      lChange.Incident.EndedAtUtc := IncSecond(lTestUtc, -i);
+      lChange.Incident.Summary := 'preserved headline ' + IntToStr(i);
+      if lService.EnqueueIncident(lChange) <>
+        TMachineOverviewHistoryEnqueueResult.Queued then
+        raise Exception.Create('heavy legacy incident enqueue failed');
+    end;
+    if (not lService.Flush(5000)) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('heavy legacy fixture flush failed');
+    FreeAndNil(lService);
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lDatabaseFileName, lConnection);
+    lConnection.ExecSQL('UPDATE incident SET pre_context_json=' +
+      '''["'' || replace(hex(zeroblob(131070)), ''00'', ''x'') || ''"]'', ' +
+      'post_context_json=''[]'', evidence_state=0, context_text=' +
+      'replace(hex(zeroblob(131070)), ''00'', ''x'')');
+    lConnection.ExecSQL('WITH RECURSIVE samples(n) AS (SELECT 1 UNION ALL ' +
+      'SELECT n+1 FROM samples WHERE n<3600) ' +
+      'INSERT INTO system_sample_raw(utc_ms, monotonic_ms, provider_status, ' +
+      'provider_error, cpu_available, cpu_total, physical_available_bytes, ' +
+      'logical_cpu_blob) SELECT 1792519200000-n*1000, n, 0, '''', 1, 20, ' +
+      '1000000, X'''' FROM samples');
+    lConnection.ExecSQL('PRAGMA user_version=2');
+    lConnection.ExecSQL('PRAGMA wal_checkpoint(TRUNCATE)');
+    lFileBytes := QueryHistoryInt64(lConnection, 'PRAGMA page_count') *
+      QueryHistoryInt64(lConnection, 'PRAGMA page_size');
+    lConnection.Connected := False;
+    lConfig.MaxDatabaseSizeBytes := 4 * 1024 * 1024;
+    lConfig.CompactionMinimumFreeBytes := 1024 * 1024;
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(10000)) or
+      (not lService.Diagnostics.Available) then
+      raise Exception.Create('heavy legacy reopen failed: ' +
+        lService.Diagnostics.LastError);
+    for i := 1 to 20 do
+      if lService.EnqueueRaw(CreateHistorySystemTestSample(
+        IncSecond(lTestUtc, i), 900000 + UInt64(i), 42)) <>
+        TMachineOverviewHistoryEnqueueResult.Queued then
+        raise Exception.Create('heavy legacy new sample enqueue failed');
+    if (not lService.Flush(10000)) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('heavy legacy new sample flush failed');
+    FreeAndNil(lService);
+    lConnection.Connected := True;
+    lUsedBytes := (QueryHistoryInt64(lConnection, 'PRAGMA page_count') -
+      QueryHistoryInt64(lConnection, 'PRAGMA freelist_count')) *
+      QueryHistoryInt64(lConnection, 'PRAGMA page_size');
+    Writeln(Format('RunHistoryIncidentHeavyLegacySelfTest: used=%d budget=%d initial_file=%d new_samples=%d',
+      [lUsedBytes, lConfig.MaxDatabaseSizeBytes, lFileBytes,
+       QueryHistoryInt64(lConnection,
+         'SELECT COUNT(*) FROM system_sample_raw WHERE monotonic_ms>900000')]));
+    if (lUsedBytes > Int64(lConfig.MaxDatabaseSizeBytes)) or
+      (QueryHistoryInt64(lConnection,
+        'SELECT COUNT(*) FROM system_sample_raw WHERE monotonic_ms>900000') <> 20) then
+    begin
+      Writeln('SELFTEST FAILED: heavy legacy history exceeds budget or erases new samples');
+      Exit;
+    end;
+    if QueryHistoryInt64(lConnection,
+      'SELECT COUNT(*) FROM incident WHERE evidence_state=5 AND ' +
+      'pre_context_json=''[]'' AND post_context_json=''[]'' AND context_text=''''') <> 40 then
+      raise Exception.Create('heavy legacy headlines or cleanup state lost');
+    lConnection.Connected := False;
+    lBackupFiles := TDirectory.GetFiles(lDirectory,
+      ExtractFileName(lDatabaseFileName) + '.pre-migration-v2-*.bak');
+    if Length(lBackupFiles) <> 1 then
+      raise Exception.Create('heavy legacy verified backup missing');
+    lConnection.Params.Values['Database'] := lBackupFiles[0];
+    lConnection.Params.Values['OpenMode'] := 'ReadOnly';
+    lConnection.Connected := True;
+    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident') <> 40) or
+      (QueryHistoryInt64(lConnection,
+        'SELECT COUNT(*) FROM incident WHERE length(context_text)>100000') <> 40) then
+      raise Exception.Create('heavy legacy backup did not preserve context');
+    lConnection.Connected := False;
+    if TFile.GetSize(lDatabaseFileName) >= lFileBytes then
+      raise Exception.Create('heavy legacy startup compaction did not shrink file');
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(10000)) or
+      (not lService.Diagnostics.Available) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('heavy legacy migrated reopen failed');
+    lConnection.Params.Values['Database'] := lDatabaseFileName;
+    lConnection.Connected := True;
+    if (QueryHistoryInt64(lConnection,
+      'SELECT COUNT(*) FROM incident WHERE evidence_state=5') <> 40) or
+      (QueryHistoryInt64(lConnection,
+        'SELECT COUNT(*) FROM system_sample_raw WHERE monotonic_ms>900000') <> 20) then
+      raise Exception.Create('heavy legacy migrated reopen lost rows');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lDatabaseFileName);
+    for lDatabaseFileName in TDirectory.GetFiles(lDirectory,
+      ExtractFileName(lDatabaseFileName) + '.pre-migration-*') do
+      TFile.Delete(lDatabaseFileName);
+  end;
+end;
+
+function RunHistoryCompactionSpaceSelfTest: Integer;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lFileName: string;
+  lService: TMachineOverviewHistoryService;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lConnection := nil;
+  lService := nil;
+  lFileName := NewHistoryMigrationFile('compaction-space');
+  try
+    CreateHistoryV2Fixture(lFileName, 3);
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 16, 32 * 1024 * 1024);
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(5000)) or (not lService.Diagnostics.Available) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Compaction fixture migration failed');
+    FreeAndNil(lService);
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    lConnection.ExecSQL('UPDATE incident SET evidence_state=0, context_text=hex(zeroblob(524288))');
+    lConnection.Connected := False;
+    lConfig.CompactionMinimumFreeBytes := 1024;
+    lConfig.DiskFreeBytesOverride := 0;
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(5000)) or (not lService.Diagnostics.Available) or
+      (not ContainsText(lService.Diagnostics.LastError, 'compaction deferred')) then
+      raise Exception.Create('Compaction space refusal was fatal or missing diagnostics');
+    if (lService.EnqueueRaw(CreateHistorySystemTestSample(
+      EncodeDate(2026, 10, 20), 1, 42)) <> TMachineOverviewHistoryEnqueueResult.Queued) or
+      (not lService.Flush(5000)) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Compaction space refusal stopped history recording');
+    FreeAndNil(lService);
+    lConnection.Connected := True;
+    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_status WHERE ' +
+      'last_error LIKE ''%compaction deferred%'' AND last_compaction_utc_ms=0') <> 1) or
+      (QueryHistoryInt64(lConnection, 'PRAGMA freelist_count') = 0) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM system_sample_raw') <> 1) then
+      raise Exception.Create('Deferred compaction status/free pages/sample not preserved');
+    lConnection.ExecSQL('PRAGMA user_version=4');
+    lConnection.Connected := False;
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(5000)) or lService.Diagnostics.Available or
+      (not ContainsText(lService.Diagnostics.LastError, 'newer than supported')) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Newer schema was not refused');
+    lConnection.Connected := True;
+    if QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 4 then
+      raise Exception.Create('Newer schema changed during refused open');
+    lConnection.Connected := False;
+    Writeln('PASS RunHistoryCompactionSpaceSelfTest: deferred nonfatal, recording continues, newer schema refused');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
 function RunMachineOverviewHistorySelfTests(const aArg: string): Integer;
 begin
   Result := -1;
@@ -1279,7 +1778,19 @@ begin
   if not SameText(aArg, cMachineOverviewHistorySelfTestArg) then
     Exit;
   try
-    Result := RunLogicalProcessorBlobSelfTest;
+    Result := RunHistoryIncidentHeavyLegacySelfTest;
+    if Result = 0 then
+      Result := RunHistoryMigrationBackupSpaceSelfTest;
+    if Result = 0 then
+      Result := RunHistoryMigrationResumeSelfTest;
+    if Result = 0 then
+      Result := RunHistoryMigrationCopyCancelSelfTest;
+    if Result = 0 then
+      Result := RunHistoryReopenPartialSelfTest;
+    if Result = 0 then
+      Result := RunHistoryCompactionSpaceSelfTest;
+    if Result = 0 then
+      Result := RunLogicalProcessorBlobSelfTest;
     if Result = 0 then
       Result := RunHistoryConfigSelfTest;
     if Result = 0 then

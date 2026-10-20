@@ -61,6 +61,7 @@ function CreateHistoryConfig(const aDatabaseFileName: string):
   TMachineOverviewHistoryConfig;
 begin
   Result := Default(TMachineOverviewHistoryConfig);
+  Result.DiskFreeBytesOverride := -1;
   Result.Enabled := True;
   Result.DatabaseFileName := aDatabaseFileName;
   Result.CommitIntervalMs := 60000;
@@ -172,7 +173,7 @@ begin
   end;
 
   lDirectory := TPath.Combine(TPath.GetTempPath,
-    'ActiveAppView-MachineOverview\incident-view-tests');
+    'ActiveAppView-MachineOverview\history-tests');
   TDirectory.CreateDirectory(lDirectory);
   lDatabaseFileName := TPath.Combine(lDirectory,
     Format('incident-view-%d-%d.db',
@@ -194,6 +195,11 @@ begin
       'Recent');
     if not PersistIncidents(lDatabaseFileName, lChanges) then
       Exit;
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureLockConnection(lDatabaseFileName, lConnection);
+    lConnection.ExecSQL('PRAGMA user_version=2');
+    lConnection.ExecSQL('UPDATE incident SET pre_context_json=''invalid legacy context''');
+    lConnection.Connected := False;
 
     GC(lForm, TMachineOverviewHistoryFrm.Create(nil), g);
     if (Trim(lForm.Caption) = '') or
@@ -223,6 +229,7 @@ begin
       (lForm.IncidentAt(2).StableId <> 'beta') or
       (lForm.IncidentAt(3).StableId <> 'boundary') or
       (lForm.SelectedIncidentId <> 'recent') or
+      (not ContainsText(lForm.labStatus.Caption, 'History upgrade pending')) or
       (lForm.LastQueryThreadId = GetCurrentThreadId) or
       (lForm.LastApplyThreadId <> GetCurrentThreadId) then
     begin
@@ -239,8 +246,8 @@ begin
       (not ContainsText(lDetails, 'Beta details')) or
       (not ContainsText(lDetails, 'physical:0')) or
       (not ContainsText(lDetails, 'C:\Test\history.exe')) or
-      (not ContainsText(lDetails, 'before beta')) or
-      (not ContainsText(lDetails, 'after beta')) then
+      ContainsText(lDetails, 'before beta') or
+      ContainsText(lDetails, 'after beta') then
     begin
       Writeln('SELFTEST FAILED: incident details are incomplete');
       Exit;
@@ -249,6 +256,9 @@ begin
     SetLength(lChanges, 1);
     lChanges[0] := CreateIncidentChange('newest', IncMinute(lNowUtc, -30),
       'Newest');
+    lConnection.Connected := True;
+    lConnection.ExecSQL('PRAGMA user_version=3');
+    lConnection.Connected := False;
     if (not PersistIncidents(lDatabaseFileName, lChanges)) or
       (not lForm.RefreshAndWaitForTest(False, 5000)) or
       (lForm.IncidentAt(0).StableId <> 'newest') or
@@ -258,7 +268,6 @@ begin
       Exit;
     end;
 
-    GC(lConnection, TFDConnection.Create(nil), g);
     ConfigureLockConnection(lDatabaseFileName, lConnection);
     lConnection.ExecSQL('BEGIN EXCLUSIVE');
     try

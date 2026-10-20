@@ -23,6 +23,10 @@ type
     Rollup1mRetentionDays: Integer;
     MaxDatabaseSizeBytes: UInt64;
     BusyTimeoutMs: Cardinal;
+  DiskFreeBytesOverride: Int64;
+  CompactionMinimumFreeBytes: UInt64;
+  // Our fixture observer runs on the writer thread; production leaves it unset.
+  MigrationObserver: TProc<string>;
     class function FromSettings(const aSettings: TMachineOverviewSettings;
       const aDatabaseFileName: string): TMachineOverviewHistoryConfig; static;
   end;
@@ -112,7 +116,7 @@ uses
   System.Classes, System.DateUtils, System.Generics.Collections, System.IOUtils,
   System.JSON, System.Math, System.StrUtils, System.SyncObjs,
   Winapi.Windows,
-  Data.DB, FireDAC.Comp.Client, FireDAC.Phys.SQLite,
+  AutoFree, Data.DB, FireDAC.Comp.Client, FireDAC.Phys.SQLite,
   FireDAC.Phys.SQLiteDef, FireDAC.Phys.SQLiteWrapper,
   FireDAC.Stan.Async, FireDAC.Stan.Def,
   ActiveAppView.MachineOverview.Providers;
@@ -150,6 +154,10 @@ type
 
   TMachineOverviewHistoryStore = class
   private
+    fStopping: PInteger;
+    fCopyCreated: Boolean;
+    fBackupPath: string;
+    fStartupError: string;
     fConfig: TMachineOverviewHistoryConfig;
     fConnection: TFDConnection;
     fDatabaseExisted: Boolean;
@@ -164,7 +172,15 @@ type
     function ApplyStorageCap: Integer;
     procedure ConfigureConnection;
     procedure CreateOrMigrateSchema;
-    procedure EnsureIncidentColumn(const aName, aDefinition: string);
+    procedure EnsureColumn(const aTable, aName, aDefinition: string);
+    function Scalar(const aSql: string): Int64;
+    function IsStopping: Boolean;
+    procedure Observe(const aStage: string);
+    function FreeBytes(const aPath: string): UInt64;
+    procedure BackupDatabase(const aVersion: Integer);
+    procedure CopyBackupFile(const aSource, aDestination: string);
+    procedure RecoverLegacyIncidents;
+    procedure CompactAtStartup;
     function LoadIncidents(const aEarliestUtc: TDateTime;
       const aMaximumCount: Integer): TArray<TMachineOverviewIncident>;
     procedure PrepareStatements;
@@ -176,7 +192,8 @@ type
     procedure WriteProcessSample(const aSample: IMachineOverviewRawSample);
     procedure WriteSystemSample(const aSample: IMachineOverviewRawSample);
   public
-    constructor Create(const aConfig: TMachineOverviewHistoryConfig);
+    constructor Create(const aConfig: TMachineOverviewHistoryConfig;
+      const aStopping: PInteger);
     destructor Destroy; override;
     function WriteBatch(const aItems: TArray<TMachineOverviewHistoryItem>):
       Integer;
@@ -227,10 +244,13 @@ type
 
 const
   cMachineOverviewHistoryDatabaseFileName = 'MachineOverviewHistory.db';
-  cMachineOverviewHistorySchemaVersion = 2;
+  cMachineOverviewHistorySchemaVersion = 3;
   cMachineOverviewHistoryWriteBatchSize = 256;
   cMachineOverviewHistoryRetryDelayMs = 250;
   cMachineOverviewSQLiteDriverId = 'SQLite_MachineOverview';
+
+resourcestring
+  rsHistoryUpgradePending = 'History upgrade pending';
 
 function GetHistoryBacklogState(const aState: TObject):
   TMachineOverviewHistoryBacklogState;
@@ -388,80 +408,6 @@ begin
   end;
 end;
 
-function HistoryContextToJson(
-  const aValues: TArray<TMachineOverviewIncidentContext>): string;
-var
-  lArray: TJSONArray;
-  lObject: TJSONObject;
-  lValue: TMachineOverviewIncidentContext;
-begin
-  lArray := TJSONArray.Create;
-  try
-    for lValue in aValues do
-    begin
-      lObject := TJSONObject.Create;
-      lObject.AddPair('utc_ms',
-        TJSONNumber.Create(HistoryUtcMilliseconds(lValue.CapturedAtUtc)));
-      lObject.AddPair('monotonic_ms',
-        TJSONNumber.Create(lValue.CapturedAtMonotonicMs));
-      lObject.AddPair('provider_id', lValue.ProviderId);
-      lObject.AddPair('summary', lValue.Summary);
-      lArray.AddElement(lObject);
-    end;
-    Result := lArray.ToJSON;
-  finally
-    lArray.Free;
-  end;
-end;
-
-function TryHistoryContextFromJson(const aText: string;
-  out aValues: TArray<TMachineOverviewIncidentContext>): Boolean;
-var
-  i: Integer;
-  lArray: TJSONArray;
-  lJsonValue: TJSONValue;
-  lMonotonicMs: UInt64;
-  lObject: TJSONObject;
-  lUtcMs: Int64;
-  lValue: TJSONValue;
-begin
-  aValues := nil;
-  lJsonValue := TJSONObject.ParseJSONValue(aText);
-  try
-    Result := lJsonValue is TJSONArray;
-    if not Result then
-      Exit;
-    lArray := lJsonValue as TJSONArray;
-    SetLength(aValues, lArray.Count);
-    for i := 0 to lArray.Count - 1 do
-    begin
-      if not (lArray.Items[i] is TJSONObject) then
-        Exit(False);
-      lObject := lArray.Items[i] as TJSONObject;
-      lValue := lObject.GetValue('utc_ms');
-      if (not Assigned(lValue)) or
-        (not TryStrToInt64(lValue.Value, lUtcMs)) then
-        Exit(False);
-      lValue := lObject.GetValue('monotonic_ms');
-      if (not Assigned(lValue)) or
-        (not TryStrToUInt64(lValue.Value, lMonotonicMs)) then
-        Exit(False);
-      aValues[i].CapturedAtUtc :=
-        HistoryDateTimeFromMilliseconds(lUtcMs);
-      aValues[i].CapturedAtMonotonicMs := lMonotonicMs;
-      lValue := lObject.GetValue('provider_id');
-      if Assigned(lValue) then
-        aValues[i].ProviderId := lValue.Value;
-      lValue := lObject.GetValue('summary');
-      if Assigned(lValue) then
-        aValues[i].Summary := lValue.Value;
-    end;
-    Result := True;
-  finally
-    lJsonValue.Free;
-  end;
-end;
-
 function HistoryLogicalProcessors(
   const aSample: TMachineOverviewProviderSample):
   TArray<TMachineOverviewOptionalDouble>;
@@ -492,13 +438,16 @@ begin
 end;
 
 constructor TMachineOverviewHistoryStore.Create(
-  const aConfig: TMachineOverviewHistoryConfig);
+  const aConfig: TMachineOverviewHistoryConfig; const aStopping: PInteger);
 begin
   inherited Create;
   fConfig := aConfig;
+  fStopping := aStopping;
   try
     ConfigureConnection;
     CreateOrMigrateSchema;
+    RecoverLegacyIncidents;
+    CompactAtStartup;
     PrepareStatements;
   except
     FreeAndNil(fRollup1m);
@@ -526,6 +475,22 @@ begin
   inherited Destroy;
 end;
 
+function HistoryJournalMode(const aFileName: string): string;
+var
+  g: TGarbos;
+  lHeader: array[0..19] of Byte;
+  lStream: TFileStream;
+begin
+  g := Default(TGarbos);
+  Result := 'DELETE';
+  if not TFile.Exists(aFileName) then
+    Exit;
+  GC(lStream, TFileStream.Create(aFileName, fmOpenRead or fmShareDenyNone), g);
+  if (lStream.Read(lHeader, SizeOf(lHeader)) = SizeOf(lHeader)) and
+    (lHeader[18] = 2) and (lHeader[19] = 2) then
+    Result := 'WAL';
+end;
+
 procedure TMachineOverviewHistoryStore.ConfigureConnection;
 var
   lDirectory: string;
@@ -536,7 +501,7 @@ begin
     TDirectory.CreateDirectory(lDirectory);
   fDatabaseExisted := TFile.Exists(fConfig.DatabaseFileName);
   if fDatabaseExisted then
-    lOpenMode := 'ReadWrite'
+    lOpenMode := 'ReadOnly'
   else
     lOpenMode := 'CreateUTF8';
   fConnection := TFDConnection.Create(nil);
@@ -552,13 +517,16 @@ begin
   fConnection.Params.Values['Database'] := fConfig.DatabaseFileName;
   fConnection.Params.Values['OpenMode'] := lOpenMode;
   fConnection.Params.Values['LockingMode'] := 'Normal';
+  // FireDAC otherwise requests DELETE even on a read-only WAL connection.
+  fConnection.Params.Values['JournalMode'] := HistoryJournalMode(fConfig.DatabaseFileName);
   fConnection.Params.Values['SharedCache'] := 'False';
   fConnection.Params.Values['BusyTimeout'] := IntToStr(fConfig.BusyTimeoutMs);
   fConnection.Connected := True;
+  Observe('ConnectionOpened');
 end;
 
-procedure TMachineOverviewHistoryStore.EnsureIncidentColumn(
-  const aName, aDefinition: string);
+procedure TMachineOverviewHistoryStore.EnsureColumn(
+  const aTable, aName, aDefinition: string);
 var
   lExists: Boolean;
   lQuery: TFDQuery;
@@ -567,7 +535,7 @@ begin
   lQuery := TFDQuery.Create(nil);
   try
     lQuery.Connection := fConnection;
-    lQuery.Open('PRAGMA table_info(incident)');
+    lQuery.Open('PRAGMA table_info(' + aTable + ')');
     while not lQuery.Eof do
     begin
       if SameText(lQuery.FieldByName('name').AsString, aName) then
@@ -581,8 +549,248 @@ begin
     lQuery.Free;
   end;
   if not lExists then
-    fConnection.ExecSQL('ALTER TABLE incident ADD COLUMN ' + aName + ' ' +
+      fConnection.ExecSQL('ALTER TABLE ' + aTable + ' ADD COLUMN ' + aName + ' ' +
       aDefinition);
+end;
+
+function TMachineOverviewHistoryStore.Scalar(const aSql: string): Int64;
+var
+  g: TGarbos;
+  lQuery: TFDQuery;
+begin
+  g := Default(TGarbos);
+  GC(lQuery, TFDQuery.Create(nil), g);
+  lQuery.Connection := fConnection;
+  lQuery.Open(aSql);
+  Result := lQuery.Fields[0].AsLargeInt;
+end;
+
+function TMachineOverviewHistoryStore.IsStopping: Boolean;
+begin
+  Result := Assigned(fStopping) and
+    (TInterlocked.CompareExchange(fStopping^, 0, 0) <> 0);
+end;
+
+procedure TMachineOverviewHistoryStore.Observe(const aStage: string);
+begin
+  if Assigned(fConfig.MigrationObserver) then
+    fConfig.MigrationObserver(aStage);
+  if IsStopping then
+    raise EAbort.Create('History upgrade cancelled');
+end;
+
+function TMachineOverviewHistoryStore.FreeBytes(const aPath: string): UInt64;
+var
+  lAvailable: UInt64;
+begin
+  if fConfig.DiskFreeBytesOverride >= 0 then
+    Exit(UInt64(fConfig.DiskFreeBytesOverride));
+  if not GetDiskFreeSpaceEx(PChar(ExtractFilePath(aPath)), @lAvailable, nil, nil) then
+    RaiseLastOSError;
+  Result := UInt64(lAvailable);
+end;
+
+function HistoryCopyProgress(aTotalSize, aTransferred, aStreamSize,
+  aStreamTransferred: Int64; aStreamNumber, aReason: DWORD;
+  aSource, aDestination: THandle; aData: Pointer): DWORD; stdcall;
+var
+  lStore: TMachineOverviewHistoryStore;
+begin
+  lStore := TMachineOverviewHistoryStore(aData);
+  if (not lStore.fCopyCreated) and Assigned(lStore.fConfig.MigrationObserver) then
+  begin
+    try
+      lStore.fConfig.MigrationObserver('CopyProgress');
+    except
+      on lException: Exception do
+      begin
+        lStore.fStartupError := lException.Message;
+        lStore.fCopyCreated := True;
+        Exit(PROGRESS_CANCEL);
+      end;
+    end;
+  end;
+  lStore.fCopyCreated := True;
+  if lStore.IsStopping then
+    Result := PROGRESS_CANCEL
+  else
+    Result := PROGRESS_CONTINUE;
+end;
+
+procedure TMachineOverviewHistoryStore.CopyBackupFile(
+  const aSource, aDestination: string);
+var
+  lError: Cardinal;
+begin
+  Observe('BeforeCopy');
+  fCopyCreated := False;
+  if not CopyFileEx(PChar(aSource), PChar(aDestination), @HistoryCopyProgress,
+    Self, nil, COPY_FILE_FAIL_IF_EXISTS) then
+  begin
+    lError := GetLastError;
+    if fCopyCreated and TFile.Exists(aDestination) then
+      TFile.Delete(aDestination);
+    raise EOSError.CreateFmt('History backup copy failed (%d): %s',
+        [lError, SysErrorMessage(lError) + ' ' + fStartupError]);
+  end;
+end;
+
+procedure TMachineOverviewHistoryStore.BackupDatabase(const aVersion: Integer);
+var
+  g: TGarbos;
+  lBackup: TFDConnection;
+  lCount: Int64;
+  lHasIncidents: Boolean;
+  lPath: string;
+  lQuery: TFDQuery;
+  lRequired: Int64;
+  lWalCopied: Boolean;
+  lMainCopied: Boolean;
+  lBackupTime: TDateTime;
+begin
+  g := Default(TGarbos);
+  lBackup := nil;
+  lRequired := TFile.GetSize(fConfig.DatabaseFileName) + 256 * 1024 * 1024;
+  if TFile.Exists(fConfig.DatabaseFileName + '-wal') then
+    Inc(lRequired, TFile.GetSize(fConfig.DatabaseFileName + '-wal'));
+  if FreeBytes(fConfig.DatabaseFileName) < UInt64(lRequired) then
+    raise EInvalidOperation.CreateFmt('MigrationBlocked: History upgrade paused: ' +
+      'needs %.2f GB free on %s to back up MachineOverviewHistory.db first. ' +
+      'Live monitoring continues; history recording is off.',
+      [lRequired / (1024.0 * 1024 * 1024), ExtractFileDrive(fConfig.DatabaseFileName)]);
+  Observe('BackupGatePassed');
+  lHasIncidents := Scalar('SELECT COUNT(*) FROM sqlite_master WHERE ' +
+    'type=''table'' AND name=''incident''') <> 0;
+  lCount := 0;
+  if lHasIncidents then
+    lCount := Scalar('SELECT COUNT(*) FROM incident');
+  fConnection.Connected := False;
+  fConnection.Params.Values['OpenMode'] := 'ReadWrite';
+  fConnection.Connected := True;
+  fConnection.ExecSQL('PRAGMA wal_checkpoint(TRUNCATE)');
+  fConnection.Connected := False;
+  lBackupTime := Now;
+  repeat
+    lPath := fConfig.DatabaseFileName + '.pre-migration-v' + IntToStr(aVersion) +
+      '-' + FormatDateTime('yyyymmddhhnnss', lBackupTime) + '.bak';
+    lBackupTime := IncSecond(lBackupTime);
+  until (not TFile.Exists(lPath)) and (not TFile.Exists(lPath + '-wal')) and
+    (not TFile.Exists(lPath + '-shm'));
+  lWalCopied := False;
+  lMainCopied := False;
+  try
+    CopyBackupFile(fConfig.DatabaseFileName, lPath);
+    lMainCopied := True;
+    if TFile.Exists(fConfig.DatabaseFileName + '-wal') and
+      (TFile.GetSize(fConfig.DatabaseFileName + '-wal') > 0) then
+    begin
+      CopyBackupFile(fConfig.DatabaseFileName + '-wal', lPath + '-wal');
+      lWalCopied := True;
+    end;
+    if TFile.GetSize(lPath) <> TFile.GetSize(fConfig.DatabaseFileName) then
+      raise EInvalidOperation.Create('History backup size verification failed');
+    GC(lBackup, TFDConnection.Create(nil), g);
+    lBackup.Params.Assign(fConnection.Params);
+    lBackup.Params.Values['Database'] := lPath;
+    lBackup.Params.Values['OpenMode'] := 'ReadOnly';
+    lBackup.LoginPrompt := False;
+    lBackup.ResourceOptions.SilentMode := True;
+    lBackup.Connected := True;
+    lBackup.ExecSQL('PRAGMA query_only=ON');
+    if lHasIncidents then
+    begin
+      GC(lQuery, TFDQuery.Create(nil), g);
+      lQuery.Connection := lBackup;
+      lQuery.Open('SELECT COUNT(*) FROM incident');
+      if lQuery.Fields[0].AsLargeInt <> lCount then
+        raise EInvalidOperation.Create('History backup incident count verification failed');
+      lQuery.Close;
+    end;
+    lBackup.Connected := False;
+  except
+    if Assigned(lBackup) then
+      lBackup.Connected := False;
+    if lWalCopied then
+      TFile.Delete(lPath + '-wal');
+    if lMainCopied then
+      TFile.Delete(lPath);
+    raise;
+  end;
+  fBackupPath := lPath;
+  Observe('BackupVerified');
+  fConnection.Connected := True;
+end;
+
+procedure TMachineOverviewHistoryStore.RecoverLegacyIncidents;
+var
+  lCount: Integer;
+begin
+  repeat
+    Observe('BeforeCleanupChunk');
+    fConnection.StartTransaction;
+    try
+      lCount := fConnection.ExecSQL('UPDATE incident SET pre_context_json=''[]'', ' +
+        'post_context_json=''[]'', context_text='''', evidence_state=5 ' +
+        'WHERE id IN (SELECT id FROM incident WHERE evidence_state=0 ORDER BY id LIMIT 200)');
+      fConnection.Commit;
+    except
+      if fConnection.InTransaction then
+        fConnection.Rollback;
+      raise;
+    end;
+    if lCount > 0 then
+      Observe('CleanupChunkCommitted');
+  until lCount = 0;
+  Observe('BeforeRecovery');
+  fConnection.StartTransaction;
+  try
+    fConnection.ExecSQL('UPDATE incident_evidence SET state=3 WHERE state=1 OR ' +
+      'incident_key IN (SELECT incident_key FROM incident WHERE ended_utc_ms=0)');
+    fConnection.ExecSQL('UPDATE incident SET evidence_state=3 WHERE evidence_state=1 OR ended_utc_ms=0');
+    fConnection.Commit;
+  except
+    if fConnection.InTransaction then
+      fConnection.Rollback;
+    raise;
+  end;
+end;
+
+procedure TMachineOverviewHistoryStore.CompactAtStartup;
+var
+  lFileBytes, lFreeBytes, lMinimum, lRequired, lUsedBytes: Int64;
+begin
+  lFileBytes := Scalar('PRAGMA page_count') * Scalar('PRAGMA page_size');
+  lFreeBytes := Scalar('PRAGMA freelist_count') * Scalar('PRAGMA page_size');
+  lMinimum := Int64(fConfig.CompactionMinimumFreeBytes);
+  if lMinimum = 0 then
+    lMinimum := Max(Int64(256 * 1024 * 1024), Int64(fConfig.MaxDatabaseSizeBytes div 4));
+  if lFreeBytes <= lMinimum then
+    Exit;
+  Observe('BeforeCompaction');
+  lUsedBytes := lFileBytes - lFreeBytes;
+  lRequired := lUsedBytes + 256 * 1024 * 1024;
+  try
+    if (FreeBytes(fConfig.DatabaseFileName) < UInt64(lRequired)) or
+      (FreeBytes(TPath.Combine(TPath.GetTempPath, 'history-vacuum')) < UInt64(lRequired)) then
+      raise EInvalidOperation.Create('History compaction deferred: insufficient database or TEMP drive space');
+    fConnection.ExecSQL('VACUUM');
+    fConnection.ExecSQL('PRAGMA wal_checkpoint(TRUNCATE)');
+    fConnection.ExecSQL('UPDATE history_status SET last_compaction_utc_ms=?, ' +
+      'last_compaction_reclaimed_bytes=? WHERE id=1',
+      [HistoryUtcMilliseconds(TTimeZone.Local.ToUniversalTime(Now)),
+       lFileBytes - TFile.GetSize(fConfig.DatabaseFileName)]);
+  except
+    on lException: Exception do
+    begin
+      fStartupError := lException.Message;
+      try
+        fConnection.ExecSQL('UPDATE history_status SET last_error=? WHERE id=1', [fStartupError]);
+      except
+        on lStatusError: Exception do
+          fStartupError := fStartupError + '; recording compaction status failed: ' + lStatusError.Message;
+      end;
+    end;
+  end;
 end;
 
 procedure TMachineOverviewHistoryStore.CreateOrMigrateSchema;
@@ -595,6 +803,7 @@ begin
     lQuery.Connection := fConnection;
     lQuery.Open('PRAGMA user_version');
     lVersion := lQuery.Fields[0].AsInteger;
+    Observe('SchemaVersionRead');
   finally
     lQuery.Free;
   end;
@@ -603,17 +812,16 @@ begin
       'Machine Overview history schema %d is newer than supported schema %d',
       [lVersion, cMachineOverviewHistorySchemaVersion]);
   if fDatabaseExisted and (lVersion < cMachineOverviewHistorySchemaVersion) then
+    BackupDatabase(lVersion)
+  else if fDatabaseExisted then
   begin
     fConnection.Connected := False;
-    TFile.Copy(fConfig.DatabaseFileName, fConfig.DatabaseFileName +
-      '.pre-migration-v' + IntToStr(lVersion) + '.bak', True);
-    if TFile.Exists(fConfig.DatabaseFileName + '-wal') then
-      TFile.Copy(fConfig.DatabaseFileName + '-wal', fConfig.DatabaseFileName +
-        '.pre-migration-v' + IntToStr(lVersion) + '.bak-wal', True);
+    fConnection.Params.Values['OpenMode'] := 'ReadWrite';
     fConnection.Connected := True;
   end;
   fConnection.ExecSQL('PRAGMA journal_mode=WAL');
   fConnection.ExecSQL('PRAGMA synchronous=NORMAL');
+  fConnection.ExecSQL('PRAGMA journal_size_limit=67108864');
   if lVersion = cMachineOverviewHistorySchemaVersion then
     Exit;
   fConnection.StartTransaction;
@@ -671,26 +879,50 @@ begin
       'related_executable_paths_json TEXT NOT NULL, ' +
       'trace_status INTEGER NOT NULL, pre_context_json TEXT NOT NULL, ' +
       'post_context_json TEXT NOT NULL, context_text TEXT NOT NULL)');
-    EnsureIncidentColumn('peak_utc_ms', 'INTEGER NOT NULL DEFAULT 0');
-    EnsureIncidentColumn('category', 'INTEGER NOT NULL DEFAULT 0');
-    EnsureIncidentColumn('origin', 'INTEGER NOT NULL DEFAULT 0');
-    EnsureIncidentColumn('local_display_time',
+    EnsureColumn('incident', 'peak_utc_ms', 'INTEGER NOT NULL DEFAULT 0');
+    EnsureColumn('incident', 'category', 'INTEGER NOT NULL DEFAULT 0');
+    EnsureColumn('incident', 'origin', 'INTEGER NOT NULL DEFAULT 0');
+    EnsureColumn('incident', 'local_display_time',
       'TEXT NOT NULL DEFAULT ''''');
-    EnsureIncidentColumn('explanation', 'TEXT NOT NULL DEFAULT ''''');
-    EnsureIncidentColumn('threshold_text', 'TEXT NOT NULL DEFAULT ''''');
-    EnsureIncidentColumn('peak_value', 'REAL NOT NULL DEFAULT 0');
-    EnsureIncidentColumn('provider_id', 'TEXT NOT NULL DEFAULT ''''');
-    EnsureIncidentColumn('provider_freshness_ms',
+    EnsureColumn('incident', 'explanation', 'TEXT NOT NULL DEFAULT ''''');
+    EnsureColumn('incident', 'threshold_text', 'TEXT NOT NULL DEFAULT ''''');
+    EnsureColumn('incident', 'peak_value', 'REAL NOT NULL DEFAULT 0');
+    EnsureColumn('incident', 'provider_id', 'TEXT NOT NULL DEFAULT ''''');
+    EnsureColumn('incident', 'provider_freshness_ms',
       'INTEGER NOT NULL DEFAULT 0');
-    EnsureIncidentColumn('related_entity_ids_json',
+    EnsureColumn('incident', 'related_entity_ids_json',
       'TEXT NOT NULL DEFAULT ''[]''');
-    EnsureIncidentColumn('related_executable_paths_json',
+    EnsureColumn('incident', 'related_executable_paths_json',
       'TEXT NOT NULL DEFAULT ''[]''');
-    EnsureIncidentColumn('trace_status', 'INTEGER NOT NULL DEFAULT 0');
-    EnsureIncidentColumn('pre_context_json',
+    EnsureColumn('incident', 'trace_status', 'INTEGER NOT NULL DEFAULT 0');
+    EnsureColumn('incident', 'pre_context_json',
       'TEXT NOT NULL DEFAULT ''[]''');
-    EnsureIncidentColumn('post_context_json',
+    EnsureColumn('incident', 'post_context_json',
       'TEXT NOT NULL DEFAULT ''[]''');
+    EnsureColumn('incident', 'evidence_state', 'INTEGER NOT NULL DEFAULT 0');
+    EnsureColumn('process_top_sample', 'interval_ms', 'INTEGER NOT NULL DEFAULT 0');
+    EnsureColumn('process_top_sample', 'logical_processor_count', 'INTEGER NOT NULL DEFAULT 0');
+    fConnection.ExecSQL('CREATE TABLE IF NOT EXISTS incident_evidence (' +
+      'incident_key TEXT PRIMARY KEY NOT NULL, started_utc_ms INTEGER NOT NULL, ' +
+      'updated_utc_ms INTEGER NOT NULL, state INTEGER NOT NULL, byte_count INTEGER NOT NULL, ' +
+      'evidence_json TEXT NOT NULL)');
+    fConnection.ExecSQL('CREATE INDEX IF NOT EXISTS idx_incident_evidence_started ' +
+      'ON incident_evidence(started_utc_ms, byte_count)');
+    fConnection.ExecSQL('CREATE TABLE IF NOT EXISTS history_status (' +
+      'id INTEGER PRIMARY KEY CHECK (id = 1), updated_utc_ms INTEGER NOT NULL, ' +
+      'maintenance_utc_ms INTEGER NOT NULL, commit_interval_ms INTEGER NOT NULL, ' +
+      'budget_bytes INTEGER NOT NULL, used_bytes INTEGER NOT NULL, file_bytes INTEGER NOT NULL, ' +
+      'wal_bytes INTEGER NOT NULL, evidence_bytes INTEGER NOT NULL, storage_state INTEGER NOT NULL, ' +
+      'storage_message TEXT NOT NULL, last_floor_breach_utc_ms INTEGER NOT NULL, ' +
+      'evidence_trimmed_total INTEGER NOT NULL, incidents_deleted_total INTEGER NOT NULL, ' +
+      'samples_deleted_total INTEGER NOT NULL, session_started_utc_ms INTEGER NOT NULL, ' +
+      'session_dropped_records INTEGER NOT NULL, process_interval_ms INTEGER NOT NULL, ' +
+      'system_interval_ms INTEGER NOT NULL, logical_processor_count INTEGER NOT NULL, ' +
+      'provider_status_text TEXT NOT NULL, last_error TEXT NOT NULL, ' +
+      'migration_backup_path TEXT NOT NULL, last_compaction_utc_ms INTEGER NOT NULL, ' +
+      'last_compaction_reclaimed_bytes INTEGER NOT NULL)');
+    fConnection.ExecSQL('INSERT OR IGNORE INTO history_status VALUES ' +
+      '(1,0,0,0,0,0,0,0,0,0,'''',0,0,0,0,0,0,0,0,0,'''','''',?,0,0)', [fBackupPath]);
     fConnection.ExecSQL('DELETE FROM incident WHERE id NOT IN (' +
       'SELECT MAX(id) FROM incident GROUP BY incident_key)');
     fConnection.ExecSQL('CREATE UNIQUE INDEX IF NOT EXISTS ' +
@@ -825,12 +1057,12 @@ begin
     'local_display_time, summary, explanation, threshold_text, peak_value, ' +
     'provider_id, provider_freshness_ms, related_entity_ids_json, ' +
     'related_executable_paths_json, trace_status, pre_context_json, ' +
-    'post_context_json, context_text) VALUES (:incident_key, ' +
+    'post_context_json, context_text, evidence_state) VALUES (:incident_key, ' +
     ':started_utc_ms, :peak_utc_ms, :ended_utc_ms, :category, :severity, ' +
     ':origin, :local_display_time, :summary, :explanation, :threshold_text, ' +
     ':peak_value, :provider_id, :provider_freshness_ms, ' +
     ':related_entity_ids_json, :related_executable_paths_json, ' +
-    ':trace_status, :pre_context_json, :post_context_json, :context_text) ' +
+    ':trace_status, :pre_context_json, :post_context_json, :context_text, 5) ' +
     'ON CONFLICT(incident_key) DO UPDATE SET ' +
     'peak_utc_ms=excluded.peak_utc_ms, ended_utc_ms=excluded.ended_utc_ms, ' +
     'category=excluded.category, severity=excluded.severity, ' +
@@ -1163,11 +1395,11 @@ begin
   fIncidentUpsert.ParamByName('trace_status').AsInteger :=
     Ord(aIncident.TraceStatus);
   fIncidentUpsert.ParamByName('pre_context_json').Value :=
-    HistoryContextToJson(aIncident.PreContext);
+    '[]';
   fIncidentUpsert.ParamByName('post_context_json').Value :=
-    HistoryContextToJson(aIncident.PostContext);
+    '[]';
   fIncidentUpsert.ParamByName('context_text').Value :=
-    aIncident.Explanation;
+    '';
   fIncidentUpsert.ExecSQL;
 end;
 
@@ -1363,6 +1595,7 @@ begin
     Result.MaxDatabaseSizeBytes := UInt64(lDefaults.MaxDatabaseSizeMB) *
       1024 * 1024;
   Result.BusyTimeoutMs := 100;
+  Result.DiskFreeBytesOverride := -1;
 end;
 
 class function TMachineOverviewHistoryItem.CreateRaw(
@@ -1697,7 +1930,7 @@ begin
   fServiceState.MarkWorkerStarted;
   try
     try
-      lStore := TMachineOverviewHistoryStore.Create(fServiceState.Config);
+      lStore := TMachineOverviewHistoryStore.Create(fServiceState.Config, @fServiceState.Stopping);
       if Assigned(fServiceState.Pipeline) then
       begin
         lIncidentError := '';
@@ -1714,6 +1947,8 @@ begin
           OutputDebugString(PChar('Machine Overview incident hydration: ' +
             lIncidentError));
       end;
+      if not lStore.fStartupError.IsEmpty then
+        lIncidentError := Trim(lIncidentError + ' ' + lStore.fStartupError);
       fServiceState.MarkInitialized(True, lIncidentError);
     except
       on lException: Exception do
@@ -2082,6 +2317,7 @@ var
   lOrdinal: Integer;
   lQuery: TFDQuery;
   lStage: string;
+  lVersion: Integer;
 begin
   aIncidents := nil;
   aError := '';
@@ -2103,7 +2339,8 @@ begin
       lConnection.ResourceOptions.SilentMode := True;
       lConnection.Params.Values['DriverID'] := cMachineOverviewSQLiteDriverId;
       lConnection.Params.Values['Database'] := aDatabaseFileName;
-      lConnection.Params.Values['OpenMode'] := 'ReadWrite';
+      lConnection.Params.Values['OpenMode'] := 'ReadOnly';
+    lConnection.Params.Values['JournalMode'] := HistoryJournalMode(aDatabaseFileName);
       lConnection.Params.Values['LockingMode'] := 'Normal';
       lConnection.Params.Values['SharedCache'] := 'False';
       lConnection.Params.Values['BusyTimeout'] := '100';
@@ -2114,6 +2351,13 @@ begin
       lStage := 'prepare incident query';
       lQuery := TFDQuery.Create(nil);
       lQuery.Connection := lConnection;
+    lQuery.Open('PRAGMA user_version');
+    lVersion := lQuery.Fields[0].AsInteger;
+    lQuery.Close;
+    if (lVersion < 2) or (lVersion > cMachineOverviewHistorySchemaVersion) then
+      raise EInvalidOperation.CreateFmt('Unsupported history reader schema %d', [lVersion]);
+    if lVersion = 2 then
+      aError := rsHistoryUpgradePending;
       lQuery.SQL.Text := 'SELECT incident_key, ' +
         'CAST(started_utc_ms AS TEXT) AS started_utc_ms_text, ' +
         'CAST(peak_utc_ms AS TEXT) AS peak_utc_ms_text, ' +
@@ -2122,8 +2366,8 @@ begin
         'summary, explanation, threshold_text, peak_value, provider_id, ' +
         'CAST(provider_freshness_ms AS TEXT) AS provider_freshness_ms_text, ' +
         'related_entity_ids_json, ' +
-        'related_executable_paths_json, trace_status, pre_context_json, ' +
-        'post_context_json FROM incident WHERE started_utc_ms >= :earliest ' +
+        'related_executable_paths_json, trace_status ' +
+        'FROM incident WHERE started_utc_ms >= :earliest ' +
         'ORDER BY started_utc_ms DESC, incident_key ASC LIMIT :maximum';
       lQuery.ParamByName('earliest').AsLargeInt :=
         HistoryUtcMilliseconds(aEarliestUtc);
@@ -2172,14 +2416,6 @@ begin
           raise EConvertError.Create('Invalid incident executable-path data');
         lOrdinal := lQuery.FieldByName('trace_status').AsInteger;
         lIncident.TraceStatus := HistoryTraceStatusFromOrdinal(lOrdinal);
-        if not TryHistoryContextFromJson(
-          lQuery.FieldByName('pre_context_json').AsString,
-          lIncident.PreContext) then
-          raise EConvertError.Create('Invalid incident pre-context data');
-        if not TryHistoryContextFromJson(
-          lQuery.FieldByName('post_context_json').AsString,
-          lIncident.PostContext) then
-          raise EConvertError.Create('Invalid incident post-context data');
         lIndex := Length(aIncidents);
         SetLength(aIncidents, lIndex + 1);
         aIncidents[lIndex] := lIncident;
