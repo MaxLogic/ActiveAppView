@@ -570,6 +570,12 @@ begin
     end;
       lStage := 'enqueue';
       lTestUtc := EncodeDate(2026, 8, 28) + EncodeTime(20, 15, 30, 125);
+      // Our expired row belongs to an earlier commit; the current batch is protected.
+      if lService.EnqueueRaw(CreateHistorySystemTestSample(IncDay(lTestUtc, -400), 1, 1)) <>
+        TMachineOverviewHistoryEnqueueResult.Queued then
+        raise Exception.Create('Expired fixture enqueue failed');
+      if not lService.Flush(5000) then
+        raise Exception.Create('Expired fixture batch did not flush');
       if lService.EnqueueRaw(CreateHistorySystemTestSample(lTestUtc,
         123456, 37.5)) <>
       TMachineOverviewHistoryEnqueueResult.Queued then
@@ -582,7 +588,7 @@ begin
       ConfigureHistoryTestConnection(lDatabaseFileName, lConnection);
       lStage := 'pre-flush row count';
     if QueryHistoryInt64(lConnection,
-      'SELECT COUNT(*) FROM system_sample_raw') <> 0 then
+      'SELECT COUNT(*) FROM system_sample_raw') <> 1 then
     begin
       Writeln('SELFTEST FAILED: history writer bypassed transactional batching');
       Exit;
@@ -590,9 +596,6 @@ begin
       lConnection.Connected := False;
       lStage := 'enqueue provider and retention samples';
       if (lService.EnqueueRaw(CreateHistorySystemTestSample(
-          IncDay(lTestUtc, -400), 1, 1)) <>
-          TMachineOverviewHistoryEnqueueResult.Queued) or
-        (lService.EnqueueRaw(CreateHistorySystemTestSample(
           IncSecond(lTestUtc, 5), 123457, 40)) <>
           TMachineOverviewHistoryEnqueueResult.Queued) or
         (lService.EnqueueRaw(CreateHistorySystemTestSample(
@@ -1161,9 +1164,9 @@ begin
       Exit;
     end;
     lDiagnostics := lService.Diagnostics;
-    if lDiagnostics.StorageCapDropped = 0 then
+    if lDiagnostics.StorageState <> TMachineOverviewStorageState.OverBudget then
     begin
-      Writeln('SELFTEST FAILED: storage cap did not evict telemetry');
+      Writeln('SELFTEST FAILED: protected batch did not report OverBudget');
       Exit;
     end;
     if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
@@ -1171,9 +1174,9 @@ begin
     GC(lConnection, TFDConnection.Create(nil), g);
     ConfigureHistoryTestConnection(lDatabaseFileName, lConnection);
     if QueryHistoryInt64(lConnection,
-      'SELECT COUNT(*) FROM system_sample_raw') <> 0 then
+      'SELECT COUNT(*) FROM system_sample_raw') <> 1 then
     begin
-      Writeln('SELFTEST FAILED: storage cap left raw telemetry above the bound');
+      Writeln('SELFTEST FAILED: storage cap deleted the protected batch');
       Exit;
     end;
     Result := 0;
@@ -1770,6 +1773,475 @@ begin
   end;
 end;
 
+procedure EnqueueHistoryBudgetRaw(const aService: TMachineOverviewHistoryService;
+  const aSample: IMachineOverviewRawSample);
+begin
+  if aService.EnqueueRaw(aSample) <> TMachineOverviewHistoryEnqueueResult.Queued then
+    raise Exception.Create('Budget raw sample enqueue failed');
+end;
+
+procedure SeedHistoryBudgetIncident(const aConnection: TFDConnection;
+  const aKey: string; const aStartedUtcMs: Int64);
+begin
+  aConnection.ExecSQL('INSERT INTO incident(incident_key, started_utc_ms, peak_utc_ms, ended_utc_ms, ' +
+    'category, severity, origin, local_display_time, summary, explanation, threshold_text, peak_value, ' +
+    'provider_id, provider_freshness_ms, related_entity_ids_json, related_executable_paths_json, ' +
+    'trace_status, pre_context_json, post_context_json, context_text, evidence_state) ' +
+    'VALUES (?,?,?, ?,0,2,0,'''',''headline'','''','''',42,''test'',0,''[]'',''[]'',2,''[]'',''[]'','''',2)',
+    [aKey, aStartedUtcMs, aStartedUtcMs, aStartedUtcMs + 1]);
+  aConnection.ExecSQL('INSERT INTO incident_evidence VALUES (?,?,?,2,16384,hex(zeroblob(8192)))',
+    [aKey, aStartedUtcMs, aStartedUtcMs]);
+end;
+
+function StartHistoryBudgetService(const aConfig: TMachineOverviewHistoryConfig): TMachineOverviewHistoryService;
+begin
+  Result := TMachineOverviewHistoryService.Create(nil, aConfig);
+  try
+    Result.Start;
+    if (not Result.WaitUntilInitialized(5000)) or (not Result.Diagnostics.Available) then
+      raise Exception.Create('Budget writer initialization failed: ' + Result.Diagnostics.LastError);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function RunHistoryBudgetFloorBreachSelfTest: Integer;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lFileName: string;
+  lService: TMachineOverviewHistoryService;
+  lUtc: TDateTime;
+  lUtcMs: Int64;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('budget-floors');
+  lConnection := nil;
+  lService := nil;
+  try
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 32, 1);
+    lService := StartHistoryBudgetService(lConfig);
+    lUtc := EncodeDate(2026, 10, 20) + EncodeTime(12, 0, 0, 0);
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(IncMinute(lUtc, -10), 1, 42));
+    EnqueueHistoryBudgetRaw(lService, CreateHistoryDiskTestSample(IncMinute(lUtc, -10)));
+    EnqueueHistoryBudgetRaw(lService, CreateHistoryProcessTestSample(IncMinute(lUtc, -10)));
+    if not lService.Flush(5000) then
+      raise Exception.Create('Floor telemetry fixture did not flush');
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Floor fixture did not stop');
+    FreeAndNil(lService);
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    lUtc := EncodeDate(2026, 10, 20) + EncodeTime(12, 0, 0, 0);
+    lUtcMs := DateTimeToUnix(lUtc, True) * 1000;
+    SeedHistoryBudgetIncident(lConnection, 'recent-complete', lUtcMs - 3600000);
+    SeedHistoryBudgetIncident(lConnection, 'collecting-evidence', lUtcMs - 7200000);
+    SeedHistoryBudgetIncident(lConnection, 'collecting-headline', lUtcMs - 7200001);
+    lConnection.Connected := False;
+    lService := StartHistoryBudgetService(lConfig);
+    lConnection.Connected := True;
+    lConnection.ExecSQL('UPDATE incident_evidence SET state=1 WHERE incident_key=''collecting-evidence''');
+    lConnection.ExecSQL('UPDATE incident SET evidence_state=1 WHERE incident_key=''collecting-headline''');
+    lConnection.Connected := False;
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(lUtc, 1, 42));
+    if (not lService.Flush(5000)) or
+      (lService.Diagnostics.StorageState <> TMachineOverviewStorageState.FloorBreached) then
+      raise Exception.Create('Small budget did not report a floor breach');
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(lUtc, 2, 43));
+    if (not lService.Flush(5000)) or (not lService.Diagnostics.LastCommitAvailable) or
+      (lService.Diagnostics.StorageState <> TMachineOverviewStorageState.OverBudget) or
+      (lService.Diagnostics.RetryCount <> 0) then
+      raise Exception.Create('OverBudget stopped recording or retried a committed batch');
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Floor writer did not stop');
+    lConnection.Connected := True;
+    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM system_sample_raw') <> 2) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM disk_sample_raw') <> 0) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM process_top_sample') <> 0) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM rollup_10s') <> 1) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM rollup_1m') <> 1) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence') <> 2) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident') <> 2) or
+      (QueryHistoryInt64(lConnection, 'SELECT evidence_bytes FROM history_status') <> 32768) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_status WHERE storage_state=3 ' +
+      'AND length(storage_message)>0 AND last_floor_breach_utc_ms>0') <> 1) then
+      raise Exception.Create('Floor/OverBudget state or Collecting protection not persisted');
+    Writeln('PASS RunHistoryBudgetFloorBreachSelfTest: FloorBreached then OverBudget; Collecting and batches protected');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryIncidentAgeOnlySelfTest: Integer;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lFileName: string;
+  lService: TMachineOverviewHistoryService;
+  lUtc: TDateTime;
+  lUtcMs: Int64;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('incident-age-only');
+  lConnection := nil;
+  lService := nil;
+  try
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 32, 64 * 1024 * 1024);
+    lConfig.MaximumIncidentCount := 10;
+    lService := StartHistoryBudgetService(lConfig);
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Age-only fixture did not stop');
+    FreeAndNil(lService);
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    lUtc := EncodeDate(2026, 10, 20);
+    lUtcMs := DateTimeToUnix(lUtc, True) * 1000;
+    // Our two incidents cannot reach the count cap or the storage budget.
+    SeedHistoryBudgetIncident(lConnection, 'age-expired', lUtcMs - Int64(366) * 86400000);
+    SeedHistoryBudgetIncident(lConnection, 'age-retained', lUtcMs - Int64(364) * 86400000);
+    lConnection.Connected := False;
+    lService := StartHistoryBudgetService(lConfig);
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(lUtc, 1, 42));
+    if (not lService.Flush(5000)) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Age-only writer did not flush/stop');
+    lConnection.Connected := True;
+    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE incident_key=''age-expired''') <> 0) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence WHERE incident_key=''age-expired''') <> 0) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE incident_key=''age-retained''') <> 1) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence WHERE incident_key=''age-retained''') <> 1) then
+      raise Exception.Create('Age-only retention did not delete the 366-day incident/evidence and retain the 364-day pair');
+    Writeln('PASS RunHistoryIncidentAgeOnlySelfTest: 366-day pair deleted, 364-day pair retained, two incidents below cap 10');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryIncidentRetentionSelfTest: Integer;
+var
+  g: TGarbos;
+  i: Integer;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lFileName: string;
+  lService: TMachineOverviewHistoryService;
+  lUtc: TDateTime;
+  lUtcMs, lStartedUtcMs: Int64;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('incident-retention');
+  lConnection := nil;
+  lService := nil;
+  try
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 32, 64 * 1024 * 1024);
+    lConfig.MaximumIncidentCount := 10;
+    lService := StartHistoryBudgetService(lConfig);
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Retention fixture did not stop');
+    FreeAndNil(lService);
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    lUtc := EncodeDate(2026, 10, 20);
+    lUtcMs := DateTimeToUnix(lUtc, True) * 1000;
+    SeedHistoryBudgetIncident(lConnection, 'expired', lUtcMs - Int64(366) * 86400000);
+    for i := 1 to 13 do
+    begin
+      lStartedUtcMs := lUtcMs - Int64(14-i) * 86400000;
+      SeedHistoryBudgetIncident(lConnection, 'retention-' + IntToStr(i), lStartedUtcMs);
+    end;
+    lConnection.Connected := False;
+    lService := StartHistoryBudgetService(lConfig);
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(lUtc, 1, 42));
+    if (not lService.Flush(5000)) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Retention writer did not flush/stop');
+    lConnection.Connected := True;
+    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident') <> 10) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence') <> 10) or
+      (QueryHistoryInt64(lConnection, 'SELECT MIN(started_utc_ms) FROM incident') <> lUtcMs - Int64(10)*86400000) or
+      (QueryHistoryInt64(lConnection, 'SELECT evidence_bytes FROM history_status') <> 10*16384) or
+      (QueryHistoryInt64(lConnection, 'SELECT incidents_deleted_total FROM history_status') <> 4) then
+      raise Exception.Create('Incident age/count retention did not remove oldest rows and dependent evidence');
+    Writeln('PASS RunHistoryIncidentRetentionSelfTest: 365 day age, 10 row fixture cap, evidence accounting');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryMaintenanceFailureSelfTest: Integer;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lFileName: string;
+  lService: TMachineOverviewHistoryService;
+  lUtc: TDateTime;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('maintenance-failure');
+  lConnection := nil;
+  lService := nil;
+  try
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 32, 64 * 1024 * 1024);
+    lService := StartHistoryBudgetService(lConfig);
+    lUtc := EncodeDate(2026, 10, 20);
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(IncDay(lUtc, -3), 1, 42));
+    if not lService.Flush(5000) then
+      raise Exception.Create('Maintenance failure fixture did not flush');
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    lConnection.ExecSQL('CREATE TRIGGER fail_maintenance BEFORE DELETE ON system_sample_raw ' +
+      'BEGIN SELECT RAISE(ABORT,''injected maintenance failure''); END');
+    lConnection.Connected := False;
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(lUtc, 2, 43));
+    if (not lService.Flush(5000)) or (not lService.Diagnostics.LastCommitAvailable) or
+      (lService.Diagnostics.Persisted <> 2) or (lService.Diagnostics.RetryCount <> 0) or
+      (not ContainsText(lService.Diagnostics.LastMaintenanceError, 'injected maintenance failure')) then
+      raise Exception.Create('Maintenance failure requeued or hid a durable batch');
+    lConnection.Connected := True;
+    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM system_sample_raw') <> 2) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_status WHERE last_error ' +
+      'LIKE ''%injected maintenance failure%''') <> 1) then
+      raise Exception.Create('Maintenance rollback/error status was not retained');
+    lConnection.ExecSQL('DROP TRIGGER fail_maintenance');
+    lConnection.Connected := False;
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(IncSecond(lUtc, 1), 3, 44));
+    if (not lService.Flush(5000)) or (lService.Diagnostics.Persisted <> 3) or
+      (not lService.Diagnostics.LastMaintenanceError.IsEmpty) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Writer did not recover after maintenance failure');
+    Writeln('PASS RunHistoryMaintenanceFailureSelfTest: durable batch, diagnostics/status error, later recovery');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryMaintenanceBoundSelfTest: Integer;
+var
+  g: TGarbos;
+  i: Integer;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lFileName: string;
+  lService: TMachineOverviewHistoryService;
+  lUtc: TDateTime;
+  lRemaining: Int64;
+  lSequence: UInt64;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('maintenance-bound');
+  lConnection := nil;
+  lService := nil;
+  try
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 32, 1);
+    lService := StartHistoryBudgetService(lConfig);
+    lUtc := EncodeDate(2026, 10, 20);
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(IncDay(lUtc, -3), 1, 42));
+    if (not lService.Flush(5000)) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Bound fixture did not flush/stop');
+    FreeAndNil(lService);
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    lConnection.ExecSQL('WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows ' +
+      'WHERE n<40000) INSERT INTO system_sample_raw(utc_ms,monotonic_ms,provider_status,' +
+      'provider_error,cpu_available,cpu_total,physical_available_bytes,logical_cpu_blob) ' +
+      'SELECT s.utc_ms,n,s.provider_status,s.provider_error,s.cpu_available,s.cpu_total,' +
+      's.physical_available_bytes,s.logical_cpu_blob FROM rows CROSS JOIN system_sample_raw s');
+    lConnection.Connected := False;
+    lService := StartHistoryBudgetService(lConfig);
+    lRemaining := 40001;
+    i := 0;
+    lSequence := 0;
+    while (lRemaining > 0) and (i < 20) do
+    begin
+      Inc(i);
+      Inc(lSequence);
+      EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(lUtc, lSequence, 43));
+      if (not lService.Flush(5000)) or (lService.Diagnostics.LastMaintenanceDeleteStatements > 64) then
+        raise Exception.Create('Maintenance did not respect the DELETE bound');
+      lConnection.Connected := True;
+      lRemaining := QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM system_sample_raw WHERE utc_ms<' +
+        IntToStr(DateTimeToUnix(lUtc, True)*1000));
+      if QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM system_sample_raw WHERE utc_ms=' +
+        IntToStr(DateTimeToUnix(lUtc, True)*1000)) <> i then
+        raise Exception.Create('Bounded pass removed its committed batch');
+      if (i = 1) and ((lRemaining = 0) or
+        (lService.Diagnostics.StorageState <> TMachineOverviewStorageState.Trimming)) then
+        raise Exception.Create('Bound did not defer work with Trimming state');
+      Writeln(Format('Bound cycle %d: remaining=%d deletes=%d duration_ms=%d',
+        [i, lRemaining, lService.Diagnostics.LastMaintenanceDeleteStatements,
+        lService.Diagnostics.LastMaintenanceDurationMs]));
+      lConnection.Connected := False;
+    end;
+    if lRemaining <> 0 then
+      raise Exception.Create('Deferred maintenance did not converge');
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Bounded writer did not stop');
+    Writeln('PASS RunHistoryMaintenanceBoundSelfTest: 40001 expired rows, bounded passes, continuation');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryBudgetSteadyStateSelfTest: Integer;
+var
+  g: TGarbos;
+  i: Integer;
+  lChange: TMachineOverviewIncidentChange;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lFileName: string;
+  lService: TMachineOverviewHistoryService;
+  lUtc, lCycleUtc: TDateTime;
+  lOffset: Int64;
+  lSequence: UInt64;
+  lUtcMs, lUsed, lLastUsed: Int64;
+  lStatus: string;
+  lQuery: TFDQuery;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('budget-steady');
+  lConnection := nil;
+  lService := nil;
+  try
+    lUtc := EncodeDate(2026, 10, 20) + EncodeTime(12, 0, 0, 0);
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 32, 2 * 1024 * 1024);
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(5000)) or (not lService.Diagnostics.Available) then
+      raise Exception.Create('Budget fixture unavailable');
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(IncHour(lUtc, -2), 1, 42));
+    EnqueueHistoryBudgetRaw(lService, CreateHistoryDiskTestSample(IncHour(lUtc, -2)));
+    EnqueueHistoryBudgetRaw(lService, CreateHistoryProcessTestSample(IncHour(lUtc, -2)));
+    if (not lService.Flush(5000)) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Budget fixture initialization failed');
+    FreeAndNil(lService);
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    lUtc := EncodeDate(2026, 10, 20) + EncodeTime(12, 0, 0, 0);
+    lUtcMs := DateTimeToUnix(lUtc, True) * 1000;
+    lConnection.ExecSQL('WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL ' +
+      'SELECT n+1 FROM rows WHERE n<300) INSERT INTO incident(' +
+      'incident_key, started_utc_ms, peak_utc_ms, ended_utc_ms, category, severity, origin, ' +
+      'local_display_time, summary, explanation, threshold_text, peak_value, provider_id, ' +
+      'provider_freshness_ms, related_entity_ids_json, related_executable_paths_json, ' +
+      'trace_status, pre_context_json, post_context_json, context_text, evidence_state) ' +
+      'SELECT ''budget-''||n, ? - CASE WHEN n>280 THEN 1000+n ELSE (301-n)*17280000 END, ' +
+      '1,1,0,2,0,'''',''headline'','''','''',42,''test'',0,''[]'',''[]'',2,''[]'',''[]'','''',2 FROM rows',
+      [lUtcMs]);
+    lConnection.ExecSQL('INSERT INTO incident_evidence SELECT incident_key, started_utc_ms, ' +
+      'started_utc_ms,2,16384,hex(zeroblob(8192)) FROM incident');
+    lConnection.Connected := False;
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(5000)) or (not lService.Diagnostics.Available) then
+      raise Exception.Create('Budget writer unavailable');
+    lLastUsed := 0;
+    lSequence := 0;
+    lOffset := 0;
+    for i := 1 to 20 do
+    begin
+      Inc(lOffset);
+      Inc(lSequence);
+      lCycleUtc := IncSecond(lUtc, lOffset);
+      EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(lCycleUtc, lSequence, 42));
+      lChange := Default(TMachineOverviewIncidentChange);
+      lChange.Incident.StableId := 'batch-' + IntToStr(i);
+      lChange.Incident.StartedAtUtc := lCycleUtc;
+      lChange.Incident.EndedAtUtc := lCycleUtc;
+      if lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued then
+        raise Exception.Create('Budget incident enqueue failed');
+      if not lService.Flush(5000) then
+        raise Exception.Create('Budget writer did not flush');
+      if lService.Diagnostics.LastMaintenanceDeleteStatements > 64 then
+        raise Exception.Create('Maintenance exceeded 64 DELETE statements');
+      Writeln(Format('Maintenance cycle %d: deletes=%d duration_ms=%d', [i,
+        lService.Diagnostics.LastMaintenanceDeleteStatements, lService.Diagnostics.LastMaintenanceDurationMs]));
+      lConnection.Connected := True;
+      lUsed := (QueryHistoryInt64(lConnection, 'PRAGMA page_count') -
+        QueryHistoryInt64(lConnection, 'PRAGMA freelist_count')) *
+        QueryHistoryInt64(lConnection, 'PRAGMA page_size');
+      Writeln(Format('Budget cycle %d: used=%d budget=%d', [i, lUsed, lConfig.MaxDatabaseSizeBytes]));
+      if (i >= 5) and (lUsed > Int64(lConfig.MaxDatabaseSizeBytes)) then
+        raise Exception.Create('RunHistoryBudgetSteadyStateSelfTest: evidence exceeds the shared budget');
+      if QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM system_sample_raw') <> i + 1 then
+        raise Exception.Create('Budget maintenance deleted a committed batch');
+      if (i > 16) and (lUsed > lLastUsed) then
+        raise Exception.Create('Last five budget passes are still growing');
+      lLastUsed := lUsed;
+      lConnection.Connected := False;
+    end;
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Budget writer did not stop');
+    lConnection.Connected := True;
+    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM disk_sample_raw') <> 1) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM process_top_sample') <> 3) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident') <> 320) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE incident_key=''budget-1'' AND evidence_state=4') <> 1) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence WHERE incident_key=''budget-1''') <> 0) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence WHERE incident_key IN ' +
+      '(SELECT incident_key FROM incident WHERE incident_key LIKE ''budget-%'' ORDER BY started_utc_ms DESC LIMIT 20)') <> 20) then
+      raise Exception.Create('Budget did not preserve headlines and newest evidence');
+    if QueryHistoryInt64(lConnection, 'SELECT used_bytes FROM history_status') <> lUsed then
+      raise Exception.Create('Budget status does not match used pages');
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := lConnection;
+    lQuery.Open('SELECT * FROM history_status');
+    lStatus := lQuery.FieldByName('budget_bytes').AsWideString + ':' + lQuery.FieldByName('used_bytes').AsWideString + ':' +
+      lQuery.FieldByName('storage_state').AsWideString + ':' + lQuery.FieldByName('evidence_trimmed_total').AsWideString;
+    lQuery.Close;
+    lConnection.Connected := False;
+    FreeAndNil(lService);
+    lService := StartHistoryBudgetService(lConfig);
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Budget reopen did not stop');
+    lConnection.Connected := True;
+    lQuery.Open('SELECT * FROM history_status');
+    if lStatus <> lQuery.FieldByName('budget_bytes').AsWideString + ':' + lQuery.FieldByName('used_bytes').AsWideString + ':' +
+      lQuery.FieldByName('storage_state').AsWideString + ':' + lQuery.FieldByName('evidence_trimmed_total').AsWideString then
+      raise Exception.Create('Budget status did not survive reopen');
+    lQuery.Close;
+    Writeln('PASS RunHistoryBudgetSteadyStateSelfTest: bounded evidence, committed batches, status survives reopen');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
 function RunMachineOverviewHistorySelfTests(const aArg: string): Integer;
 begin
   Result := -1;
@@ -1778,7 +2250,19 @@ begin
   if not SameText(aArg, cMachineOverviewHistorySelfTestArg) then
     Exit;
   try
-    Result := RunHistoryIncidentHeavyLegacySelfTest;
+    Result := RunHistoryBudgetSteadyStateSelfTest;
+    if Result = 0 then
+      Result := RunHistoryBudgetFloorBreachSelfTest;
+    if Result = 0 then
+      Result := RunHistoryIncidentAgeOnlySelfTest;
+    if Result = 0 then
+      Result := RunHistoryIncidentRetentionSelfTest;
+    if Result = 0 then
+      Result := RunHistoryMaintenanceFailureSelfTest;
+    if Result = 0 then
+      Result := RunHistoryMaintenanceBoundSelfTest;
+    if Result = 0 then
+      Result := RunHistoryIncidentHeavyLegacySelfTest;
     if Result = 0 then
       Result := RunHistoryMigrationBackupSpaceSelfTest;
     if Result = 0 then

@@ -12,6 +12,8 @@ uses
 type
   TMachineOverviewHistoryItemKind = (RawSample, Incident);
   TMachineOverviewHistoryEnqueueResult = (Queued, Dropped, Stopped);
+  TMachineOverviewStorageState = (WithinBudget, Trimming, FloorBreached,
+    OverBudget, MigrationBlocked);
 
   TMachineOverviewHistoryConfig = record
     Enabled: Boolean;
@@ -25,6 +27,8 @@ type
     BusyTimeoutMs: Cardinal;
   DiskFreeBytesOverride: Int64;
   CompactionMinimumFreeBytes: UInt64;
+    IncidentRetentionDays: Integer;
+    MaximumIncidentCount: Integer;
   // Our fixture observer runs on the writer thread; production leaves it unset.
   MigrationObserver: TProc<string>;
     class function FromSettings(const aSettings: TMachineOverviewSettings;
@@ -78,6 +82,10 @@ type
     LastCommitAvailable: Boolean;
     LastCommitDurationMs: UInt64;
     LastError: string;
+    StorageState: TMachineOverviewStorageState;
+    LastMaintenanceError: string;
+    LastMaintenanceDeleteStatements: Integer;
+    LastMaintenanceDurationMs: Int64;
     HydratedIncidentCount: Integer;
   end;
 
@@ -113,7 +121,7 @@ function TryLoadMachineOverviewIncidents(const aDatabaseFileName: string;
 implementation
 
 uses
-  System.Classes, System.DateUtils, System.Generics.Collections, System.IOUtils,
+  System.Classes, System.DateUtils, System.Diagnostics, System.Generics.Collections, System.IOUtils,
   System.JSON, System.Math, System.StrUtils, System.SyncObjs,
   Winapi.Windows,
   AutoFree, Data.DB, FireDAC.Comp.Client, FireDAC.Phys.SQLite,
@@ -168,8 +176,22 @@ type
     fRollup10s: TFDQuery;
     fRollup1m: TFDQuery;
     fSystemInsert: TFDQuery;
-    procedure ApplyRetention(const aNowUtcMs: Int64);
-    function ApplyStorageCap: Integer;
+    fBatchBoundary, fMaintenanceNow, fEvidenceBytes: Int64;
+    fUsedBytes: Int64;
+    fTrimming: Boolean;
+    fMaintenanceTimer: TStopwatch;
+    fDeleteStatements, fDeletedSamples, fDeletedIncidents, fTrimmedEvidence: Integer;
+    fStorageState: TMachineOverviewStorageState;
+    fStorageMessage, fMaintenanceError: string;
+    fMaintenanceDuration: Int64;
+    function CanDelete(const aStatements: Integer = 1): Boolean;
+    function CategorySelection(const aCategory: Integer; const aCutoff: Int64;
+      const aProjection: string = ''): string;
+    function DeleteCategory(const aCategory: Integer; const aSelection: string): Integer;
+    procedure MeasureUsedBytes;
+    procedure ApplyRetention;
+    procedure ApplyStorageCap;
+    procedure PersistStatus;
     procedure ConfigureConnection;
     procedure CreateOrMigrateSchema;
     procedure EnsureColumn(const aTable, aName, aDefinition: string);
@@ -195,8 +217,8 @@ type
     constructor Create(const aConfig: TMachineOverviewHistoryConfig;
       const aStopping: PInteger);
     destructor Destroy; override;
-    function WriteBatch(const aItems: TArray<TMachineOverviewHistoryItem>):
-      Integer;
+    procedure WriteBatch(const aItems: TArray<TMachineOverviewHistoryItem>);
+    function RunMaintenance: Integer;
   end;
 
   TMachineOverviewHistoryServiceState = class;
@@ -234,6 +256,7 @@ type
     procedure MarkCommitFailure(const aError: string);
     procedure MarkCommitSuccess(const aCount: Integer;
       const aDurationMs: UInt64; const aStorageCapDropped: Integer);
+    procedure MarkMaintenance(const aStore: TMachineOverviewHistoryStore);
     procedure MarkInitialized(const aAvailable: Boolean;
       const aError: string);
     procedure MarkIncidentHydration(const aCount: Integer);
@@ -251,6 +274,10 @@ const
 
 resourcestring
   rsHistoryUpgradePending = 'History upgrade pending';
+  rsHistoryWithinBudget = 'History is within the storage budget.';
+  rsHistoryTrimming = 'History trimming will continue after the next batch.';
+  rsHistoryFloorBreached = 'Storage budget too small: protected recent history was removed. Increase MaxDatabaseSizeMB.';
+  rsHistoryOverBudget = 'Storage is over budget: only the committed batch or collecting evidence remains. Increase MaxDatabaseSizeMB.';
 
 function GetHistoryBacklogState(const aState: TObject):
   TMachineOverviewHistoryBacklogState;
@@ -439,15 +466,32 @@ end;
 
 constructor TMachineOverviewHistoryStore.Create(
   const aConfig: TMachineOverviewHistoryConfig; const aStopping: PInteger);
+var
+  g: TGarbos;
+  lQuery: TFDQuery;
 begin
+  g := Default(TGarbos);
   inherited Create;
   fConfig := aConfig;
+  if fConfig.IncidentRetentionDays <= 0 then
+    fConfig.IncidentRetentionDays := 365;
+  if fConfig.MaximumIncidentCount <= 0 then
+    fConfig.MaximumIncidentCount := 50000;
   fStopping := aStopping;
   try
     ConfigureConnection;
     CreateOrMigrateSchema;
     RecoverLegacyIncidents;
     CompactAtStartup;
+    fEvidenceBytes := Scalar('SELECT COALESCE(SUM(byte_count),0) FROM incident_evidence');
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := fConnection;
+    lQuery.Open('SELECT storage_state, used_bytes FROM history_status WHERE id=1');
+    fStorageState := TMachineOverviewStorageState(lQuery.FieldByName('storage_state').AsInteger);
+    fTrimming := (fStorageState <> TMachineOverviewStorageState.WithinBudget) and
+      (lQuery.FieldByName('used_bytes').AsLargeInt >
+      Int64((fConfig.MaxDatabaseSizeBytes div 10) * 9));
+    lQuery.Close;
     PrepareStatements;
   except
     FreeAndNil(fRollup1m);
@@ -1403,94 +1447,314 @@ begin
   fIncidentUpsert.ExecSQL;
 end;
 
-procedure TMachineOverviewHistoryStore.ApplyRetention(
-  const aNowUtcMs: Int64);
+function TMachineOverviewHistoryStore.CanDelete(const aStatements: Integer): Boolean;
 begin
-  fConnection.ExecSQL('DELETE FROM system_sample_raw WHERE id IN ' +
-    '(SELECT id FROM system_sample_raw WHERE utc_ms < :cutoff ' +
-    'ORDER BY utc_ms LIMIT 256)',
-    [aNowUtcMs - (Int64(fConfig.RawRetentionHours) * 60 * 60 * 1000)]);
-  fConnection.ExecSQL('DELETE FROM disk_sample_raw WHERE id IN ' +
-    '(SELECT id FROM disk_sample_raw WHERE utc_ms < :cutoff ' +
-    'ORDER BY utc_ms LIMIT 256)',
-    [aNowUtcMs - (Int64(fConfig.RawRetentionHours) * 60 * 60 * 1000)]);
-  fConnection.ExecSQL('DELETE FROM process_top_sample WHERE id IN ' +
-    '(SELECT id FROM process_top_sample WHERE utc_ms < :cutoff ' +
-    'ORDER BY utc_ms LIMIT 256)',
-    [aNowUtcMs - (Int64(fConfig.RawRetentionHours) * 60 * 60 * 1000)]);
-  fConnection.ExecSQL('DELETE FROM rollup_10s WHERE bucket_utc_ms IN ' +
-    '(SELECT bucket_utc_ms FROM rollup_10s WHERE bucket_utc_ms < :cutoff ' +
-    'ORDER BY bucket_utc_ms LIMIT 256)',
-    [aNowUtcMs - (Int64(fConfig.Rollup10sRetentionDays) * 24 * 60 * 60 *
-      1000)]);
-  fConnection.ExecSQL('DELETE FROM rollup_1m WHERE bucket_utc_ms IN ' +
-    '(SELECT bucket_utc_ms FROM rollup_1m WHERE bucket_utc_ms < :cutoff ' +
-    'ORDER BY bucket_utc_ms LIMIT 256)',
-    [aNowUtcMs - (Int64(fConfig.Rollup1mRetentionDays) * 24 * 60 * 60 *
-      1000)]);
+  Result := (fDeleteStatements + aStatements <= 64) and
+    (fMaintenanceTimer.ElapsedMilliseconds < 250) and (not IsStopping);
 end;
 
-function TMachineOverviewHistoryStore.ApplyStorageCap: Integer;
+procedure TMachineOverviewHistoryStore.MeasureUsedBytes;
+begin
+  fUsedBytes := (Scalar('PRAGMA page_count') - Scalar('PRAGMA freelist_count')) *
+    Scalar('PRAGMA page_size');
+end;
+
+function TMachineOverviewHistoryStore.CategorySelection(const aCategory: Integer;
+  const aCutoff: Int64; const aProjection: string): string;
+const
+  cTables: array[0..6] of string = ('system_sample_raw', 'disk_sample_raw',
+    'process_top_sample', 'rollup_10s', 'rollup_1m', 'incident_evidence', 'incident');
+  cTimes: array[0..6] of string = ('utc_ms', 'utc_ms', 'utc_ms', 'bucket_utc_ms',
+    'bucket_utc_ms', 'started_utc_ms', 'started_utc_ms');
+  cKeys: array[0..6] of string = ('id', 'id', 'id', 'bucket_utc_ms',
+    'bucket_utc_ms', 'incident_key', 'id');
 var
-  lFreePages: Int64;
-  lPageCount: Int64;
-  lPageSize: Int64;
-  lQuery: TFDQuery;
-  lUsedBytes: UInt64;
+  lBoundary: Int64;
+  lProjection, lProtection: string;
+begin
+  lBoundary := fBatchBoundary;
+  if aCategory = 3 then
+    lBoundary := (lBoundary div 10000) * 10000
+  else if aCategory = 4 then
+    lBoundary := (lBoundary div 60000) * 60000;
+  lProtection := '';
+  if aCategory = 5 then
+    lProtection := ' AND state<>1 AND NOT EXISTS (SELECT 1 FROM incident i ' +
+      'WHERE i.incident_key=incident_evidence.incident_key AND i.evidence_state=1)'
+  else if aCategory = 6 then
+    lProtection := ' AND evidence_state<>1 AND NOT EXISTS (SELECT 1 FROM incident_evidence e ' +
+      'WHERE e.incident_key=incident.incident_key AND e.state=1)';
+  if aCutoff < lBoundary then
+    lBoundary := aCutoff;
+  lProjection := aProjection;
+  if lProjection.IsEmpty then
+    lProjection := cKeys[aCategory];
+  Result := 'SELECT ' + lProjection + ' FROM ' + cTables[aCategory] +
+    ' WHERE ' + cTimes[aCategory] + '<' + IntToStr(lBoundary) + lProtection;
+end;
+
+function TMachineOverviewHistoryStore.DeleteCategory(const aCategory: Integer;
+  const aSelection: string): Integer;
+const
+  cTables: array[0..6] of string = ('system_sample_raw', 'disk_sample_raw',
+    'process_top_sample', 'rollup_10s', 'rollup_1m', 'incident_evidence', 'incident');
+  cKeys: array[0..6] of string = ('id', 'id', 'id', 'bucket_utc_ms',
+    'bucket_utc_ms', 'incident_key', 'id');
+var
+  lBytes: Int64;
 begin
   Result := 0;
+  if not CanDelete(1 + Ord(aCategory = 6)) then
+    Exit;
+  if Scalar('SELECT EXISTS (' + aSelection + ')') = 0 then
+    Exit;
+  if aCategory = 6 then
+  begin
+    // We remove dependent evidence and headlines atomically, counting both DELETEs.
+    lBytes := Scalar('SELECT COALESCE(SUM(byte_count),0) FROM incident_evidence ' +
+      'WHERE incident_key IN (SELECT incident_key FROM incident WHERE id IN (' + aSelection + '))');
+    fConnection.ExecSQL('DELETE FROM incident_evidence WHERE incident_key IN ' +
+      '(SELECT incident_key FROM incident WHERE id IN (' + aSelection + '))');
+    Inc(fDeleteStatements);
+    fEvidenceBytes := fEvidenceBytes - lBytes;
+    MeasureUsedBytes;
+  end else if aCategory = 5 then
+  begin
+    lBytes := Scalar('SELECT COALESCE(SUM(byte_count),0) FROM incident_evidence WHERE incident_key IN (' +
+      aSelection + ')');
+    fConnection.ExecSQL('UPDATE incident SET evidence_state=4 WHERE incident_key IN (' + aSelection + ')');
+    fEvidenceBytes := fEvidenceBytes - lBytes;
+  end;
+  Result := fConnection.ExecSQL('DELETE FROM ' + cTables[aCategory] + ' WHERE ' +
+    cKeys[aCategory] + ' IN (' + aSelection + ')');
+  Inc(fDeleteStatements);
+  if aCategory = 6 then
+    Inc(fDeletedIncidents, Result)
+  else if aCategory = 5 then
+    Inc(fTrimmedEvidence, Result)
+  else
+    Inc(fDeletedSamples, Result);
+  MeasureUsedBytes;
+end;
+
+procedure TMachineOverviewHistoryStore.ApplyRetention;
+const
+  cDayMs: Int64 = 86400000;
+var
+  i, lRows: Integer;
+  lCutoff, lExcess: Int64;
+  lSelection: string;
+begin
+  for i := 0 to 6 do
+  begin
+    if i < 3 then
+      lCutoff := fMaintenanceNow - Int64(fConfig.RawRetentionHours) * 3600000
+    else if i = 3 then
+      lCutoff := fMaintenanceNow - Int64(fConfig.Rollup10sRetentionDays) * cDayMs
+    else if i = 4 then
+      lCutoff := fMaintenanceNow - Int64(fConfig.Rollup1mRetentionDays) * cDayMs
+    else
+      lCutoff := fMaintenanceNow - Int64(fConfig.IncidentRetentionDays) * cDayMs;
+    repeat
+      lSelection := CategorySelection(i, lCutoff);
+      if i < 3 then
+        lSelection := lSelection + ' ORDER BY utc_ms LIMIT 512'
+      else if i < 5 then
+        lSelection := lSelection + ' ORDER BY bucket_utc_ms LIMIT 512'
+      else if i = 5 then
+        lSelection := lSelection + ' ORDER BY started_utc_ms LIMIT 64'
+      else
+        lSelection := lSelection + ' ORDER BY started_utc_ms LIMIT 256';
+      lRows := DeleteCategory(i, lSelection);
+    until (lRows = 0) or (not CanDelete);
+    if not CanDelete then
+      Exit;
+  end;
+  while CanDelete(2) do
+  begin
+    lExcess := Scalar('SELECT COUNT(*) FROM incident') - fConfig.MaximumIncidentCount;
+    if lExcess <= 0 then
+      Break;
+    if lExcess > 256 then
+      lExcess := 256;
+    lSelection := CategorySelection(6, High(Int64)) +
+      ' ORDER BY started_utc_ms, id LIMIT ' + IntToStr(lExcess);
+    if DeleteCategory(6, lSelection) = 0 then
+      Break;
+  end;
+end;
+
+procedure TMachineOverviewHistoryStore.ApplyStorageCap;
+const
+  cFloors: array[0..5] of Int64 = (3600000, 3600000, 3600000,
+    86400000, 604800000, 86400000);
+  cTimes: array[0..6] of string = ('utc_ms', 'utc_ms', 'utc_ms',
+    'bucket_utc_ms', 'bucket_utc_ms', 'started_utc_ms', 'started_utc_ms');
+var
+  i, lCategory, lPhase, lRows: Integer;
+  lOldest, lTime, lCutoff, lTarget: Int64;
+  lSelection, lCandidate: string;
+  lBreached, lExhausted: Boolean;
+begin
+  fStorageState := TMachineOverviewStorageState.WithinBudget;
+  fStorageMessage := rsHistoryWithinBudget;
   if fConfig.MaxDatabaseSizeBytes = 0 then
     Exit;
-  lQuery := TFDQuery.Create(nil);
-  try
-    lQuery.Connection := fConnection;
-    lQuery.Open('PRAGMA page_count');
-    lPageCount := lQuery.Fields[0].AsLargeInt;
-    lQuery.Close;
-    lQuery.Open('PRAGMA freelist_count');
-    lFreePages := lQuery.Fields[0].AsLargeInt;
-    lQuery.Close;
-    lQuery.Open('PRAGMA page_size');
-    lPageSize := lQuery.Fields[0].AsLargeInt;
-  finally
-    lQuery.Free;
-  end;
-  lUsedBytes := UInt64(Max(Int64(0), lPageCount - lFreePages)) *
-    UInt64(Max(Int64(0), lPageSize));
-  if lUsedBytes <= fConfig.MaxDatabaseSizeBytes then
+  fTrimming := fTrimming or (UInt64(fUsedBytes) > fConfig.MaxDatabaseSizeBytes);
+  if not fTrimming then
     Exit;
-  Inc(Result, fConnection.ExecSQL(
-    'DELETE FROM system_sample_raw WHERE id IN (SELECT id FROM ' +
-    'system_sample_raw ORDER BY utc_ms LIMIT 256)'));
-  Inc(Result, fConnection.ExecSQL(
-    'DELETE FROM disk_sample_raw WHERE id IN (SELECT id FROM ' +
-    'disk_sample_raw ORDER BY utc_ms LIMIT 256)'));
-  Inc(Result, fConnection.ExecSQL(
-    'DELETE FROM process_top_sample WHERE id IN (SELECT id FROM ' +
-    'process_top_sample ORDER BY utc_ms LIMIT 256)'));
-  Inc(Result, fConnection.ExecSQL(
-    'DELETE FROM rollup_10s WHERE bucket_utc_ms IN (SELECT bucket_utc_ms ' +
-    'FROM rollup_10s ORDER BY bucket_utc_ms LIMIT 256)'));
-  Inc(Result, fConnection.ExecSQL(
-    'DELETE FROM rollup_1m WHERE bucket_utc_ms IN (SELECT bucket_utc_ms ' +
-    'FROM rollup_1m ORDER BY bucket_utc_ms LIMIT 256)'));
+  lTarget := Int64((fConfig.MaxDatabaseSizeBytes div 10) * 9);
+  lBreached := False;
+  lExhausted := False;
+  lPhase := 0;
+  while (fUsedBytes > lTarget) and CanDelete do
+  begin
+    lCategory := -1;
+    lOldest := High(Int64);
+    for i := 0 to 6 do
+    begin
+      if ((lPhase < 2) and (i = 6)) or ((lPhase = 2) and (i <> 6)) then
+        Continue;
+      lCutoff := High(Int64);
+      if lPhase = 0 then
+        lCutoff := fMaintenanceNow - cFloors[i];
+      lCandidate := CategorySelection(i, lCutoff);
+      lTime := Scalar('SELECT COALESCE(MIN(' + cTimes[i] + '),' + IntToStr(High(Int64)) +
+        ') FROM (' + CategorySelection(i, lCutoff, cTimes[i]) + ')');
+      if lTime < lOldest then
+      begin
+        lOldest := lTime;
+        lCategory := i;
+        lSelection := lCandidate;
+      end;
+    end;
+    if lCategory < 0 then
+    begin
+      // Floors may only be breached while we still exceed the hard budget.
+      if (lPhase < 2) and (UInt64(fUsedBytes) > fConfig.MaxDatabaseSizeBytes) then
+      begin
+        Inc(lPhase);
+        Continue;
+      end;
+      lExhausted := True;
+      Break;
+    end;
+    if lCategory < 5 then
+      lSelection := lSelection + ' ORDER BY ' + cTimes[lCategory] + ' LIMIT 512'
+    else if lCategory = 5 then
+      lSelection := lSelection + ' ORDER BY started_utc_ms LIMIT 64'
+    else
+      lSelection := lSelection + ' ORDER BY started_utc_ms LIMIT 256';
+    lRows := DeleteCategory(lCategory, lSelection);
+    if (lRows > 0) and (lPhase > 0) then
+      lBreached := True;
+    if lRows = 0 then
+      Break;
+  end;
+  fTrimming := (fUsedBytes > lTarget) and
+    (not (lExhausted and (UInt64(fUsedBytes) <= fConfig.MaxDatabaseSizeBytes)));
+  if lBreached then
+  begin
+    fStorageState := TMachineOverviewStorageState.FloorBreached;
+    fStorageMessage := rsHistoryFloorBreached;
+  end else if (UInt64(fUsedBytes) > fConfig.MaxDatabaseSizeBytes) and lExhausted then
+  begin
+    fStorageState := TMachineOverviewStorageState.OverBudget;
+    fStorageMessage := rsHistoryOverBudget;
+  end else if fTrimming and (not lExhausted) then
+  begin
+    fStorageState := TMachineOverviewStorageState.Trimming;
+    fStorageMessage := rsHistoryTrimming;
+  end;
 end;
 
-function TMachineOverviewHistoryStore.WriteBatch(
-  const aItems: TArray<TMachineOverviewHistoryItem>): Integer;
+procedure TMachineOverviewHistoryStore.PersistStatus;
 var
-  lItem: TMachineOverviewHistoryItem;
-  lNowUtcMs: Int64;
+  lStatusUtc, lWalBytes: Int64;
+begin
+  lStatusUtc := HistoryUtcMilliseconds(TTimeZone.Local.ToUniversalTime(Now));
+  lWalBytes := 0;
+  if TFile.Exists(fConfig.DatabaseFileName + '-wal') then
+    lWalBytes := TFile.GetSize(fConfig.DatabaseFileName + '-wal');
+  fConnection.ExecSQL('UPDATE history_status SET maintenance_utc_ms=?, ' +
+    'commit_interval_ms=?, budget_bytes=?, used_bytes=?, file_bytes=?, wal_bytes=?, evidence_bytes=?, ' +
+    'storage_state=?, storage_message=?, last_floor_breach_utc_ms=CASE WHEN ?=2 THEN ? ELSE ' +
+    'last_floor_breach_utc_ms END, evidence_trimmed_total=evidence_trimmed_total+?, ' +
+    'incidents_deleted_total=incidents_deleted_total+?, samples_deleted_total=samples_deleted_total+?, ' +
+    'last_error=? WHERE id=1', [lStatusUtc, Int64(fConfig.CommitIntervalMs),
+    Int64(fConfig.MaxDatabaseSizeBytes), fUsedBytes,
+    Scalar('PRAGMA page_count') * Scalar('PRAGMA page_size'), lWalBytes, fEvidenceBytes,
+    Ord(fStorageState), fStorageMessage, Ord(fStorageState), lStatusUtc,
+    fTrimmedEvidence, fDeletedIncidents, fDeletedSamples,
+    Trim(fStartupError + ' ' + fMaintenanceError)]);
+end;
+
+function TMachineOverviewHistoryStore.RunMaintenance: Integer;
+var
+  lOriginalEvidenceBytes: Int64;
+  lOriginalState: TMachineOverviewStorageState;
+  lOriginalMessage: string;
+  lOriginalTrimming: Boolean;
 begin
   Result := 0;
-  if Length(aItems) = 0 then
-    Exit;
-  lNowUtcMs := 0;
+  fMaintenanceTimer := TStopwatch.StartNew;
+  fDeleteStatements := 0;
+  fDeletedSamples := 0;
+  fDeletedIncidents := 0;
+  fTrimmedEvidence := 0;
+  fMaintenanceError := '';
+  lOriginalEvidenceBytes := fEvidenceBytes;
+  lOriginalState := fStorageState;
+  lOriginalMessage := fStorageMessage;
+  lOriginalTrimming := fTrimming;
+  try
+    fConnection.StartTransaction;
+    try
+      ApplyRetention;
+      MeasureUsedBytes;
+      ApplyStorageCap;
+      PersistStatus;
+      fConnection.Commit;
+      Result := fDeletedSamples + fDeletedIncidents + fTrimmedEvidence;
+    except
+      if fConnection.InTransaction then
+        fConnection.Rollback;
+      fEvidenceBytes := lOriginalEvidenceBytes;
+      fStorageState := lOriginalState;
+      fStorageMessage := lOriginalMessage;
+      fTrimming := lOriginalTrimming;
+      raise;
+    end;
+  except
+    on lException: Exception do
+    begin
+      fMaintenanceError := lException.ClassName + ': ' + lException.Message;
+      try
+        fConnection.ExecSQL('UPDATE history_status SET last_error=? WHERE id=1',
+          [Trim(fStartupError + ' ' + fMaintenanceError)]);
+      except
+        on lStatusException: Exception do
+          fMaintenanceError := fMaintenanceError + '; status persistence failed: ' + lStatusException.Message;
+      end;
+    end;
+  end;
+  fMaintenanceDuration := fMaintenanceTimer.ElapsedMilliseconds;
+end;
+
+procedure TMachineOverviewHistoryStore.WriteBatch(
+  const aItems: TArray<TMachineOverviewHistoryItem>);
+var
+  lItem: TMachineOverviewHistoryItem;
+  lTime: Int64;
+begin
+  fBatchBoundary := High(Int64);
+  fMaintenanceNow := 0;
   fConnection.StartTransaction;
   try
     for lItem in aItems do
-      if (lItem.Kind = TMachineOverviewHistoryItemKind.RawSample) and
-        Assigned(lItem.Sample) then
+    begin
+      lTime := 0;
+      if (lItem.Kind = TMachineOverviewHistoryItemKind.RawSample) and Assigned(lItem.Sample) then
       begin
         if SameText(lItem.Sample.ProviderId, 'disks') then
           WriteDiskSample(lItem.Sample)
@@ -1498,13 +1762,24 @@ begin
           WriteProcessSample(lItem.Sample)
         else if SameText(lItem.Sample.ProviderId, 'windows-core') then
           WriteSystemSample(lItem.Sample);
-        lNowUtcMs := Max(lNowUtcMs,
-          HistoryUtcMilliseconds(lItem.Sample.CapturedAtUtc));
+        lTime := HistoryUtcMilliseconds(lItem.Sample.CapturedAtUtc);
       end else if lItem.Kind = TMachineOverviewHistoryItemKind.Incident then
+      begin
         WriteIncident(lItem.IncidentChange.Incident);
-    if lNowUtcMs > 0 then
-      ApplyRetention(lNowUtcMs);
-    Result := ApplyStorageCap;
+        lTime := HistoryUtcMilliseconds(lItem.IncidentChange.Incident.StartedAtUtc);
+      end;
+      if ((lItem.Kind = TMachineOverviewHistoryItemKind.RawSample) and Assigned(lItem.Sample)) or
+        ((lItem.Kind = TMachineOverviewHistoryItemKind.Incident) and
+        (not lItem.IncidentChange.Incident.StableId.IsEmpty)) then
+      begin
+        fBatchBoundary := Min(fBatchBoundary, lTime);
+        fMaintenanceNow := Max(fMaintenanceNow, lTime);
+      end;
+    end;
+    if fMaintenanceNow = 0 then
+      fMaintenanceNow := HistoryUtcMilliseconds(TTimeZone.Local.ToUniversalTime(Now));
+    fConnection.ExecSQL('UPDATE history_status SET updated_utc_ms=? WHERE id=1',
+      [HistoryUtcMilliseconds(TTimeZone.Local.ToUniversalTime(Now))]);
     fConnection.Commit;
   except
     if fConnection.InTransaction then
@@ -1829,6 +2104,23 @@ begin
   PublishDiagnostics;
 end;
 
+procedure TMachineOverviewHistoryServiceState.MarkMaintenance(
+  const aStore: TMachineOverviewHistoryStore);
+begin
+  DiagnosticsLock.Acquire;
+  try
+    DiagnosticsData.StorageState := aStore.fStorageState;
+    DiagnosticsData.LastMaintenanceError := aStore.fMaintenanceError;
+    DiagnosticsData.LastMaintenanceDeleteStatements := aStore.fDeleteStatements;
+    DiagnosticsData.LastMaintenanceDurationMs := aStore.fMaintenanceDuration;
+    if not Trim(aStore.fStartupError + ' ' + aStore.fMaintenanceError).IsEmpty then
+      DiagnosticsData.LastError := Trim(aStore.fStartupError + ' ' + aStore.fMaintenanceError);
+  finally
+    DiagnosticsLock.Release;
+  end;
+  PublishDiagnostics;
+end;
+
 procedure TMachineOverviewHistoryServiceState.MarkInitialized(
   const aAvailable: Boolean; const aError: string);
 begin
@@ -1837,6 +2129,8 @@ begin
     DiagnosticsData.Available := aAvailable;
     DiagnosticsData.Initialized := True;
     DiagnosticsData.LastError := aError;
+    if (not aAvailable) and ContainsText(aError, 'MigrationBlocked') then
+      DiagnosticsData.StorageState := TMachineOverviewStorageState.MigrationBlocked;
   finally
     DiagnosticsLock.Release;
   end;
@@ -1950,6 +2244,7 @@ begin
       if not lStore.fStartupError.IsEmpty then
         lIncidentError := Trim(lIncidentError + ' ' + lStore.fStartupError);
       fServiceState.MarkInitialized(True, lIncidentError);
+      fServiceState.MarkMaintenance(lStore);
     except
       on lException: Exception do
       begin
@@ -1997,9 +2292,11 @@ begin
         lCommitStartedMs := GetTickCount64;
         lCommitFailed := False;
         try
-          lStorageCapDropped := lStore.WriteBatch(lBatch);
+          lStore.WriteBatch(lBatch);
+          lStorageCapDropped := lStore.RunMaintenance;
           fServiceState.MarkCommitSuccess(Length(lBatch),
             GetTickCount64 - lCommitStartedMs, lStorageCapDropped);
+          fServiceState.MarkMaintenance(lStore);
           TInterlocked.Exchange(fServiceState.InFlightCount, 0);
           lNextCommitMs := GetTickCount64 +
             fServiceState.Config.CommitIntervalMs;

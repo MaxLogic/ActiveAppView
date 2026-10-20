@@ -3147,7 +3147,8 @@ begin
 
   GC(lIniFile, TMemIniFile.Create(lFileName, TEncoding.UTF8, False), g);
   lSettings := LoadMachineOverviewSettings(lIniFile);
-  if not lSettings.Enabled then
+  if (not lSettings.Enabled) or
+    (lSettings.MaxDatabaseSizeMB <> TMachineOverviewSettings.Defaults.MaxDatabaseSizeMB) then
   begin
     Writeln('SELFTEST FAILED: Machine Overview must default to enabled after release acceptance');
     Exit;
@@ -3253,16 +3254,18 @@ begin
 
   GC(lIniFile, TMemIniFile.Create(lFileName, TEncoding.UTF8, False), g);
   lIniFile.WriteInteger('MachineOverview', 'DisplayRefreshIntervalMs', 500);
+  lIniFile.WriteInteger('MachineOverview', 'MaxDatabaseSizeMB', 1);
   lSettings := LoadMachineOverviewSettings(lIniFile);
-  if lSettings.DisplayRefreshIntervalMs <> 2000 then
+  if (lSettings.DisplayRefreshIntervalMs <> 2000) or (lSettings.MaxDatabaseSizeMB <> 256) then
   begin
     Writeln('SELFTEST FAILED: Machine Overview display refresh was not clamped to 2000 ms');
     Exit;
   end;
 
   lIniFile.WriteInteger('MachineOverview', 'DisplayRefreshIntervalMs', 61000);
+  lIniFile.WriteInteger('MachineOverview', 'MaxDatabaseSizeMB', 70000);
   lSettings := LoadMachineOverviewSettings(lIniFile);
-  if lSettings.DisplayRefreshIntervalMs <> 60000 then
+  if (lSettings.DisplayRefreshIntervalMs <> 60000) or (lSettings.MaxDatabaseSizeMB <> 65536) then
   begin
     Writeln('SELFTEST FAILED: Machine Overview display refresh was not clamped to 60000 ms');
     Exit;

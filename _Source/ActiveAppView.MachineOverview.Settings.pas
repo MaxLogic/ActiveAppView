@@ -35,6 +35,7 @@ procedure SaveMachineOverviewPanelWidthToFile(const aFileName: string;
 implementation
 
 uses
+  System.Math,
   Winapi.Windows,
   AutoFree;
 
@@ -109,8 +110,8 @@ begin
     cMachineOverviewSectionName, 'Rollup10sRetentionDays', Result.Rollup10sRetentionDays);
   Result.Rollup1mRetentionDays := aIniFile.ReadInteger(
     cMachineOverviewSectionName, 'Rollup1mRetentionDays', Result.Rollup1mRetentionDays);
-  Result.MaxDatabaseSizeMB := aIniFile.ReadInteger(
-    cMachineOverviewSectionName, 'MaxDatabaseSizeMB', Result.MaxDatabaseSizeMB);
+  Result.MaxDatabaseSizeMB := EnsureRange(aIniFile.ReadInteger(
+    cMachineOverviewSectionName, 'MaxDatabaseSizeMB', Result.MaxDatabaseSizeMB), 256, 65536);
   Result.DetailedTraceEnabled := aIniFile.ReadBool(
     cMachineOverviewSectionName, 'DetailedTraceEnabled', Result.DetailedTraceEnabled);
 end;
