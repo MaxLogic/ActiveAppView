@@ -17,6 +17,52 @@ type
     Failed, Unavailable);
   TMachineOverviewIncidentChangeKind = (Started, Updated, Ended);
 
+  TMachineOverviewEvidenceState = (Legacy, Collecting, Complete, Partial, Trimmed, NotRecorded);
+  TMachineOverviewEvidencePhaseKind = (Before, During, After);
+  TMachineOverviewEvidenceGapReason = (ProcessSamplesMissing, SystemSamplesMissing,
+    ProviderUnavailable, CollectionStartedLate, CollectionStopped, Truncated);
+  TMachineOverviewProcessContribution = record
+    ProcessId: Cardinal;
+    CreationTime100ns: UInt64;
+    DisplayName, ImagePath, PathStatus: string;
+    AverageCpuPercent, PeakCpuPercent: Double;
+    PeakAtUtc, LastSeenUtc: TDateTime;
+    SampleCount: Integer;
+  end;
+  TMachineOverviewApplicationContribution = record
+    DisplayName: string;
+    ProcessCount: Integer;
+    AverageCpuPercent, PeakCpuPercent: Double;
+    PeakAtUtc: TDateTime;
+  end;
+  TMachineOverviewEvidenceGap = record
+    StartUtc, EndUtc: TDateTime;
+    Reason: TMachineOverviewEvidenceGapReason;
+  end;
+  TMachineOverviewEvidenceStatistic = record
+    Available: Boolean;
+    Average, Peak: Double;
+    PeakAtUtc: TDateTime;
+  end;
+  TMachineOverviewEvidencePhase = record
+    Kind: TMachineOverviewEvidencePhaseKind;
+    StartUtc, EndUtc: TDateTime;
+    ProcessSampleCount, ExpectedProcessSampleCount, SystemSampleCount, ExpectedSystemSampleCount: Integer;
+    SystemCpu, Dpc, Interrupt, MeasuredProcessCpu, UnattributedCpu: TMachineOverviewEvidenceStatistic;
+    Processes: TArray<TMachineOverviewProcessContribution>;
+    Applications: TArray<TMachineOverviewApplicationContribution>;
+  end;
+  TMachineOverviewIncidentEvidence = record
+    State: TMachineOverviewEvidenceState;
+    LogicalProcessorCount: Integer;
+    ProcessIntervalMs, SystemIntervalMs: Cardinal;
+    InaccessibleProcessCountMax: Integer;
+    Phases: array[TMachineOverviewEvidencePhaseKind] of TMachineOverviewEvidencePhase;
+    Gaps: TArray<TMachineOverviewEvidenceGap>;
+    GapsOmitted: Integer;
+    Truncated: Boolean;
+  end;
+
   TMachineOverviewIncidentContext = record
     CapturedAtUtc: TDateTime;
     CapturedAtMonotonicMs: UInt64;
@@ -44,11 +90,13 @@ type
     TraceStatus: TMachineOverviewIncidentTraceStatus;
     PreContext: TArray<TMachineOverviewIncidentContext>;
     PostContext: TArray<TMachineOverviewIncidentContext>;
+    Evidence: TMachineOverviewIncidentEvidence;
   end;
 
   TMachineOverviewIncidentChange = record
     Kind: TMachineOverviewIncidentChangeKind;
     Incident: TMachineOverviewIncident;
+    HasEvidenceUpdate: Boolean;
   end;
 
   TMachineOverviewIncidentSignals = record

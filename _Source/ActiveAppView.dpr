@@ -31,6 +31,7 @@ uses
   ActiveAppView.MachineOverview.History.SelfTests in 'ActiveAppView.MachineOverview.History.SelfTests.pas',
   ActiveAppView.MachineOverview.HistoryForm in 'ActiveAppView.MachineOverview.HistoryForm.pas' {MachineOverviewHistoryFrm},
   ActiveAppView.MachineOverview.HistoryForm.SelfTests in 'ActiveAppView.MachineOverview.HistoryForm.SelfTests.pas',
+  ActiveAppView.MachineOverview.Evidence in 'ActiveAppView.MachineOverview.Evidence.pas',
   ActiveAppView.MachineOverview.Incidents in 'ActiveAppView.MachineOverview.Incidents.pas',
   ActiveAppView.MachineOverview.Incidents.SelfTests in 'ActiveAppView.MachineOverview.Incidents.SelfTests.pas',
   ActiveAppView.MachineOverview.Layout in 'ActiveAppView.MachineOverview.Layout.pas',

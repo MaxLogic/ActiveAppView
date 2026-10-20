@@ -1045,6 +1045,15 @@ begin
     Writeln('SELFTEST FAILED: process CPU/I/O delta units or machine normalization are wrong');
     Exit;
   end;
+  if (not TryCalculateMachineOverviewFirstProcessDelta(150000000, 100000000, 200000000,
+    10000000, 1000, 32, lDelta)) or (not lDelta.CpuAvailable) or lDelta.IoAvailable or
+    (Abs(lDelta.CpuPercent - 3.125) > 0.0001) or
+    TryCalculateMachineOverviewFirstProcessDelta(99999999, 100000000, 200000000,
+      10000000, 1000, 32, lDelta) then
+  begin
+    Writeln('SELFTEST FAILED: process born inside interval must contribute CPU since creation only');
+    Exit;
+  end;
   if TryCalculateMachineOverviewProcessDelta(100, 200, 300, 400, 1000, 32,
     lDelta) or TryCalculateMachineOverviewProcessDelta(200, 100, 400, 300, 0,
     32, lDelta) or TryCalculateMachineOverviewProcessDelta(200, 100, 400, 300,
@@ -1144,6 +1153,18 @@ begin
     Exit;
   end;
   lCpuCount := CountSystemProviderMeasurements(lSample, 'process_cpu_rank:');
+  if (not TryFindSystemProviderMeasurement(lSample, 'process_cpu_interval_ms', lMeasurement)) or
+    (lMeasurement.Value <= 0) or
+    (not TryFindSystemProviderMeasurement(lSample, 'logical_processor_count', lMeasurement)) or
+    (lMeasurement.Value <> GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)) or
+    (not TryFindSystemProviderMeasurement(lSample, 'process_cpu_measured_total_percent', lMeasurement)) or
+    (lMeasurement.Value < 0) or (lMeasurement.Value > 100) or
+    (CountSystemProviderMeasurements(lSample, 'process_cpu_process:') < 1) or
+    (CountSystemProviderMeasurements(lSample, 'process_cpu_process:') > 10) then
+  begin
+    Writeln('SELFTEST FAILED: individual process evidence or measurement context missing');
+    Exit;
+  end;
   lRamCount := CountSystemProviderMeasurements(lSample, 'process_ram_rank:');
   lIoCount := CountSystemProviderMeasurements(lSample, 'process_io_rank:');
   if (lCpuCount < 1) or (lCpuCount > 5) or (lRamCount < 1) or

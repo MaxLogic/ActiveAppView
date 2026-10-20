@@ -1,4 +1,4 @@
-﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{9E15E869-5B53-407D-B7E0-254F7767CC6E}</ProjectGuid>
         <ProjectVersion>20.2</ProjectVersion>
@@ -162,6 +162,7 @@
             <FormType>dfm</FormType>
         </DCCReference>
         <DCCReference Include="ActiveAppView.MachineOverview.HistoryForm.SelfTests.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Evidence.pas"/>
         <DCCReference Include="ActiveAppView.MachineOverview.Incidents.pas"/>
         <DCCReference Include="ActiveAppView.MachineOverview.Incidents.SelfTests.pas"/>
         <DCCReference Include="ActiveAppView.MachineOverview.Layout.pas"/>

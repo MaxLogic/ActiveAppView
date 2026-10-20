@@ -25,6 +25,11 @@ function TryCalculateMachineOverviewProcessDelta(
   aCurrentIoBytes, aPreviousIoBytes, aElapsedMs: UInt64;
   const aLogicalProcessorCount: Cardinal;
   out aDelta: TMachineOverviewProcessDelta): Boolean;
+function TryCalculateMachineOverviewFirstProcessDelta( //PALOFF Our process-disk fixture calls this pure first-observation seam.
+  const aCreationTime100ns, aPreviousCapturedAt100ns, aCapturedAt100ns,
+  aProcessTime100ns, aElapsedMs: UInt64; const aLogicalProcessorCount: Cardinal;
+  out aDelta: TMachineOverviewProcessDelta): Boolean;
+
 function ShouldReuseMachineOverviewProcessPath(
   const aCachedIdentity, aCurrentIdentity: TMachineOverviewProcessIdentity;
   const aLastSeenMonotonicMs, aNowMonotonicMs,
@@ -92,11 +97,14 @@ type
     WorkingSetBytesAvailable: Boolean;
   end;
 
+  TMachineOverviewTopProcesses = array[0..9] of TMachineOverviewCollectedProcess;
+
   TMachineOverviewProcessProvider = class(TInterfacedObject,
     IMachineOverviewProvider)
   private
     fPathCache: TDictionary<string, TMachineOverviewProcessPathCacheEntry>;
     fPreviousCapturedAtMonotonicMs: UInt64;
+    fPreviousCapturedAtFileTime: UInt64;
     fPreviousProcesses: TDictionary<string, TMachineOverviewPreviousProcess>;
     fRolling: TObject;
     procedure AddDiagnostic(
@@ -109,7 +117,7 @@ type
       const aProcesses: TList<TMachineOverviewCollectedProcess>;
       const aNowMonotonicMs: UInt64);
     function CollectProcess(const aProcessId: Cardinal;
-      const aNowMonotonicMs, aElapsedMs: UInt64;
+      const aNowMonotonicMs, aElapsedMs, aCapturedAtFileTime: UInt64;
       const aLogicalProcessorCount: Cardinal;
       const aSeenIdentities: TDictionary<string, Boolean>;
       out aProcess: TMachineOverviewCollectedProcess;
@@ -266,6 +274,23 @@ begin
     aDelta.IoAvailable := True;
   end;
   Result := aDelta.CpuAvailable or aDelta.IoAvailable;
+end;
+
+function TryCalculateMachineOverviewFirstProcessDelta(
+  const aCreationTime100ns, aPreviousCapturedAt100ns, aCapturedAt100ns,
+  aProcessTime100ns, aElapsedMs: UInt64; const aLogicalProcessorCount: Cardinal;
+  out aDelta: TMachineOverviewProcessDelta): Boolean;
+begin
+  aDelta := Default(TMachineOverviewProcessDelta);
+  Result := (aPreviousCapturedAt100ns > 0) and
+    (aCreationTime100ns >= aPreviousCapturedAt100ns) and
+    (aCreationTime100ns <= aCapturedAt100ns) and
+    (aCapturedAt100ns > aPreviousCapturedAt100ns) and (aElapsedMs > 0) and (aLogicalProcessorCount > 0);
+  if not Result then
+    Exit;
+  Result := TryCalculateMachineOverviewProcessDelta(aProcessTime100ns, 0, 0, 0,
+    aElapsedMs, aLogicalProcessorCount, aDelta);
+  aDelta.IoAvailable := False;
 end;
 
 constructor TMachineOverviewProcessProvider.Create;
@@ -561,7 +586,7 @@ begin
 end;
 
 function TMachineOverviewProcessProvider.CollectProcess(
-  const aProcessId: Cardinal; const aNowMonotonicMs, aElapsedMs: UInt64;
+  const aProcessId: Cardinal; const aNowMonotonicMs, aElapsedMs, aCapturedAtFileTime: UInt64;
   const aLogicalProcessorCount: Cardinal;
   const aSeenIdentities: TDictionary<string, Boolean>;
   out aProcess: TMachineOverviewCollectedProcess;
@@ -634,6 +659,11 @@ begin
           aElapsedMs;
       end;
     end;
+    if not fPreviousProcesses.ContainsKey(lKey) then
+      if not TryCalculateMachineOverviewFirstProcessDelta(aProcess.Identity.CreationTime100ns,
+        fPreviousCapturedAtFileTime, aCapturedAtFileTime, lProcessTime100ns,
+        aElapsedMs, aLogicalProcessorCount, aProcess.Delta) then
+        aProcess.Delta := Default(TMachineOverviewProcessDelta);
     lPrevious := Default(TMachineOverviewPreviousProcess);
     lPrevious.Identity := aProcess.Identity;
     lPrevious.IoAvailable := lIoAvailable;
@@ -696,12 +726,69 @@ begin
     fPathCache.Remove(lKey);
 end;
 
+procedure AddIndividualCpuMeasurements(const aMeasurements: TList<TMachineOverviewMeasurement>;
+  const aProcesses: TList<TMachineOverviewCollectedProcess>);
+var
+  lTop: TMachineOverviewTopProcesses;
+  lProcess: TMachineOverviewCollectedProcess;
+  lMeasurement: TMachineOverviewMeasurement;
+  lTotal: Double;
+  i, j, n: Integer;
+begin
+  lTop := Default(TMachineOverviewTopProcesses);
+  n := 0;
+  lTotal := 0;
+  for lProcess in aProcesses do
+  begin
+    if not lProcess.Delta.CpuAvailable then
+      Continue;
+    lTotal := lTotal + lProcess.Delta.CpuPercent;
+    if lProcess.Delta.CpuPercent <= 0 then
+      Continue;
+    i := 0;
+    while (i < n) and ((lTop[i].Delta.CpuPercent > lProcess.Delta.CpuPercent) or
+      ((lTop[i].Delta.CpuPercent = lProcess.Delta.CpuPercent) and
+      (lTop[i].Identity.ProcessId < lProcess.Identity.ProcessId))) do
+      Inc(i);
+    if i = Length(lTop) then
+      Continue;
+    if n < Length(lTop) then
+      Inc(n);
+    for j := n - 1 downto i + 1 do
+      lTop[j] := lTop[j - 1];
+    lTop[i] := lProcess;
+  end;
+  for i := 0 to n - 1 do
+  begin
+    lMeasurement := Default(TMachineOverviewMeasurement);
+    lMeasurement.Name := 'process_cpu_process:' + IntToStr(i + 1);
+    lMeasurement.EntityId := MachineOverviewProcessIdentityKey(lTop[i].Identity);
+    lMeasurement.DisplayText := lTop[i].DisplayName;
+    lMeasurement.DetailText := lTop[i].Path;
+    lMeasurement.StatusText := ProcessPathStatusText(lTop[i].PathStatus);
+    lMeasurement.Available := True;
+    lMeasurement.UnitText := 'percent';
+    lMeasurement.Value := lTop[i].Delta.CpuPercent;
+    aMeasurements.Add(lMeasurement);
+  end;
+  lMeasurement := Default(TMachineOverviewMeasurement);
+  lMeasurement.Name := 'process_cpu_measured_total_percent';
+  lMeasurement.UnitText := 'percent';
+  lMeasurement.Available := True;
+  // Our collection spans time; tiny scheduling skew must not claim over 100% machine capacity.
+  if lTotal > 100 then
+    lTotal := 100;
+  lMeasurement.Value := lTotal;
+  aMeasurements.Add(lMeasurement);
+end;
+
 procedure TMachineOverviewProcessProvider.Collect(
   out aSample: TMachineOverviewProviderSample);
 var
   g: TGarbos;
   lAccessDenied: Boolean;
   lAccessDeniedCount: Integer;
+  lCapturedAtFileTime: TFileTime;
   lCpuMetrics: TArray<TMachineOverviewProcessMetric>;
   lCpuRanked: TArray<TMachineOverviewRankedProcess>;
   lElapsedMs: UInt64;
@@ -725,6 +812,7 @@ begin
   aSample.State.CapturedAtUtc := TTimeZone.Local.ToUniversalTime(Now);
   lNowMonotonicMs := GetTickCount64;
   aSample.State.CapturedAtMonotonicMs := lNowMonotonicMs;
+  GetSystemTimeAsFileTime(lCapturedAtFileTime);
   if not TryEnumerateProcesses(lProcessIds, lErrorCode) then
   begin
     aSample.State.Status := TMachineOverviewProviderStatus.Unavailable;
@@ -745,13 +833,17 @@ begin
   for i := 0 to High(lProcessIds) do
   begin
     lAccessDenied := False;
-    if CollectProcess(lProcessIds[i], lNowMonotonicMs, lElapsedMs,
+    if CollectProcess(lProcessIds[i], lNowMonotonicMs, lElapsedMs, FileTimeToUInt64(lCapturedAtFileTime),
       lLogicalProcessorCount, lSeenIdentities, lProcess, lAccessDenied) then
       lProcessList.Add(lProcess)
     else if lAccessDenied then
       Inc(lAccessDeniedCount);
   end;
   ExpireMissingProcesses(lSeenIdentities);
+  fPreviousCapturedAtFileTime := FileTimeToUInt64(lCapturedAtFileTime);
+  AddIndividualCpuMeasurements(lMeasurementList, lProcessList);
+  AddDiagnostic(lMeasurementList, 'process_cpu_interval_ms', 'milliseconds', lElapsedMs);
+  AddDiagnostic(lMeasurementList, 'logical_processor_count', 'count', lLogicalProcessorCount);
   fPreviousCapturedAtMonotonicMs := lNowMonotonicMs;
 
   SetLength(lCpuMetrics, lProcessList.Count);

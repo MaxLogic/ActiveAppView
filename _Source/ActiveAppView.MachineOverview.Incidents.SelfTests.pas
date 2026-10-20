@@ -7,10 +7,11 @@ function RunMachineOverviewIncidentSelfTests(const aArg: string): Integer;
 implementation
 
 uses
-  System.DateUtils, System.IOUtils, System.Math, System.StrUtils,
+  System.DateUtils, System.Diagnostics, System.Generics.Collections, System.IOUtils, System.Math, System.StrUtils,
   System.SysUtils,
   Winapi.Windows,
   AutoFree, FireDAC.Comp.Client,
+  ActiveAppView.MachineOverview.Evidence,
   ActiveAppView.MachineOverview.History,
   ActiveAppView.MachineOverview.Incidents,
   ActiveAppView.MachineOverview.Pipeline,
@@ -863,12 +864,782 @@ begin
   end;
 end;
 
+function EvidenceSecond(const aUtc: TDateTime; const aSeconds: Integer): TDateTime;
+var
+  lSeconds: Int64;
+begin
+  lSeconds := aSeconds; //PALOFF Our small integer fixture offsets widen exactly to Int64.
+  Result := IncSecond(aUtc, lSeconds);
+end;
+
+procedure EvidenceCheck(const aCondition: Boolean; const aMessage: string);
+begin
+  if not aCondition then
+    raise Exception.Create('Evidence: ' + aMessage);
+end;
+
+procedure AddEvidenceMeasurement(var aSample: TMachineOverviewProviderSample;
+  const aName: string; const aValue: Double; const aIdentity: string = '';
+  const aDisplay: string = '');
+var
+  n: Integer;
+begin
+  n := Length(aSample.Measurements);
+  SetLength(aSample.Measurements, n + 1);
+  aSample.Measurements[n].Name := aName;
+  aSample.Measurements[n].Value := aValue;
+  aSample.Measurements[n].Available := True;
+  aSample.Measurements[n].EntityId := aIdentity;
+  aSample.Measurements[n].DisplayText := aDisplay;
+  aSample.Measurements[n].DetailText := 'C:\Test\worker.exe';
+  aSample.Measurements[n].StatusText := 'Available';
+end;
+
+function EvidenceSample(const aUtc: TDateTime; const aProcess: Boolean;
+  const aFirst: Integer = 1; const aCount: Integer = 2): TMachineOverviewProviderSample;
+var
+  i: Integer;
+begin
+  Result := Default(TMachineOverviewProviderSample);
+  Result.State.Status := TMachineOverviewProviderStatus.Available;
+  Result.State.CapturedAtUtc := aUtc;
+  if aProcess then
+  begin
+    Result.State.ProviderId := 'processes';
+    AddEvidenceMeasurement(Result, 'logical_processor_count', 32);
+    AddEvidenceMeasurement(Result, 'process_cpu_interval_ms', 5000);
+    AddEvidenceMeasurement(Result, 'process_cpu_measured_total_percent', aCount * 3.125);
+    for i := 0 to aCount - 1 do
+      AddEvidenceMeasurement(Result, 'process_cpu_process:' + IntToStr(i + 1),
+        3.125, '42:' + IntToStr(aFirst + i), 'worker.exe');
+    AddEvidenceMeasurement(Result, 'process_cpu_rank:1', aCount * 3.125, '', 'worker.exe');
+    AddEvidenceMeasurement(Result, 'process_cpu_pids:1', aCount);
+  end else begin
+    Result.State.ProviderId := 'windows-core';
+    AddEvidenceMeasurement(Result, 'cpu_total_percent', 25);
+    AddEvidenceMeasurement(Result, 'dpc_percent', 2);
+    AddEvidenceMeasurement(Result, 'interrupt_percent', 1);
+  end;
+end;
+
+function EvidenceChange(const aUtc: TDateTime; const aId: string): TMachineOverviewIncidentChange;
+begin
+  Result := Default(TMachineOverviewIncidentChange);
+  Result.Kind := TMachineOverviewIncidentChangeKind.Started;
+  Result.Incident.StableId := aId;
+  Result.Incident.StartedAtUtc := aUtc;
+end;
+
+procedure AssertEvidencePayloadValid(const aEvidence: TMachineOverviewIncidentEvidence);
+var
+  lDecoded: TMachineOverviewIncidentEvidence;
+  lError: string;
+begin
+  EvidenceCheck(TryMachineOverviewEvidenceFromJson(MachineOverviewEvidenceToJson(aEvidence), lDecoded, lError),
+    'every emitted payload must decode: ' + lError);
+end;
+
+function EvidencePayloadEmpty(const aEvidence: TMachineOverviewIncidentEvidence): Boolean;
+var
+  lKind: TMachineOverviewEvidencePhaseKind;
+begin
+  Result := (aEvidence.State = TMachineOverviewEvidenceState.Legacy) and
+    (aEvidence.ProcessIntervalMs = 0) and (aEvidence.SystemIntervalMs = 0) and
+    (Length(aEvidence.Gaps) = 0) and not aEvidence.Truncated;
+  for lKind := Low(lKind) to High(lKind) do
+    Result := Result and (Length(aEvidence.Phases[lKind].Processes) = 0) and
+      (Length(aEvidence.Phases[lKind].Applications) = 0) and
+      (aEvidence.Phases[lKind].ProcessSampleCount = 0) and
+      (aEvidence.Phases[lKind].SystemSampleCount = 0);
+end;
+
+procedure ApplyEvidence(const aRecorder: TMachineOverviewEvidenceRecorder;
+  var aChange: TMachineOverviewIncidentChange);
+begin
+  aRecorder.Apply(aChange);
+  if aChange.HasEvidenceUpdate then
+    AssertEvidencePayloadValid(aChange.Incident.Evidence)
+  else
+    EvidenceCheck(EvidencePayloadEmpty(aChange.Incident.Evidence), 'headline-only change has no payload');
+end;
+
+function CompleteEvidence(const aRecorder: TMachineOverviewEvidenceRecorder;
+  const aNowUtc: TDateTime): TArray<TMachineOverviewIncidentChange>;
+var
+  lChange: TMachineOverviewIncidentChange;
+begin
+  Result := aRecorder.TakeCompleted(aNowUtc);
+  for lChange in Result do
+  begin
+    EvidenceCheck(lChange.HasEvidenceUpdate, 'completion explicitly carries evidence');
+    AssertEvidencePayloadValid(lChange.Incident.Evidence);
+  end;
+end;
+
+function CaptureEvidence(const aRecorder: TMachineOverviewEvidenceRecorder;
+  const aChange: TMachineOverviewIncidentChange): TMachineOverviewIncidentEvidence;
+var
+  lChange: TMachineOverviewIncidentChange;
+begin
+  lChange := aChange;
+  ApplyEvidence(aRecorder, lChange);
+  Result := lChange.Incident.Evidence;
+end;
+
+procedure RunEvidenceAttributionSelfTest;
+var
+  g: TGarbos;
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lChange: TMachineOverviewIncidentChange;
+  lEvidence: TMachineOverviewIncidentEvidence;
+  lPhase: TMachineOverviewEvidencePhase;
+  lUtc: TDateTime;
+  i: Integer;
+begin
+  lChange := Default(TMachineOverviewIncidentChange);
+  g := Default(TGarbos);
+  GC(lRecorder, TMachineOverviewEvidenceRecorder.Create(TMachineOverviewEvidenceConfig.Defaults), g);
+  lUtc := EncodeDate(2026, 10, 20);
+  lChange := EvidenceChange(lUtc, 'attribution');
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  for i := 0 to 14 do
+  begin
+    lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, i), False));
+    if (i > 0) and ((i mod 5) = 0) then
+      lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, i), True, 1 + Ord(i = 10), 2));
+  end;
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+  lChange.Incident.EndedAtUtc := EvidenceSecond(lUtc, 15);
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  lPhase := lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During];
+  EvidenceCheck(lEvidence.LogicalProcessorCount = 32, 'LP count');
+  EvidenceCheck((lPhase.ProcessSampleCount = 2) and (lPhase.SystemSampleCount = 15), 'sample counts');
+  EvidenceCheck(Length(lPhase.Processes) = 3, 'PID reuse must retain exited identity');
+  EvidenceCheck((lPhase.Processes[0].CreationTime100ns = 2) and
+    SameValue(lPhase.Processes[0].AverageCpuPercent, 3.125, 0.001), 'normalization / phase denominator');
+  EvidenceCheck(SameValue(lPhase.Processes[0].PeakCpuPercent, 3.125, 0.001) and
+    SameValue(lPhase.Processes[0].PeakAtUtc, EvidenceSecond(lUtc, 5), 0.0000001), 'process peak time');
+  EvidenceCheck(SameValue(lPhase.Processes[1].LastSeenUtc, EvidenceSecond(lUtc, 5), 0.0000001), 'exited last seen');
+  EvidenceCheck((Length(lPhase.Applications) = 1) and (lPhase.Applications[0].ProcessCount = 2) and
+    SameValue(lPhase.Applications[0].AverageCpuPercent, 6.25, 0.001) and
+    SameValue(lPhase.Applications[0].PeakCpuPercent, 6.25, 0.001) and
+    SameValue(lPhase.Applications[0].PeakAtUtc, EvidenceSecond(lUtc, 5), 0.0000001), 'application grouping');
+  EvidenceCheck(SameValue(lPhase.SystemCpu.Average, 25, 0.001) and
+    SameValue(lPhase.Dpc.Average, 2, 0.001) and SameValue(lPhase.Interrupt.Average, 1, 0.001) and
+    SameValue(lPhase.MeasuredProcessCpu.Average, 6.25, 0.001) and
+    SameValue(lPhase.UnattributedCpu.Average, 18.75, 0.001),
+    Format('system / residual attribution cpu=%.4f dpc=%.4f irq=%.4f measured=%.4f residual=%.4f',
+      [lPhase.SystemCpu.Average, lPhase.Dpc.Average, lPhase.Interrupt.Average,
+       lPhase.MeasuredProcessCpu.Average, lPhase.UnattributedCpu.Average]));
+  Writeln('SELFTEST PASS: evidence attribution');
+end;
+
+procedure RunEvidenceGapSelfTest;
+var
+  g: TGarbos;
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lChange: TMachineOverviewIncidentChange;
+  lEvidence: TMachineOverviewIncidentEvidence;
+  lSample: TMachineOverviewProviderSample;
+  lGap: TMachineOverviewEvidenceGap;
+  lReasons: set of TMachineOverviewEvidenceGapReason;
+  lUtc: TDateTime;
+  i: Integer;
+begin
+  lChange := Default(TMachineOverviewIncidentChange);
+  g := Default(TGarbos);
+  GC(lRecorder, TMachineOverviewEvidenceRecorder.Create(TMachineOverviewEvidenceConfig.Defaults), g);
+  lUtc := EncodeDate(2026, 10, 20);
+  lRecorder.ObserveSample(EvidenceSample(lUtc, False));
+  lRecorder.ObserveSample(EvidenceSample(lUtc, True));
+  lChange := EvidenceChange(lUtc, 'gaps');
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, 15), True));
+  lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, 5), False));
+  lSample := EvidenceSample(EvidenceSecond(lUtc, 16), True);
+  lSample.State.Status := TMachineOverviewProviderStatus.Unavailable;
+  lRecorder.ObserveSample(lSample);
+  lSample.State.CapturedAtUtc := EvidenceSecond(lUtc, 17);
+  lRecorder.ObserveSample(lSample);
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Updated;
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  lReasons := [];
+  for lGap in lEvidence.Gaps do
+  begin
+    Include(lReasons, lGap.Reason);
+    if lGap.Reason = TMachineOverviewEvidenceGapReason.ProviderUnavailable then
+      EvidenceCheck(lGap.EndUtc >= EvidenceSecond(lUtc, 17), 'adjacent unavailable gaps must merge');
+  end;
+  EvidenceCheck([TMachineOverviewEvidenceGapReason.ProcessSamplesMissing,
+    TMachineOverviewEvidenceGapReason.SystemSamplesMissing,
+    TMachineOverviewEvidenceGapReason.ProviderUnavailable,
+    TMachineOverviewEvidenceGapReason.CollectionStartedLate] <= lReasons, 'gap reasons');
+  for i := 1 to 40 do
+  begin
+    lSample := EvidenceSample(EvidenceSecond(lUtc, 20 + i * 20), True);
+    if Odd(i) then
+      lSample.State.Status := TMachineOverviewProviderStatus.Unavailable;
+    lRecorder.ObserveSample(lSample);
+  end;
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  EvidenceCheck((Length(lEvidence.Gaps) = 16) and
+    (lEvidence.GapsOmitted > 0), 'gap overflow counted');
+  Writeln('SELFTEST PASS: evidence gaps');
+end;
+
+procedure RunEvidenceBoundsSelfTest;
+var
+  g: TGarbos;
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lChange: TMachineOverviewIncidentChange;
+  lEvidence: TMachineOverviewIncidentEvidence;
+  lCompleted: TArray<TMachineOverviewIncidentChange>;
+  lUtc: TDateTime;
+  lShortBytes, lLongBytes: Integer;
+  i: Integer;
+begin
+  lChange := Default(TMachineOverviewIncidentChange);
+  g := Default(TGarbos);
+  GC(lRecorder, TMachineOverviewEvidenceRecorder.Create(TMachineOverviewEvidenceConfig.Defaults), g);
+  lUtc := EncodeDate(2026, 10, 20);
+  lChange := EvidenceChange(lUtc, 'bounds');
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  for i := 1 to 36 do
+    lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, i * 5), True, i * 10, 10));
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Updated;
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  lShortBytes := TEncoding.UTF8.GetByteCount(MachineOverviewEvidenceToJson(lEvidence));
+  for i := 37 to 4320 do
+    lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, i * 5), True, i * 10, 10));
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  lLongBytes := TEncoding.UTF8.GetByteCount(MachineOverviewEvidenceToJson(lEvidence));
+  EvidenceCheck(lEvidence.Truncated and (lLongBytes <= 16384) and
+    (lLongBytes < lShortBytes + 1024), 'six-hour bounded summary');
+  EvidenceCheck(Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes) <= 10,
+    'During row bound');
+  EvidenceCheck((Length(lEvidence.Gaps) <= 16) and
+    (Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.Before].Processes) <= 5) and
+    (Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.After].Processes) <= 5), 'other bounds');
+  for i := 1 to 70 do
+  begin
+    lChange := EvidenceChange(EvidenceSecond(lUtc, i), 'concurrent-' + IntToStr(i));
+    ApplyEvidence(lRecorder, lChange);
+  end;
+  EvidenceCheck(lRecorder.TrackedIncidentCount <= 64, 'incident bound');
+  lCompleted := CompleteEvidence(lRecorder, lUtc);
+  EvidenceCheck(Length(lCompleted) = 7, 'overflow incidents finalized early');
+  for i := 0 to High(lCompleted) do
+    EvidenceCheck((lCompleted[i].Incident.Evidence.State = TMachineOverviewEvidenceState.Partial) and
+      lCompleted[i].Incident.Evidence.Truncated and (Length(lCompleted[i].Incident.Evidence.Gaps) > 0),
+      'overflow must publish partial truncated evidence');
+  EvidenceCheck(Length(CompleteEvidence(lRecorder, lUtc)) = 0, 'early completion emitted once');
+  lChange := EvidenceChange(lUtc, 'unknown-update');
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Updated;
+  lChange.Incident.Evidence.LogicalProcessorCount := 123;
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  EvidenceCheck(EvidencePayloadEmpty(lEvidence), 'unknown update explicitly carries no evidence');
+  for i := 71 to 220 do
+  begin
+    lChange := EvidenceChange(EvidenceSecond(lUtc, i), 'concurrent-' + IntToStr(i));
+    lEvidence := CaptureEvidence(lRecorder, lChange);
+  end;
+  EvidenceCheck((lRecorder.TrackedIncidentCount = 64) and
+    (lEvidence.State = TMachineOverviewEvidenceState.Partial) and lEvidence.Truncated and
+    (lEvidence.ProcessIntervalMs = 5000), 'saturated completion queue refuses admission with valid partial evidence');
+  ApplyEvidence(lRecorder, lChange);
+  EvidenceCheck((not lChange.HasEvidenceUpdate) and (lRecorder.TrackedIncidentCount = 64),
+    'terminal admission refusal also finalizes its key');
+  EvidenceCheck(Length(CompleteEvidence(lRecorder, lUtc)) = 64, 'completion queue bounded at 64');
+  Writeln(Format('SELFTEST PASS: evidence bounds short=%d long=%d bytes', [lShortBytes, lLongBytes]));
+end;
+
+procedure RunEvidencePostWindowSelfTest(const aUserMarked: Boolean);
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewEvidenceConfig;
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lChange: TMachineOverviewIncidentChange;
+  lEvidence: TMachineOverviewIncidentEvidence;
+  lCompleted: TArray<TMachineOverviewIncidentChange>;
+  lUtc: TDateTime;
+begin
+  lChange := Default(TMachineOverviewIncidentChange);
+  g := Default(TGarbos);
+  lConfig := TMachineOverviewEvidenceConfig.Defaults;
+  lConfig.PostWindowMs := 10000;
+  GC(lRecorder, TMachineOverviewEvidenceRecorder.Create(lConfig), g);
+  lUtc := EncodeDate(2026, 10, 20);
+  lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, -5), True));
+  lChange := EvidenceChange(lUtc, 'post');
+  if not aUserMarked then
+    lEvidence := CaptureEvidence(lRecorder, lChange);
+  lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, 5), True));
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+  lChange.Incident.EndedAtUtc := EvidenceSecond(lUtc, 5);
+  if aUserMarked then
+    lChange.Incident.Origin := TMachineOverviewIncidentOrigin.UserMarked;
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  EvidenceCheck(Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.Before].Processes) = 2,
+    'Before ring replay');
+  EvidenceCheck((lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].ProcessSampleCount = 0) and
+    (lEvidence.Phases[TMachineOverviewEvidencePhaseKind.After].ProcessSampleCount = 1),
+    'interval ending at incident end belongs to After');
+  EvidenceCheck(Length(CompleteEvidence(lRecorder, EvidenceSecond(lUtc, 14))) = 0, 'post not early');
+  EvidenceCheck(Length(CompleteEvidence(lRecorder, IncMilliSecond(lUtc, 14999))) = 0, 'post deadline minus one ms');
+  lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, 15), True));
+  lCompleted := CompleteEvidence(lRecorder, EvidenceSecond(lUtc, 15));
+  EvidenceCheck((Length(lCompleted) = 1) and
+    (lCompleted[0].Kind = TMachineOverviewIncidentChangeKind.Updated) and
+    (lCompleted[0].Incident.Evidence.State = TMachineOverviewEvidenceState.Complete), 'post completes');
+  EvidenceCheck((Length(CompleteEvidence(lRecorder, EvidenceSecond(lUtc, 16))) = 0) and
+    (lRecorder.TrackedIncidentCount = 0), 'post emits exactly once');
+  Writeln('SELFTEST PASS: evidence post window user-marked=', aUserMarked);
+end;
+
+procedure RunEvidenceJsonRoundTripSelfTest;
+var
+  lEvidence, lDecoded: TMachineOverviewIncidentEvidence;
+  lText, lError: string;
+  lKind: TMachineOverviewEvidencePhaseKind;
+  i: Integer;
+begin
+  lEvidence := Default(TMachineOverviewIncidentEvidence);
+  lEvidence.LogicalProcessorCount := 32;
+  lEvidence.ProcessIntervalMs := 5000;
+  lEvidence.SystemIntervalMs := 1000;
+  for lKind := Low(lKind) to High(lKind) do
+    lEvidence.Phases[lKind].Kind := lKind;
+  lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].SystemCpu.Available := True;
+  lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].SystemCpu.Average := 3.125;
+  lText := MachineOverviewEvidenceToJson(lEvidence);
+  EvidenceCheck(TryMachineOverviewEvidenceFromJson(lText, lDecoded, lError), 'JSON decode: ' + lError);
+  EvidenceCheck((lDecoded.LogicalProcessorCount = 32) and
+    SameValue(lDecoded.Phases[TMachineOverviewEvidencePhaseKind.During].SystemCpu.Average, 3.13, 0.001) and
+    (MachineOverviewEvidenceToJson(lDecoded) = lText), 'JSON round trip');
+  EvidenceCheck((not TryMachineOverviewEvidenceFromJson('{broken', lDecoded, lError)) and
+    (lError <> ''), 'invalid JSON error');
+  EvidenceCheck(not TryMachineOverviewEvidenceFromJson('{}', lDecoded, lError), 'invalid schema');
+  EvidenceCheck(not TryMachineOverviewEvidenceFromJson(lText + 'garbage', lDecoded, lError), 'trailing garbage');
+  EvidenceCheck(not TryMachineOverviewEvidenceFromJson(StringReplace(lText, '"lp":32', '"lp":32,"lp":-1', []),
+    lDecoded, lError), 'duplicate members');
+  EvidenceCheck(not TryMachineOverviewEvidenceFromJson(StringReplace(lText, '"lp":32', '"lp":-1', []),
+    lDecoded, lError), 'invalid LP count');
+  EvidenceCheck((lError <> '') and (lDecoded.LogicalProcessorCount = 0), 'invalid decode clears result');
+  for lKind := Low(lKind) to High(lKind) do
+  begin
+    SetLength(lEvidence.Phases[lKind].Processes, 5);
+    SetLength(lEvidence.Phases[lKind].Applications, 5);
+    for i := 0 to 4 do
+    begin
+      lEvidence.Phases[lKind].Processes[i].CreationTime100ns := High(UInt64);
+      lEvidence.Phases[lKind].Processes[i].DisplayName := StringOfChar(WideChar($6F22), 256);
+      lEvidence.Phases[lKind].Processes[i].ImagePath := StringOfChar(WideChar($6F22), 1024);
+      lEvidence.Phases[lKind].Processes[i].PathStatus := 'Available';
+      lEvidence.Phases[lKind].Applications[i].DisplayName := StringOfChar(WideChar($6F22), 256);
+    end;
+  end;
+  lText := MachineOverviewEvidenceToJson(lEvidence);
+  EvidenceCheck(TEncoding.UTF8.GetByteCount(lText) <= 16384, 'UTF-8 JSON size under long Unicode names and paths');
+  EvidenceCheck(TryMachineOverviewEvidenceFromJson(lText, lDecoded, lError), 'trimmed JSON decode: ' + lError);
+  EvidenceCheck(lDecoded.Truncated and
+    (lDecoded.Phases[TMachineOverviewEvidencePhaseKind.During].Processes[0].CreationTime100ns = High(UInt64)) and
+    (Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.Before].Processes) = 5) and
+    (Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.Before].Processes[0].ImagePath) = 1024),
+    'trimmed JSON preserves UInt64 and does not mutate caller arrays');
+  Writeln('SELFTEST PASS: evidence JSON');
+end;
+
+procedure RunEvidenceCostMeasurement(const aIncidentCount: Integer);
+var
+  g: TGarbos;
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lChange: TMachineOverviewIncidentChange;
+  lSamples: array[0..199] of TMachineOverviewProviderSample;
+  lTimes: TArray<Double>;
+  lStopwatch: TStopwatch;
+  lUtc: TDateTime;
+  i, j: Integer;
+begin
+  lChange := Default(TMachineOverviewIncidentChange);
+  g := Default(TGarbos);
+  GC(lRecorder, TMachineOverviewEvidenceRecorder.Create(TMachineOverviewEvidenceConfig.Defaults), g);
+  lUtc := EncodeDate(2026, 10, 20);
+  for i := 1 to aIncidentCount do
+  begin
+    lChange := EvidenceChange(lUtc, 'cost-' + IntToStr(i));
+    ApplyEvidence(lRecorder, lChange);
+  end;
+  SetLength(lTimes, 21);
+  for j := -1 to High(lTimes) do
+  begin
+    for i := 0 to High(lSamples) do
+      lSamples[i] := EvidenceSample(EvidenceSecond(lUtc, (j + 1) * 200 + i), (i mod 5) = 4, 1, 10);
+    lStopwatch := TStopwatch.StartNew;
+    for i := 0 to High(lSamples) do
+      lRecorder.ObserveSample(lSamples[i]);
+    lStopwatch.Stop;
+    if j >= 0 then
+    begin
+      lTimes[j] := lStopwatch.ElapsedTicks * 1000000.0 / TStopwatch.Frequency / Length(lSamples);
+      Writeln(Format('EVIDENCE COST raw incidents=%d batch=%d us_per_sample=%.3f',
+        [aIncidentCount, j, lTimes[j]]));
+    end;
+  end;
+  TArray.Sort<Double>(lTimes);
+  Writeln(Format('EVIDENCE COST Debug Win64 incidents=%d samples=4200 min_us=%.3f median_us=%.3f p95_us=%.3f max_us=%.3f',
+    [aIncidentCount, lTimes[0], lTimes[10], lTimes[19], lTimes[20]]));
+  EvidenceCheck(lRecorder.TrackedIncidentCount = aIncidentCount, 'cost workload consumed');
+end;
+
+procedure EvidenceReviewCheck(const aCondition: Boolean; const aMessage: string; var aFailures: Integer);
+begin
+  if not aCondition then
+  begin
+    Inc(aFailures);
+    Writeln('REVIEW REGRESSION FAILED: ' + aMessage);
+  end;
+end;
+
+procedure RunEvidenceFinalizedLifecycleSelfTest;
+var
+  g: TGarbos;
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lConfig: TMachineOverviewEvidenceConfig;
+  lChange, lFinalized: TMachineOverviewIncidentChange;
+  lCompleted: TArray<TMachineOverviewIncidentChange>;
+  lKind: TMachineOverviewIncidentChangeKind;
+  lDecoded, lStoredEvidence: TMachineOverviewIncidentEvidence;
+  lGap: TMachineOverviewEvidenceGap;
+  lUtc: TDateTime;
+  lPayload, lError: string;
+  lEvictionGap: Boolean;
+  lUser, lSupplied: Boolean;
+  i, lMode, lFailures: Integer;
+begin
+  g := Default(TGarbos);
+  lFailures := 0;
+  lUtc := EncodeDate(2026, 10, 20);
+  for lMode := 0 to 2 do
+  begin
+    lConfig := TMachineOverviewEvidenceConfig.Defaults;
+    lConfig.PreWindowMs := 5000;
+    if lMode = 2 then
+      lConfig.PostWindowMs := 0;
+    GC(lRecorder, TMachineOverviewEvidenceRecorder.Create(lConfig), g);
+    lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, -5), True));
+    lChange := EvidenceChange(lUtc, 'finalized');
+    if lMode = 1 then
+    begin
+      lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+      lChange.Incident.Origin := TMachineOverviewIncidentOrigin.UserMarked;
+      lChange.Incident.EndedAtUtc := lUtc;
+    end;
+    ApplyEvidence(lRecorder, lChange);
+    lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, 5), True));
+    if lMode = 2 then
+    begin
+      lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+      lChange.Incident.EndedAtUtc := EvidenceSecond(lUtc, 10);
+      ApplyEvidence(lRecorder, lChange);
+    end else begin
+      for i := 1 to 64 do
+      begin
+        lChange := EvidenceChange(EvidenceSecond(lUtc, i), 'other-' + IntToStr(i));
+        ApplyEvidence(lRecorder, lChange);
+      end;
+    end;
+    lCompleted := CompleteEvidence(lRecorder, EvidenceSecond(lUtc, 65));
+    EvidenceCheck((Length(lCompleted) = 1) and (lCompleted[0].Incident.StableId = 'finalized'),
+      'lifecycle fixture finalized target once');
+    lFinalized := lCompleted[0];
+    AssertEvidencePayloadValid(lFinalized.Incident.Evidence);
+    lPayload := MachineOverviewEvidenceToJson(lFinalized.Incident.Evidence);
+    lStoredEvidence := lFinalized.Incident.Evidence;
+    lEvictionGap := False;
+    for lGap in lFinalized.Incident.Evidence.Gaps do
+      lEvictionGap := lEvictionGap or (lGap.Reason = TMachineOverviewEvidenceGapReason.Truncated);
+    if lMode <> 2 then
+      EvidenceCheck(lEvictionGap, 'eviction includes a valid truncation gap');
+    if lMode <> 2 then
+      EvidenceCheck(lFinalized.Incident.Evidence.Truncated and
+        (lFinalized.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.Before].ProcessSampleCount = 1),
+        'eviction preserves pre-window samples and truncation');
+    if lMode = 0 then
+      EvidenceCheck(lFinalized.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During].ProcessSampleCount = 1,
+        'eviction preserves During sample');
+    lChange := EvidenceChange(lUtc, 'finalized');
+    lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+    lChange.Incident.EndedAtUtc := EvidenceSecond(lUtc, 70);
+    ApplyEvidence(lRecorder, lChange);
+    EvidenceReviewCheck((not lChange.HasEvidenceUpdate) and EvidencePayloadEmpty(lChange.Incident.Evidence),
+      'fresh automatic Ended for finalized key returns no payload', lFailures);
+    if not EvidencePayloadEmpty(lChange.Incident.Evidence) then
+      EvidenceReviewCheck(TryMachineOverviewEvidenceFromJson(
+        MachineOverviewEvidenceToJson(lChange.Incident.Evidence), lDecoded, lError),
+        'fresh automatic Ended must never emit invalid zero-interval Partial: ' + lError, lFailures);
+    for lKind := Low(lKind) to High(lKind) do
+      for lUser := False to True do
+        for lSupplied := False to True do
+        begin
+          lChange := EvidenceChange(lUtc, 'finalized');
+          lChange.Kind := lKind;
+          lChange.Incident.EndedAtUtc := EvidenceSecond(lUtc, 70);
+          if lUser then
+            lChange.Incident.Origin := TMachineOverviewIncidentOrigin.UserMarked;
+          if lSupplied then
+          begin
+            lChange.Incident.Evidence := lFinalized.Incident.Evidence;
+            lChange.HasEvidenceUpdate := True;
+          end;
+          ApplyEvidence(lRecorder, lChange);
+          // Our S4 caller persists evidence only when this output flag is set.
+          if lChange.HasEvidenceUpdate then
+            lStoredEvidence := lChange.Incident.Evidence;
+          AssertEvidencePayloadValid(lStoredEvidence);
+          EvidenceReviewCheck(MachineOverviewEvidenceToJson(lStoredEvidence) = lPayload,
+            'headline-only output preserves persisted finalized payload', lFailures);
+          EvidenceReviewCheck((not lChange.HasEvidenceUpdate) and EvidencePayloadEmpty(lChange.Incident.Evidence),
+            Format('finalized key returns headline only mode=%d kind=%d user=%s supplied=%s',
+              [lMode, Ord(lKind), BoolToStr(lUser, True), BoolToStr(lSupplied, True)]), lFailures);
+          if not EvidencePayloadEmpty(lChange.Incident.Evidence) then
+            EvidenceReviewCheck(TryMachineOverviewEvidenceFromJson(
+              MachineOverviewEvidenceToJson(lChange.Incident.Evidence), lDecoded, lError),
+              'unexpected emitted lifecycle payload must still decode: ' + lError, lFailures);
+          EvidenceReviewCheck(lRecorder.TrackedIncidentCount = IfThen(lMode = 2, 0, 64),
+            'finalized key never recreates tracking', lFailures);
+          lCompleted := CompleteEvidence(lRecorder, EvidenceSecond(lUtc, 1000));
+          EvidenceReviewCheck(Length(lCompleted) = 0, 'finalized key never emits replacement evidence', lFailures);
+          EvidenceReviewCheck(MachineOverviewEvidenceToJson(lFinalized.Incident.Evidence) = lPayload,
+            'finalized payload preserved byte-for-byte', lFailures);
+        end;
+  end;
+  EvidenceCheck(lFailures = 0, 'finalized lifecycle regression failures: ' + IntToStr(lFailures));
+  Writeln('SELFTEST PASS: finalized evidence lifecycle');
+end;
+
+procedure RunEvidenceFinalizedFifoSelfTest;
+var
+  g: TGarbos;
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lConfig: TMachineOverviewEvidenceConfig;
+  lChange: TMachineOverviewIncidentChange;
+  lUtc: TDateTime;
+  i: Integer;
+begin
+  g := Default(TGarbos);
+  lUtc := EncodeDate(2026, 10, 20);
+  lConfig := TMachineOverviewEvidenceConfig.Defaults;
+  lConfig.PreWindowMs := 0;
+  lConfig.PostWindowMs := 0;
+  GC(lRecorder, TMachineOverviewEvidenceRecorder.Create(lConfig), g);
+  // We prove both sides of our documented 4096-key FIFO retention boundary.
+  for i := 0 to 4096 do
+  begin
+    lChange := EvidenceChange(lUtc, 'fifo-' + IntToStr(i));
+    ApplyEvidence(lRecorder, lChange);
+    EvidenceCheck(lChange.HasEvidenceUpdate, 'fresh FIFO key admitted');
+    lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+    lChange.Incident.EndedAtUtc := lUtc;
+    ApplyEvidence(lRecorder, lChange);
+    EvidenceCheck(Length(CompleteEvidence(lRecorder, lUtc)) = 1, 'FIFO key finalized once');
+  end;
+  lChange := EvidenceChange(lUtc, 'fifo-1');
+  ApplyEvidence(lRecorder, lChange);
+  EvidenceCheck((not lChange.HasEvidenceUpdate) and (lRecorder.TrackedIncidentCount = 0),
+    'oldest retained key rejects replay');
+  lChange := EvidenceChange(lUtc, 'fifo-4096');
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+  lChange.Incident.Origin := TMachineOverviewIncidentOrigin.UserMarked;
+  ApplyEvidence(lRecorder, lChange);
+  EvidenceCheck((not lChange.HasEvidenceUpdate) and (lRecorder.TrackedIncidentCount = 0),
+    'newest retained key rejects UserMarked replay');
+  lChange := EvidenceChange(lUtc, 'fifo-0');
+  ApplyEvidence(lRecorder, lChange);
+  EvidenceCheck(lChange.HasEvidenceUpdate and (lRecorder.TrackedIncidentCount = 1),
+    'expired oldest key may be admitted after bounded FIFO pruning');
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+  lChange.Incident.EndedAtUtc := lUtc;
+  ApplyEvidence(lRecorder, lChange);
+  EvidenceCheck(Length(CompleteEvidence(lRecorder, lUtc)) = 1, 'expired key finalized afresh');
+  lChange := EvidenceChange(lUtc, 'never-seen-ended');
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+  lChange.Incident.EndedAtUtc := lUtc;
+  ApplyEvidence(lRecorder, lChange);
+  EvidenceCheck(not lChange.HasEvidenceUpdate, 'unknown automatic Ended is headline-only');
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Started;
+  ApplyEvidence(lRecorder, lChange);
+  EvidenceCheck((not lChange.HasEvidenceUpdate) and (lRecorder.TrackedIncidentCount = 0) and
+    (Length(CompleteEvidence(lRecorder, lUtc)) = 0), 'unknown automatic terminal path finalizes key');
+  Writeln('SELFTEST PASS: finalized key FIFO bound');
+end;
+
+procedure RunEvidenceReviewRegressionSelfTests;
+var
+  g: TGarbos;
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lConfig: TMachineOverviewEvidenceConfig;
+  lChange, lEvicted: TMachineOverviewIncidentChange;
+  lCompleted: TArray<TMachineOverviewIncidentChange>;
+  lEvidence, lDecoded: TMachineOverviewIncidentEvidence;
+  lSample: TMachineOverviewProviderSample;
+  lGap: TMachineOverviewEvidenceGap;
+  lKind: TMachineOverviewEvidencePhaseKind;
+  lUtc: TDateTime;
+  lText, lError, lPair: string;
+  i, lFailures, lGapCount: Integer;
+begin
+  g := Default(TGarbos);
+  lFailures := 0;
+  lUtc := EncodeDate(2026, 10, 20);
+  lConfig := TMachineOverviewEvidenceConfig.Defaults;
+  lConfig.PreWindowMs := 0;
+  lConfig.PostWindowMs := 0;
+  GC(lRecorder, TMachineOverviewEvidenceRecorder.Create(lConfig), g);
+  lChange := EvidenceChange(lUtc, 'evicted');
+  ApplyEvidence(lRecorder, lChange);
+  lRecorder.ObserveSample(EvidenceSample(EvidenceSecond(lUtc, 5), True));
+  for i := 2 to 65 do
+  begin
+    lChange := EvidenceChange(EvidenceSecond(lUtc, i), 'eviction-' + IntToStr(i));
+    ApplyEvidence(lRecorder, lChange);
+  end;
+  lCompleted := CompleteEvidence(lRecorder, EvidenceSecond(lUtc, 65));
+  EvidenceCheck(Length(lCompleted) = 1, 'eviction fixture finalized once');
+  lEvicted := lCompleted[0];
+  EvidenceCheck(lEvicted.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During].ProcessSampleCount = 1,
+    'eviction fixture retained During sample');
+  lChange := EvidenceChange(lUtc, 'evicted');
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+  lChange.Incident.EndedAtUtc := EvidenceSecond(lUtc, 70);
+  ApplyEvidence(lRecorder, lChange);
+  EvidenceReviewCheck((not lChange.HasEvidenceUpdate) and EvidencePayloadEmpty(lChange.Incident.Evidence),
+    'evicted automatic Ended returns no evidence update', lFailures);
+  lCompleted := CompleteEvidence(lRecorder, EvidenceSecond(lUtc, 70));
+  EvidenceReviewCheck(Length(lCompleted) = 0, 'evicted automatic Ended never completes again', lFailures);
+  // Our caller may already have the finalized snapshot when a late change arrives.
+  AssertEvidencePayloadValid(lEvicted.Incident.Evidence);
+  lText := MachineOverviewEvidenceToJson(lEvicted.Incident.Evidence);
+  lChange := lEvicted;
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+  lChange.Incident.EndedAtUtc := EvidenceSecond(lUtc, 71);
+  ApplyEvidence(lRecorder, lChange);
+  EvidenceReviewCheck((not lChange.HasEvidenceUpdate) and EvidencePayloadEmpty(lChange.Incident.Evidence),
+    'replayed finalized snapshot returns no evidence update', lFailures);
+  AssertEvidencePayloadValid(lEvicted.Incident.Evidence);
+  EvidenceReviewCheck((MachineOverviewEvidenceToJson(lEvicted.Incident.Evidence) = lText) and
+    (lEvicted.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During].ProcessSampleCount = 1),
+    'late Ended preserves finalized payload and During evidence', lFailures);
+
+  GC(lRecorder, TMachineOverviewEvidenceRecorder.Create(lConfig), g);
+  lRecorder.ObserveSample(EvidenceSample(lUtc, True));
+  lChange := EvidenceChange(lUtc, 'gap-boundary');
+  ApplyEvidence(lRecorder, lChange);
+  lRecorder.ObserveSample(EvidenceSample(lUtc + 10500 / Double(86400000), True));
+  lRecorder.ObserveSample(EvidenceSample(lUtc + 21500 / Double(86400000), True));
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Updated;
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  lGapCount := 0;
+  for lGap in lEvidence.Gaps do
+    if lGap.Reason = TMachineOverviewEvidenceGapReason.ProcessSamplesMissing then
+      Inc(lGapCount);
+  EvidenceReviewCheck(lGapCount = 0, '10.5s and exact 11s are within process gap tolerance', lFailures);
+  lRecorder.ObserveSample(EvidenceSample(lUtc + 32501 / Double(86400000), True));
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  lGapCount := 0;
+  for lGap in lEvidence.Gaps do
+    if lGap.Reason = TMachineOverviewEvidenceGapReason.ProcessSamplesMissing then
+      Inc(lGapCount);
+  EvidenceReviewCheck(lGapCount = 1, '11.001s exceeds process gap tolerance', lFailures);
+
+  // We apply the same threshold when completing without another process sample.
+  for i := 0 to 2 do
+  begin
+    case i of
+      0: lConfig.PostWindowMs := 10500;
+      1: lConfig.PostWindowMs := 11000;
+      2: lConfig.PostWindowMs := 11001;
+    end;
+    GC(lRecorder, TMachineOverviewEvidenceRecorder.Create(lConfig), g);
+    lRecorder.ObserveSample(EvidenceSample(lUtc, True));
+    lChange := EvidenceChange(lUtc, 'trailing-gap-' + IntToStr(i));
+    ApplyEvidence(lRecorder, lChange);
+    lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+    lChange.Incident.EndedAtUtc := lUtc;
+    ApplyEvidence(lRecorder, lChange);
+    lCompleted := CompleteEvidence(lRecorder, lUtc + lConfig.PostWindowMs / Double(86400000));
+    EvidenceCheck(Length(lCompleted) = 1, 'trailing gap fixture completes');
+    lGapCount := 0;
+    for lGap in lCompleted[0].Incident.Evidence.Gaps do
+      if lGap.Reason = TMachineOverviewEvidenceGapReason.ProcessSamplesMissing then
+        Inc(lGapCount);
+    EvidenceReviewCheck((lGapCount = 1) = (i = 2),
+      'trailing process gap boundary ' + IntToStr(i), lFailures);
+  end;
+  lConfig.PostWindowMs := 0;
+
+  lPair := WideChar($D83D) + WideChar($DE00);
+  GC(lRecorder, TMachineOverviewEvidenceRecorder.Create(lConfig), g);
+  lChange := EvidenceChange(lUtc, 'unicode-boundary');
+  ApplyEvidence(lRecorder, lChange);
+  lSample := EvidenceSample(EvidenceSecond(lUtc, 5), True, 1, 1);
+  for i := 0 to High(lSample.Measurements) do
+    if lSample.Measurements[i].Name = 'process_cpu_process:1' then
+    begin
+      lSample.Measurements[i].DisplayText := StringOfChar('n', 255) + lPair;
+      lSample.Measurements[i].DetailText := StringOfChar('p', 1023) + lPair;
+    end else if lSample.Measurements[i].Name = 'process_cpu_rank:1' then
+      lSample.Measurements[i].DisplayText := StringOfChar('a', 255) + lPair;
+  lRecorder.ObserveSample(lSample);
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Updated;
+  lEvidence := CaptureEvidence(lRecorder, lChange);
+  EvidenceReviewCheck(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes[0].DisplayName =
+    StringOfChar('n', 255), 'capture name cut preserves surrogate pair', lFailures);
+  EvidenceReviewCheck(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes[0].ImagePath =
+    StringOfChar('p', 1023), 'capture path cut preserves surrogate pair', lFailures);
+  EvidenceReviewCheck(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Applications[0].DisplayName =
+    StringOfChar('a', 255), 'capture application name cut preserves surrogate pair', lFailures);
+  lEvidence := Default(TMachineOverviewIncidentEvidence);
+  lEvidence.ProcessIntervalMs := 5000;
+  lEvidence.SystemIntervalMs := 1000;
+  for lKind := Low(lKind) to High(lKind) do
+  begin
+    SetLength(lEvidence.Phases[lKind].Processes, 5);
+    SetLength(lEvidence.Phases[lKind].Applications, 5);
+    for i := 0 to 4 do
+    begin
+      lText := StringOfChar(WideChar($6F22), 63) + lPair + StringOfChar(WideChar($6F22), 191);
+      lEvidence.Phases[lKind].Processes[i].DisplayName := lText;
+      lEvidence.Phases[lKind].Processes[i].ImagePath := StringOfChar(WideChar($6F22), 1024);
+      lEvidence.Phases[lKind].Applications[i].DisplayName := lText;
+    end;
+  end;
+  lText := MachineOverviewEvidenceToJson(lEvidence);
+  EvidenceCheck(TryMachineOverviewEvidenceFromJson(lText, lDecoded, lError), 'unicode budget JSON decodes: ' + lError);
+  EvidenceReviewCheck(lDecoded.Phases[TMachineOverviewEvidencePhaseKind.During].Processes[0].DisplayName =
+    StringOfChar(WideChar($6F22), 63), 'JSON budget name cut preserves surrogate pair', lFailures);
+  EvidenceReviewCheck(lDecoded.Phases[TMachineOverviewEvidencePhaseKind.During].Applications[0].DisplayName =
+    StringOfChar(WideChar($6F22), 63), 'JSON budget application cut preserves surrogate pair', lFailures);
+  EvidenceCheck(lFailures = 0, 'review regression failures: ' + IntToStr(lFailures));
+  Writeln('Evidence review regressions passed');
+end;
+
 function RunMachineOverviewIncidentSelfTests(const aArg: string): Integer;
 begin
   Result := -1;
   if not SameText(aArg, cMachineOverviewIncidentSelfTestArg) then
     Exit;
   try
+    RunEvidenceFinalizedLifecycleSelfTest;
+    RunEvidenceFinalizedFifoSelfTest;
+    RunEvidenceReviewRegressionSelfTests;
+    RunEvidenceAttributionSelfTest;
+    RunEvidenceGapSelfTest;
+    RunEvidenceBoundsSelfTest;
+    RunEvidencePostWindowSelfTest(False);
+    RunEvidencePostWindowSelfTest(True);
+    RunEvidenceJsonRoundTripSelfTest;
+    RunEvidenceCostMeasurement(1);
+    RunEvidenceCostMeasurement(64);
     Result := RunHighCpuIncidentSelfTest;
     if Result = 0 then
       Result := RunPostContextContinuationSelfTest;

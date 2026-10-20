@@ -1,0 +1,1287 @@
+unit ActiveAppView.MachineOverview.Evidence;
+
+interface
+
+uses
+  ActiveAppView.MachineOverview.Incidents, ActiveAppView.MachineOverview.Providers;
+
+type
+  TMachineOverviewEvidenceConfig = record
+    PreWindowMs, PostWindowMs, RingRetentionMs: UInt64;
+    ProcessIntervalMs, SystemIntervalMs: Cardinal;
+    class function Defaults: TMachineOverviewEvidenceConfig; static;
+  end;
+
+  // Our aggregator thread owns this recorder; snapshots never share mutable accumulators.
+  TMachineOverviewEvidenceRecorder = class
+  private
+    fState: TObject;
+  public
+    constructor Create(const aConfig: TMachineOverviewEvidenceConfig);
+    destructor Destroy; override;
+    procedure ObserveSample(const aSample: TMachineOverviewProviderSample);
+    // Apply/TakeCompleted set HasEvidenceUpdate only when supplying a payload. False
+    // means headline-only: Evidence is empty and callers must preserve stored evidence.
+    // Finalized keys reject every change kind/origin before admission. We retain the
+    // latest 4096 finalized keys in FIFO order; older keys may be admitted after expiry.
+    procedure Apply(var aChange: TMachineOverviewIncidentChange);
+    function TakeCompleted(const aNowUtc: TDateTime): TArray<TMachineOverviewIncidentChange>;
+    function TrackedIncidentCount: Integer;
+  end;
+
+function MachineOverviewEvidenceToJson(const aEvidence: TMachineOverviewIncidentEvidence): string;
+function TryMachineOverviewEvidenceFromJson(const aText: string;
+  out aEvidence: TMachineOverviewIncidentEvidence; out aError: string): Boolean;
+
+implementation
+
+uses
+  System.DateUtils, System.Generics.Collections, System.JSON, System.Math, System.StrUtils, System.SysUtils,
+  AutoFree, maxLogic.StrUtils,
+  ActiveAppView.MachineOverview.Types;
+
+const
+  cDayMs: Double = 86400000.0;
+  cMaximumJsonBytes = 16384;
+  cMaximumFinalizedKeys = 4096;
+  cPhaseNames: array[TMachineOverviewEvidencePhaseKind] of string = ('before', 'during', 'after');
+  cGapNames: array[TMachineOverviewEvidenceGapReason] of string = ('process-missing', 'system-missing',
+    'provider-unavailable', 'started-late', 'stopped', 'truncated');
+
+type
+  TEvidenceSample = record
+    AtUtc, PreviousUtc: TDateTime;
+    IsProcess, Available, Truncated: Boolean;
+    IntervalMs: Cardinal;
+    LogicalProcessors, Inaccessible, ProcessCount, ApplicationCount: Integer;
+    Cpu, Dpc, Interrupt, Residual: TMachineOverviewOptionalDouble;
+    Processes: TArray<TMachineOverviewProcessContribution>;
+    Applications: TArray<TMachineOverviewApplicationContribution>;
+  end;
+
+  TEvidenceTotal = record
+    Sum, Weight: Double;
+    Value: TMachineOverviewEvidenceStatistic;
+    procedure Add(const aValue: Double; const aWeight: Double; const aAtUtc: TDateTime);
+    function Snapshot: TMachineOverviewEvidenceStatistic;
+  end;
+
+  TEvidencePhaseAccumulator = record
+    Value: TMachineOverviewEvidencePhase;
+    Cpu, Dpc, Interrupt, Measured, Residual: TEvidenceTotal;
+    ProcessWeight: Double;
+    ProcessCount, ApplicationCount: Integer;
+    Processes: array[0..63] of TMachineOverviewProcessContribution;
+    Applications: array[0..31] of TMachineOverviewApplicationContribution;
+    procedure AddProcess(const aValue: TMachineOverviewProcessContribution; const aWeight: Double;
+      var aTruncated: Boolean);
+    procedure AddApplication(const aValue: TMachineOverviewApplicationContribution; const aWeight: Double;
+      var aTruncated: Boolean);
+    procedure Add(const aSample: TEvidenceSample; var aTruncated: Boolean);
+    function Snapshot(const aEndUtc: TDateTime; const aProcessMs, aSystemMs: Cardinal): TMachineOverviewEvidencePhase;
+  end;
+
+  TEvidencePhaseAccumulators = array[TMachineOverviewEvidencePhaseKind] of TEvidencePhaseAccumulator;
+
+  TEvidenceIncident = class
+  public
+    Headline: TMachineOverviewIncident;
+    Config: TMachineOverviewEvidenceConfig;
+    Value: TMachineOverviewIncidentEvidence;
+    Phases: TEvidencePhaseAccumulators;
+    Pending: array[Boolean] of TEvidenceSample;
+    HasPending: array[Boolean] of Boolean;
+    LatestUtc: TDateTime;
+    constructor Create(const aIncident: TMachineOverviewIncident; const aConfig: TMachineOverviewEvidenceConfig);
+    procedure AddGap(const aStart, aEnd: TDateTime; const aReason: TMachineOverviewEvidenceGapReason);
+    procedure Observe(const aSample: TEvidenceSample);
+    function Snapshot(const aState: TMachineOverviewEvidenceState): TMachineOverviewIncidentEvidence;
+  end;
+
+  TEvidenceRecorderState = class
+  public
+    Config: TMachineOverviewEvidenceConfig;
+    Ring: array[0..511] of TEvidenceSample;
+    RingFirst, RingCount: Integer;
+    LastProcessUtc, LastSystemUtc, LatestUtc: TDateTime;
+    Entries: TObjectList<TEvidenceIncident>;
+    Ready: TList<TMachineOverviewIncidentChange>;
+    FinalizedKeys: THashSet<string>;
+    FinalizedOrder: TQueue<string>;
+    constructor Create(const aConfig: TMachineOverviewEvidenceConfig);
+    destructor Destroy; override;
+    function Compact(const aSample: TMachineOverviewProviderSample): TEvidenceSample;
+    procedure Replay(const aEntry: TEvidenceIncident);
+    procedure EvictOldest;
+    procedure RememberFinalized(const aStableId: string);
+  end;
+
+function EvidenceTextPrefix(const aText: string; const aMaximumUnits: Integer): string;
+var
+  lCount: Integer;
+begin
+  lCount := Length(aText);
+  if lCount > aMaximumUnits then
+    lCount := aMaximumUnits;
+  // We keep UTF-16 pairs together when a bounded prefix ends inside a character.
+  if (lCount > 0) and (lCount < Length(aText)) and
+    (Ord(aText[lCount]) >= $D800) and (Ord(aText[lCount]) <= $DBFF) and
+    (Ord(aText[lCount + 1]) >= $DC00) and (Ord(aText[lCount + 1]) <= $DFFF) then
+    Dec(lCount);
+  Result := Copy(aText, 1, lCount);
+end;
+
+function EvidenceGapThresholdMs(const aIntervalMs: Cardinal; const aProcess: Boolean): Double;
+begin
+  if aProcess then
+    Result := Double(aIntervalMs) * 2 + 1000
+  else
+    Result := Double(aIntervalMs) * 3;
+end;
+
+function FindMeasurement(const aSample: TMachineOverviewProviderSample; const aName: string;
+  out aValue: TMachineOverviewMeasurement): Boolean;
+var
+  lValue: TMachineOverviewMeasurement;
+begin
+  for lValue in aSample.Measurements do
+    if lValue.Name = aName then
+    begin
+      aValue := lValue;
+      Exit(lValue.Available and not IsNan(lValue.Value) and not IsInfinite(lValue.Value));
+    end;
+  aValue := Default(TMachineOverviewMeasurement);
+  Result := False;
+end;
+
+function OptionalMeasurement(const aSample: TMachineOverviewProviderSample;
+  const aName: string): TMachineOverviewOptionalDouble;
+var
+  lValue: TMachineOverviewMeasurement;
+begin
+  Result := Default(TMachineOverviewOptionalDouble);
+  Result.Available := FindMeasurement(aSample, aName, lValue) and (lValue.Value >= 0) and (lValue.Value <= 100);
+  if Result.Available then
+    Result.Value := lValue.Value;
+end;
+
+procedure TEvidenceTotal.Add(const aValue: Double; const aWeight: Double; const aAtUtc: TDateTime);
+begin
+  if (aWeight <= 0) or IsNan(aValue) or IsInfinite(aValue) then
+    Exit;
+  Sum := Sum + aValue * aWeight;
+  Weight := Weight + aWeight;
+  if not Value.Available or (aValue > Value.Peak) then
+  begin
+    Value.Peak := aValue;
+    Value.PeakAtUtc := aAtUtc;
+  end;
+  Value.Available := True;
+end;
+
+function TEvidenceTotal.Snapshot: TMachineOverviewEvidenceStatistic;
+begin
+  Result := Value;
+  if Weight > 0 then
+    Result.Average := Sum / Weight;
+end;
+
+procedure TEvidencePhaseAccumulator.AddProcess(const aValue: TMachineOverviewProcessContribution;
+  const aWeight: Double; var aTruncated: Boolean);
+var
+  i, n, lLowest: Integer;
+begin
+  n := -1;
+  lLowest := 0;
+  for i := 0 to ProcessCount - 1 do
+  begin
+    if (Processes[i].ProcessId = aValue.ProcessId) and
+      (Processes[i].CreationTime100ns = aValue.CreationTime100ns) then
+      n := i;
+    if Processes[i].AverageCpuPercent < Processes[lLowest].AverageCpuPercent then
+      lLowest := i;
+  end;
+  if n < 0 then
+  begin
+    if ProcessCount < Length(Processes) then
+    begin
+      n := ProcessCount;
+      Inc(ProcessCount);
+    end else begin
+      n := lLowest;
+      aTruncated := True;
+      if aValue.AverageCpuPercent * aWeight <= Processes[n].AverageCpuPercent then
+        Exit;
+    end;
+    Processes[n] := aValue;
+    Processes[n].AverageCpuPercent := 0;
+    Processes[n].SampleCount := 0;
+  end;
+  Processes[n].AverageCpuPercent := Processes[n].AverageCpuPercent + aValue.AverageCpuPercent * aWeight;
+  if aValue.PeakCpuPercent > Processes[n].PeakCpuPercent then
+  begin
+    Processes[n].PeakCpuPercent := aValue.PeakCpuPercent;
+    Processes[n].PeakAtUtc := aValue.PeakAtUtc;
+  end;
+  Processes[n].LastSeenUtc := aValue.LastSeenUtc;
+  Inc(Processes[n].SampleCount);
+end;
+
+procedure TEvidencePhaseAccumulator.AddApplication(const aValue: TMachineOverviewApplicationContribution;
+  const aWeight: Double; var aTruncated: Boolean);
+var
+  i, n, lLowest: Integer;
+begin
+  n := -1;
+  lLowest := 0;
+  for i := 0 to ApplicationCount - 1 do
+  begin
+    if SameText(Applications[i].DisplayName, aValue.DisplayName) then
+      n := i;
+    if Applications[i].AverageCpuPercent < Applications[lLowest].AverageCpuPercent then
+      lLowest := i;
+  end;
+  if n < 0 then
+  begin
+    if ApplicationCount < Length(Applications) then
+    begin
+      n := ApplicationCount;
+      Inc(ApplicationCount);
+    end else begin
+      n := lLowest;
+      aTruncated := True;
+      if aValue.AverageCpuPercent * aWeight <= Applications[n].AverageCpuPercent then
+        Exit;
+    end;
+    Applications[n] := aValue;
+    Applications[n].AverageCpuPercent := 0;
+  end;
+  Applications[n].AverageCpuPercent := Applications[n].AverageCpuPercent + aValue.AverageCpuPercent * aWeight;
+  Applications[n].ProcessCount := Max(Applications[n].ProcessCount, aValue.ProcessCount);
+  if aValue.PeakCpuPercent > Applications[n].PeakCpuPercent then
+  begin
+    Applications[n].PeakCpuPercent := aValue.PeakCpuPercent;
+    Applications[n].PeakAtUtc := aValue.PeakAtUtc;
+  end;
+end;
+
+procedure TEvidencePhaseAccumulator.Add(const aSample: TEvidenceSample; var aTruncated: Boolean);
+var
+  i: Integer;
+begin
+  if not aSample.Available then
+    Exit;
+  if aSample.IsProcess then
+  begin
+    if (aSample.IntervalMs = 0) or not aSample.Cpu.Available then
+      Exit;
+    Inc(Value.ProcessSampleCount);
+    ProcessWeight := ProcessWeight + aSample.IntervalMs;
+    Measured.Add(aSample.Cpu.Value, aSample.IntervalMs, aSample.AtUtc);
+    if aSample.Residual.Available then
+      Residual.Add(aSample.Residual.Value, aSample.IntervalMs, aSample.AtUtc);
+    for i := 0 to aSample.ProcessCount - 1 do
+      AddProcess(aSample.Processes[i], aSample.IntervalMs, aTruncated);
+    for i := 0 to aSample.ApplicationCount - 1 do
+      AddApplication(aSample.Applications[i], aSample.IntervalMs, aTruncated);
+  end else begin
+    if aSample.Cpu.Available then
+    begin
+      Inc(Value.SystemSampleCount);
+      Cpu.Add(aSample.Cpu.Value, 1, aSample.AtUtc);
+    end;
+    if aSample.Dpc.Available then
+      Dpc.Add(aSample.Dpc.Value, 1, aSample.AtUtc);
+    if aSample.Interrupt.Available then
+      Interrupt.Add(aSample.Interrupt.Value, 1, aSample.AtUtc);
+  end;
+end;
+
+function ProcessBefore(const aLeft, aRight: TMachineOverviewProcessContribution): Boolean;
+begin
+  Result := (aLeft.AverageCpuPercent > aRight.AverageCpuPercent) or
+    ((aLeft.AverageCpuPercent = aRight.AverageCpuPercent) and
+    ((aLeft.ProcessId < aRight.ProcessId) or ((aLeft.ProcessId = aRight.ProcessId) and
+    (aLeft.CreationTime100ns < aRight.CreationTime100ns))));
+end;
+
+function TEvidencePhaseAccumulator.Snapshot(const aEndUtc: TDateTime;
+  const aProcessMs, aSystemMs: Cardinal): TMachineOverviewEvidencePhase;
+var
+  i, j, lMaximum: Integer;
+  lProcess: TMachineOverviewProcessContribution;
+  lApplication: TMachineOverviewApplicationContribution;
+  lDuration: Double;
+begin
+  Result := Value;
+  Result.EndUtc := Max(Result.StartUtc, aEndUtc);
+  lDuration := Max(0, (Result.EndUtc - Result.StartUtc) * cDayMs);
+  Result.ExpectedProcessSampleCount := Round(Min(Double(MaxInt), Int((lDuration + 0.01) / aProcessMs)));
+  Result.ExpectedSystemSampleCount := Round(Min(Double(MaxInt), Int((lDuration + 0.01) / aSystemMs)));
+  Result.SystemCpu := Cpu.Snapshot;
+  Result.Dpc := Dpc.Snapshot;
+  Result.Interrupt := Interrupt.Snapshot;
+  Result.MeasuredProcessCpu := Measured.Snapshot;
+  Result.UnattributedCpu := Residual.Snapshot;
+  SetLength(Result.Processes, ProcessCount);
+  for i := 0 to ProcessCount - 1 do
+  begin
+    Result.Processes[i] := Processes[i];
+    if ProcessWeight > 0 then
+      Result.Processes[i].AverageCpuPercent := Processes[i].AverageCpuPercent / ProcessWeight;
+  end;
+  // Our small bounded arrays use insertion sort only when publishing a snapshot.
+  for i := 1 to High(Result.Processes) do
+  begin
+    lProcess := Result.Processes[i];
+    j := i - 1;
+    while (j >= 0) and ProcessBefore(lProcess, Result.Processes[j]) do
+    begin
+      Result.Processes[j + 1] := Result.Processes[j];
+      Dec(j);
+    end;
+    Result.Processes[j + 1] := lProcess;
+  end;
+  lMaximum := 5;
+  if Value.Kind = TMachineOverviewEvidencePhaseKind.During then
+    lMaximum := 10;
+  SetLength(Result.Processes, Min(lMaximum, Length(Result.Processes)));
+  SetLength(Result.Applications, ApplicationCount);
+  for i := 0 to ApplicationCount - 1 do
+  begin
+    Result.Applications[i] := Applications[i];
+    if ProcessWeight > 0 then
+      Result.Applications[i].AverageCpuPercent := Applications[i].AverageCpuPercent / ProcessWeight;
+  end;
+  for i := 1 to High(Result.Applications) do
+  begin
+    lApplication := Result.Applications[i];
+    j := i - 1;
+    while (j >= 0) and (lApplication.AverageCpuPercent > Result.Applications[j].AverageCpuPercent) do
+    begin
+      Result.Applications[j + 1] := Result.Applications[j];
+      Dec(j);
+    end;
+    Result.Applications[j + 1] := lApplication;
+  end;
+  SetLength(Result.Applications, Min(5, Length(Result.Applications)));
+end;
+
+constructor TEvidenceIncident.Create(const aIncident: TMachineOverviewIncident;
+  const aConfig: TMachineOverviewEvidenceConfig);
+var
+  lKind: TMachineOverviewEvidencePhaseKind;
+begin
+  inherited Create;
+  Headline := aIncident;
+  // Context belongs to the detector until S4; our recorder never duplicates it.
+  Headline.PreContext := nil;
+  Headline.PostContext := nil;
+  Headline.Evidence := Default(TMachineOverviewIncidentEvidence);
+  Config := aConfig;
+  Value.State := TMachineOverviewEvidenceState.Collecting;
+  Value.ProcessIntervalMs := Config.ProcessIntervalMs;
+  Value.SystemIntervalMs := Config.SystemIntervalMs;
+  LatestUtc := aIncident.StartedAtUtc;
+  for lKind := Low(lKind) to High(lKind) do
+    Phases[lKind].Value.Kind := lKind;
+  Phases[TMachineOverviewEvidencePhaseKind.Before].Value.StartUtc :=
+    aIncident.StartedAtUtc - Config.PreWindowMs / cDayMs;
+  Phases[TMachineOverviewEvidencePhaseKind.During].Value.StartUtc := aIncident.StartedAtUtc;
+  Phases[TMachineOverviewEvidencePhaseKind.After].Value.StartUtc := aIncident.EndedAtUtc;
+end;
+
+procedure TEvidenceIncident.AddGap(const aStart, aEnd: TDateTime;
+  const aReason: TMachineOverviewEvidenceGapReason);
+var
+  i, n: Integer;
+  lStart, lEnd, lLimit: TDateTime;
+begin
+  lStart := Max(aStart, Phases[TMachineOverviewEvidencePhaseKind.Before].Value.StartUtc);
+  lLimit := LatestUtc;
+  if Headline.EndedAtUtc > 0 then
+    lLimit := Headline.EndedAtUtc + Config.PostWindowMs / cDayMs;
+  lEnd := Min(aEnd, lLimit);
+  if lEnd < lStart then
+    Exit;
+  n := Length(Value.Gaps);
+  i := 0;
+  while i < n do
+  begin
+    if (Value.Gaps[i].Reason = aReason) and
+      (lStart <= Value.Gaps[i].EndUtc + 0.5 / cDayMs) and
+      (lEnd >= Value.Gaps[i].StartUtc - 0.5 / cDayMs) then
+    begin
+      lStart := Min(lStart, Value.Gaps[i].StartUtc);
+      lEnd := Max(lEnd, Value.Gaps[i].EndUtc);
+      Delete(Value.Gaps, i, 1);
+      Dec(n);
+      i := 0;
+    end else begin
+      Inc(i);
+    end;
+  end;
+  if n = 16 then
+  begin
+    Inc(Value.GapsOmitted);
+    Exit;
+  end;
+  SetLength(Value.Gaps, n + 1);
+  Value.Gaps[n].StartUtc := lStart;
+  Value.Gaps[n].EndUtc := lEnd;
+  Value.Gaps[n].Reason := aReason;
+end;
+
+procedure TEvidenceIncident.Observe(const aSample: TEvidenceSample);
+var
+  lKind: TMachineOverviewEvidencePhaseKind;
+  lExpected: Cardinal;
+begin
+  if aSample.AtUtc < Phases[TMachineOverviewEvidencePhaseKind.Before].Value.StartUtc then
+    Exit;
+  if (Headline.EndedAtUtc > 0) and
+    (aSample.AtUtc > Headline.EndedAtUtc + Config.PostWindowMs / cDayMs + 0.5 / cDayMs) then
+    Exit;
+  LatestUtc := Max(LatestUtc, aSample.AtUtc);
+  lKind := TMachineOverviewEvidencePhaseKind.Before;
+  if aSample.AtUtc >= Headline.StartedAtUtc then
+    lKind := TMachineOverviewEvidencePhaseKind.During;
+  if (Headline.EndedAtUtc > 0) and (aSample.AtUtc >= Headline.EndedAtUtc) then
+    lKind := TMachineOverviewEvidencePhaseKind.After;
+  lExpected := Config.SystemIntervalMs;
+  if aSample.IsProcess then
+  begin
+    lExpected := Config.ProcessIntervalMs;
+  end;
+  if (aSample.PreviousUtc > 0) and
+    (Round((aSample.AtUtc - aSample.PreviousUtc) * cDayMs) >
+      EvidenceGapThresholdMs(lExpected, aSample.IsProcess)) then
+  begin
+    if aSample.IsProcess then
+      AddGap(aSample.PreviousUtc + lExpected / cDayMs, aSample.AtUtc,
+        TMachineOverviewEvidenceGapReason.ProcessSamplesMissing)
+    else
+      AddGap(aSample.PreviousUtc + lExpected / cDayMs, aSample.AtUtc,
+        TMachineOverviewEvidenceGapReason.SystemSamplesMissing);
+  end;
+  if not aSample.Available or not aSample.Cpu.Available then
+    AddGap(aSample.AtUtc - lExpected / cDayMs, aSample.AtUtc,
+      TMachineOverviewEvidenceGapReason.ProviderUnavailable);
+  Value.LogicalProcessorCount := Max(Value.LogicalProcessorCount, aSample.LogicalProcessors);
+  Value.InaccessibleProcessCountMax := Max(Value.InaccessibleProcessCountMax, aSample.Inaccessible);
+  Value.Truncated := Value.Truncated or aSample.Truncated;
+  if HasPending[aSample.IsProcess] then
+  begin
+    lKind := TMachineOverviewEvidencePhaseKind.Before;
+    if Pending[aSample.IsProcess].AtUtc >= Headline.StartedAtUtc then
+      lKind := TMachineOverviewEvidencePhaseKind.During;
+    if (Headline.EndedAtUtc > 0) and (Pending[aSample.IsProcess].AtUtc >= Headline.EndedAtUtc) then
+      lKind := TMachineOverviewEvidencePhaseKind.After;
+    Phases[lKind].Add(Pending[aSample.IsProcess], Value.Truncated);
+  end;
+  Pending[aSample.IsProcess] := aSample;
+  HasPending[aSample.IsProcess] := True;
+end;
+
+function TEvidenceIncident.Snapshot(const aState: TMachineOverviewEvidenceState): TMachineOverviewIncidentEvidence;
+var
+  lEnd: TDateTime;
+  lPhases: TEvidencePhaseAccumulators;
+  lKind: TMachineOverviewEvidencePhaseKind;
+  lProcess: Boolean;
+begin
+  lPhases := Phases;
+  for lProcess := False to True do
+    if HasPending[lProcess] then
+    begin
+      lKind := TMachineOverviewEvidencePhaseKind.Before;
+      if Pending[lProcess].AtUtc >= Headline.StartedAtUtc then
+        lKind := TMachineOverviewEvidencePhaseKind.During;
+      if (Headline.EndedAtUtc > 0) and (Pending[lProcess].AtUtc >= Headline.EndedAtUtc) then
+        lKind := TMachineOverviewEvidencePhaseKind.After;
+      lPhases[lKind].Add(Pending[lProcess], Value.Truncated);
+    end;
+  if Value.Truncated then
+    AddGap(Headline.StartedAtUtc, LatestUtc, TMachineOverviewEvidenceGapReason.Truncated);
+  Result := Value;
+  Result.Gaps := Copy(Value.Gaps);
+  Result.State := aState;
+  Result.Phases[TMachineOverviewEvidencePhaseKind.Before] :=
+    lPhases[TMachineOverviewEvidencePhaseKind.Before].Snapshot(Headline.StartedAtUtc,
+      Config.ProcessIntervalMs, Config.SystemIntervalMs);
+  lEnd := Headline.EndedAtUtc;
+  if lEnd = 0 then
+    lEnd := LatestUtc;
+  Result.Phases[TMachineOverviewEvidencePhaseKind.During] :=
+    lPhases[TMachineOverviewEvidencePhaseKind.During].Snapshot(lEnd, Config.ProcessIntervalMs, Config.SystemIntervalMs);
+  lEnd := Headline.EndedAtUtc;
+  if lEnd > 0 then
+    lEnd := Min(LatestUtc, lEnd + Config.PostWindowMs / cDayMs);
+  Result.Phases[TMachineOverviewEvidencePhaseKind.After] :=
+    lPhases[TMachineOverviewEvidencePhaseKind.After].Snapshot(lEnd, Config.ProcessIntervalMs, Config.SystemIntervalMs);
+end;
+
+constructor TEvidenceRecorderState.Create(const aConfig: TMachineOverviewEvidenceConfig);
+begin
+  inherited Create;
+  Config := aConfig;
+  if (Config.ProcessIntervalMs = 0) or (Config.SystemIntervalMs = 0) then
+    raise EArgumentException.Create('Evidence sampling intervals must be positive');
+  Entries := TObjectList<TEvidenceIncident>.Create;
+  Ready := TList<TMachineOverviewIncidentChange>.Create;
+  FinalizedKeys := THashSet<string>.Create(cMaximumFinalizedKeys, TFastCaseAwareComparer.Ordinal);
+  FinalizedOrder := TQueue<string>.Create;
+end;
+
+destructor TEvidenceRecorderState.Destroy;
+begin
+  FinalizedOrder.Free;
+  FinalizedKeys.Free;
+  Ready.Free;
+  Entries.Free;
+  inherited;
+end;
+
+function TEvidenceRecorderState.Compact(const aSample: TMachineOverviewProviderSample): TEvidenceSample;
+var
+  i, n, lColon: Integer;
+  lPid: Cardinal;
+  lCreation: UInt64;
+  lMeasurement, lCount: TMachineOverviewMeasurement;
+  lSample: TEvidenceSample;
+  lTotal: TEvidenceTotal;
+begin
+  Result := Default(TEvidenceSample);
+  Result.AtUtc := aSample.State.CapturedAtUtc;
+  Result.IsProcess := aSample.State.ProviderId = 'processes';
+  Result.Available := aSample.State.Status = TMachineOverviewProviderStatus.Available;
+  if not Result.IsProcess then
+  begin
+    Result.PreviousUtc := LastSystemUtc;
+    LastSystemUtc := Result.AtUtc;
+    Result.Cpu := OptionalMeasurement(aSample, 'cpu_total_percent');
+    Result.Dpc := OptionalMeasurement(aSample, 'dpc_percent');
+    Result.Interrupt := OptionalMeasurement(aSample, 'interrupt_percent');
+    Exit;
+  end;
+  Result.PreviousUtc := LastProcessUtc;
+  LastProcessUtc := Result.AtUtc;
+  if FindMeasurement(aSample, 'process_cpu_interval_ms', lMeasurement) and
+    (lMeasurement.Value >= 0) and (lMeasurement.Value <= High(Cardinal)) then
+    Result.IntervalMs := Round(lMeasurement.Value);
+  if FindMeasurement(aSample, 'logical_processor_count', lMeasurement) and
+    (lMeasurement.Value > 0) and (lMeasurement.Value <= 65536) then
+    Result.LogicalProcessors := Round(lMeasurement.Value);
+  if FindMeasurement(aSample, 'process_access_denied_count', lMeasurement) then
+    Result.Inaccessible := Round(EnsureRange(lMeasurement.Value, 0.0, MaxInt * 1.0));
+  Result.Cpu := OptionalMeasurement(aSample, 'process_cpu_measured_total_percent');
+  SetLength(Result.Processes, 10);
+  SetLength(Result.Applications, 5);
+  for i := 1 to 10 do
+    if FindMeasurement(aSample, 'process_cpu_process:' + IntToStr(i), lMeasurement) and
+      (lMeasurement.Value > 0) and (lMeasurement.Value <= 100) then
+    begin
+      lColon := Pos(':', lMeasurement.EntityId);
+      if (lColon < 2) or not TryStrToUInt(Copy(lMeasurement.EntityId, 1, lColon - 1), lPid) or
+        not TryStrToUInt64(Copy(lMeasurement.EntityId, lColon + 1), lCreation) then
+        Continue;
+      n := Result.ProcessCount;
+      Result.Processes[n].ProcessId := lPid;
+      Result.Processes[n].CreationTime100ns := lCreation;
+      Result.Processes[n].DisplayName := EvidenceTextPrefix(lMeasurement.DisplayText, 256);
+      Result.Processes[n].ImagePath := EvidenceTextPrefix(lMeasurement.DetailText, 1024);
+      Result.Processes[n].PathStatus := EvidenceTextPrefix(lMeasurement.StatusText, 64);
+      Result.Truncated := Result.Truncated or (Length(lMeasurement.DisplayText) > 256) or
+        (Length(lMeasurement.DetailText) > 1024) or (Length(lMeasurement.StatusText) > 64);
+      Result.Processes[n].AverageCpuPercent := lMeasurement.Value;
+      Result.Processes[n].PeakCpuPercent := lMeasurement.Value;
+      Result.Processes[n].PeakAtUtc := Result.AtUtc;
+      Result.Processes[n].LastSeenUtc := Result.AtUtc;
+      Inc(Result.ProcessCount);
+    end;
+  for i := 1 to 5 do
+    if FindMeasurement(aSample, 'process_cpu_rank:' + IntToStr(i), lMeasurement) and
+      (lMeasurement.Value > 0) and (lMeasurement.Value <= 100) then
+    begin
+      n := Result.ApplicationCount;
+      Result.Applications[n].DisplayName := EvidenceTextPrefix(lMeasurement.DisplayText, 256);
+      Result.Applications[n].AverageCpuPercent := lMeasurement.Value;
+      Result.Applications[n].PeakCpuPercent := lMeasurement.Value;
+      Result.Applications[n].PeakAtUtc := Result.AtUtc;
+      if FindMeasurement(aSample, 'process_cpu_pids:' + IntToStr(i), lCount) then
+        Result.Applications[n].ProcessCount := Round(EnsureRange(lCount.Value, 0.0, MaxInt * 1.0));
+      Inc(Result.ApplicationCount);
+    end;
+  SetLength(Result.Processes, Result.ProcessCount);
+  SetLength(Result.Applications, Result.ApplicationCount);
+  lTotal := Default(TEvidenceTotal);
+  for i := 0 to RingCount - 1 do
+  begin
+    lSample := Ring[(RingFirst + i) mod Length(Ring)];
+    if not lSample.IsProcess and lSample.Available and lSample.Cpu.Available and
+      (lSample.AtUtc > Result.AtUtc - Result.IntervalMs / cDayMs) and (lSample.AtUtc <= Result.AtUtc) then
+      lTotal.Add(lSample.Cpu.Value, 1, lSample.AtUtc);
+  end;
+  Result.Residual.Available := lTotal.Value.Available and Result.Cpu.Available;
+  if Result.Residual.Available then
+    Result.Residual.Value := Max(0, lTotal.Snapshot.Average - Result.Cpu.Value);
+
+end;
+
+procedure TEvidenceRecorderState.Replay(const aEntry: TEvidenceIncident);
+var
+  i: Integer;
+  lFirstProcess, lFirstSystem, lStart: TDateTime;
+  lSample: TEvidenceSample;
+begin
+  lFirstProcess := 0;
+  lFirstSystem := 0;
+  for i := 0 to RingCount - 1 do
+  begin
+    lSample := Ring[(RingFirst + i) mod Length(Ring)];
+    if lSample.IsProcess and (lFirstProcess = 0) then
+      lFirstProcess := lSample.AtUtc;
+    if not lSample.IsProcess and (lFirstSystem = 0) then
+      lFirstSystem := lSample.AtUtc;
+    // An Ended change without a tracked start has no measured During accumulator.
+    if (aEntry.Headline.EndedAtUtc <= 0) or (lSample.AtUtc < aEntry.Headline.StartedAtUtc) or
+      (lSample.AtUtc >= aEntry.Headline.EndedAtUtc) then
+      aEntry.Observe(lSample);
+  end;
+  lStart := aEntry.Phases[TMachineOverviewEvidencePhaseKind.Before].Value.StartUtc;
+  if lFirstProcess = 0 then
+    lFirstProcess := aEntry.Headline.StartedAtUtc;
+  if lFirstSystem = 0 then
+    lFirstSystem := aEntry.Headline.StartedAtUtc;
+  if Max(lFirstProcess, lFirstSystem) > lStart then
+    aEntry.AddGap(lStart, Max(lFirstProcess, lFirstSystem), TMachineOverviewEvidenceGapReason.CollectionStartedLate);
+end;
+
+procedure TEvidenceRecorderState.RememberFinalized(const aStableId: string);
+begin
+  if FinalizedKeys.Contains(aStableId) then
+    Exit;
+  if FinalizedOrder.Count = cMaximumFinalizedKeys then
+    if not FinalizedKeys.Remove(FinalizedOrder.Dequeue) then
+      raise EInvalidOpException.Create('Finalized evidence key queue is inconsistent');
+  if FinalizedKeys.Add(aStableId) then
+    FinalizedOrder.Enqueue(aStableId);
+end;
+
+procedure TEvidenceRecorderState.EvictOldest;
+var
+  i, n, lCount: NativeInt;
+  lChange: TMachineOverviewIncidentChange;
+begin
+  n := 0;
+  lCount := Entries.Count;
+  for i := 1 to lCount - 1 do
+    if Entries[i].Headline.StartedAtUtc < Entries[n].Headline.StartedAtUtc then
+      n := i;
+  Entries[n].Value.Truncated := True;
+  lChange := Default(TMachineOverviewIncidentChange);
+  lChange.Kind := TMachineOverviewIncidentChangeKind.Updated;
+  lChange.Incident := Entries[n].Headline;
+  lChange.Incident.Evidence := Entries[n].Snapshot(TMachineOverviewEvidenceState.Partial);
+  lChange.HasEvidenceUpdate := True;
+  RememberFinalized(lChange.Incident.StableId);
+  Ready.Add(lChange);
+  Entries.Delete(n);
+end;
+
+class function TMachineOverviewEvidenceConfig.Defaults: TMachineOverviewEvidenceConfig;
+begin
+  Result := Default(TMachineOverviewEvidenceConfig);
+  Result.PreWindowMs := 300000;
+  Result.PostWindowMs := 600000;
+  Result.RingRetentionMs := 360000;
+  Result.ProcessIntervalMs := 5000;
+  Result.SystemIntervalMs := 1000;
+end;
+
+constructor TMachineOverviewEvidenceRecorder.Create(const aConfig: TMachineOverviewEvidenceConfig);
+begin
+  inherited Create;
+  fState := TEvidenceRecorderState.Create(aConfig);
+end;
+
+destructor TMachineOverviewEvidenceRecorder.Destroy;
+begin
+  fState.Free;
+  inherited;
+end;
+
+procedure TMachineOverviewEvidenceRecorder.ObserveSample(const aSample: TMachineOverviewProviderSample);
+var
+  lState: TEvidenceRecorderState;
+  lSample: TEvidenceSample;
+  lEntry: TEvidenceIncident;
+begin
+  if (aSample.State.ProviderId <> 'processes') and (aSample.State.ProviderId <> 'windows-core') then
+    Exit;
+  if (aSample.State.CapturedAtUtc <= 0) or IsNan(aSample.State.CapturedAtUtc) or
+    IsInfinite(aSample.State.CapturedAtUtc) then
+    Exit;
+  lState := (fState as TEvidenceRecorderState);
+  // Duplicate or backwards timestamps cannot add CPU twice or reorder our ring.
+  if ((aSample.State.ProviderId = 'processes') and (aSample.State.CapturedAtUtc <= lState.LastProcessUtc)) or
+    ((aSample.State.ProviderId = 'windows-core') and (aSample.State.CapturedAtUtc <= lState.LastSystemUtc)) then
+    Exit;
+  lSample := lState.Compact(aSample);
+  lState.LatestUtc := Max(lState.LatestUtc, lSample.AtUtc);
+  while (lState.RingCount > 0) and ((lState.RingCount = Length(lState.Ring)) or
+    ((lState.LatestUtc - lState.Ring[lState.RingFirst].AtUtc) * cDayMs > lState.Config.RingRetentionMs)) do
+  begin
+    lState.Ring[lState.RingFirst] := Default(TEvidenceSample);
+    lState.RingFirst := (lState.RingFirst + 1) mod Length(lState.Ring);
+    Dec(lState.RingCount);
+  end;
+  lState.Ring[(lState.RingFirst + lState.RingCount) mod Length(lState.Ring)] := lSample;
+  Inc(lState.RingCount);
+  for lEntry in lState.Entries do
+    lEntry.Observe(lSample);
+end;
+
+procedure TMachineOverviewEvidenceRecorder.Apply(var aChange: TMachineOverviewIncidentChange);
+var
+  lState: TEvidenceRecorderState;
+  lEntry, lFound: TEvidenceIncident;
+  lChange: TMachineOverviewIncidentChange;
+begin
+  lChange := aChange;
+  lChange.HasEvidenceUpdate := False;
+  lChange.Incident.Evidence := Default(TMachineOverviewIncidentEvidence);
+  aChange := lChange;
+  lState := (fState as TEvidenceRecorderState);
+  if lState.FinalizedKeys.Contains(lChange.Incident.StableId) then
+    Exit;
+  lFound := nil;
+  for lEntry in lState.Entries do
+    if lEntry.Headline.StableId = lChange.Incident.StableId then
+      lFound := lEntry;
+  if not Assigned(lFound) then
+  begin
+    if lChange.Kind = TMachineOverviewIncidentChangeKind.Updated then
+      Exit;
+    // Only user-marked incidents first arrive as Ended. An unknown automatic
+    // terminal change has no samples to emit; retain its key and preserve stored evidence.
+    if (lChange.Kind = TMachineOverviewIncidentChangeKind.Ended) and
+      (lChange.Incident.Origin <> TMachineOverviewIncidentOrigin.UserMarked) then
+    begin
+      lState.RememberFinalized(lChange.Incident.StableId);
+      Exit;
+    end;
+    if lState.Entries.Count = 64 then
+    begin
+      // Our completion queue is bounded too. A caller must drain it before further admission.
+      if lState.Ready.Count = 64 then
+      begin
+        lFound := TEvidenceIncident.Create(lChange.Incident, lState.Config);
+        try
+          lFound.Value.Truncated := True;
+          lChange.Incident.Evidence := lFound.Snapshot(TMachineOverviewEvidenceState.Partial);
+          lChange.HasEvidenceUpdate := True;
+          lState.RememberFinalized(lChange.Incident.StableId);
+        finally
+          lFound.Free;
+        end;
+        aChange := lChange;
+        Exit;
+      end;
+      lState.EvictOldest;
+    end;
+    lFound := TEvidenceIncident.Create(lChange.Incident, lState.Config);
+    lState.Entries.Add(lFound);
+    lState.Replay(lFound);
+  end;
+  lFound.Headline := lChange.Incident;
+  lFound.Headline.PreContext := nil;
+  lFound.Headline.PostContext := nil;
+  lFound.Headline.Evidence := Default(TMachineOverviewIncidentEvidence);
+  if lChange.Kind = TMachineOverviewIncidentChangeKind.Ended then
+    lFound.Phases[TMachineOverviewEvidencePhaseKind.After].Value.StartUtc := lChange.Incident.EndedAtUtc;
+  lChange.Incident.Evidence := lFound.Snapshot(TMachineOverviewEvidenceState.Collecting);
+  lChange.HasEvidenceUpdate := True;
+  aChange := lChange;
+end;
+
+function TMachineOverviewEvidenceRecorder.TakeCompleted(const aNowUtc: TDateTime): TArray<TMachineOverviewIncidentChange>;
+var
+  lState: TEvidenceRecorderState;
+  lEntry: TEvidenceIncident;
+  i, n: NativeInt;
+  lProcess: Boolean;
+  lLastUtc: TDateTime;
+  lInterval: Cardinal;
+begin
+  lState := (fState as TEvidenceRecorderState);
+  Result := lState.Ready.ToArray;
+  lState.Ready.Clear;
+  for i := lState.Entries.Count - 1 downto 0 do
+  begin
+    lEntry := lState.Entries[i];
+    if (lEntry.Headline.EndedAtUtc <= 0) or
+      (aNowUtc + 0.5 / cDayMs < lEntry.Headline.EndedAtUtc + lState.Config.PostWindowMs / cDayMs) then
+      Continue;
+    lEntry.LatestUtc := lEntry.Headline.EndedAtUtc + lState.Config.PostWindowMs / cDayMs;
+    for lProcess := False to True do
+    begin
+      lLastUtc := lEntry.Headline.StartedAtUtc;
+      if lEntry.HasPending[lProcess] then
+        lLastUtc := Max(lLastUtc, lEntry.Pending[lProcess].AtUtc);
+      lInterval := lState.Config.SystemIntervalMs;
+      if lProcess then
+        lInterval := lState.Config.ProcessIntervalMs;
+      if Round((lEntry.LatestUtc - lLastUtc) * cDayMs) > EvidenceGapThresholdMs(lInterval, lProcess) then
+      begin
+        if lProcess then
+          lEntry.AddGap(lLastUtc + lInterval / cDayMs, lEntry.LatestUtc,
+            TMachineOverviewEvidenceGapReason.ProcessSamplesMissing)
+        else
+          lEntry.AddGap(lLastUtc + lInterval / cDayMs, lEntry.LatestUtc,
+            TMachineOverviewEvidenceGapReason.SystemSamplesMissing);
+      end;
+    end;
+    n := Length(Result);
+    SetLength(Result, n + 1);
+    Result[n].Kind := TMachineOverviewIncidentChangeKind.Updated;
+    Result[n].Incident := lEntry.Headline;
+    Result[n].Incident.Evidence := lEntry.Snapshot(TMachineOverviewEvidenceState.Complete);
+    Result[n].HasEvidenceUpdate := True;
+    lState.RememberFinalized(lEntry.Headline.StableId);
+    lState.Entries.Delete(i);
+  end;
+end;
+
+function TMachineOverviewEvidenceRecorder.TrackedIncidentCount: Integer;
+begin
+  Result := Integer((fState as TEvidenceRecorderState).Entries.Count); //PALOFF Our admission limit proves Count <= 64.
+end;
+
+function EvidenceUtcMs(const aUtc: TDateTime): Int64;
+begin
+  if aUtc = 0 then
+    Exit(0);
+  Result := Round((aUtc - UnixDateDelta) * cDayMs);
+end;
+
+function EvidenceFromMs(const aValue: Int64): TDateTime;
+begin
+  if aValue = 0 then
+    Exit(0);
+  Result := UnixDateDelta + aValue / cDayMs;
+end;
+
+procedure JsonInteger(const aObject: TJSONObject; const aKey: string; const aValue: Int64); overload;
+begin
+  aObject.AddPair(aKey, TJSONNumber.Create(aValue));
+end;
+
+procedure JsonInteger(const aObject: TJSONObject; const aKey: string; const aValue: Integer); overload;
+begin
+  aObject.AddPair(aKey, TJSONNumber.Create(aValue));
+end;
+
+procedure JsonInteger(const aObject: TJSONObject; const aKey: string; const aValue: Cardinal); overload;
+begin
+  aObject.AddPair(aKey, TJSONNumber.Create(aValue));
+end;
+
+procedure JsonPercent(const aObject: TJSONObject; const aKey: string; const aValue: Double);
+begin
+  aObject.AddPair(aKey, TJSONNumber.Create(FormatFloat('0.00', Floor(aValue * 100 + 0.5) / 100,
+    TFormatSettings.Invariant)));
+end;
+
+procedure JsonStatistic(const aObject: TJSONObject; const aKey: string;
+  const aValue: TMachineOverviewEvidenceStatistic);
+var
+  lObject: TJSONObject;
+begin
+  if not aValue.Available then
+    Exit;
+  lObject := TJSONObject.Create;
+  aObject.AddPair(aKey, lObject);
+  JsonPercent(lObject, 'a', aValue.Average);
+  JsonPercent(lObject, 'p', aValue.Peak);
+  JsonInteger(lObject, 't', EvidenceUtcMs(aValue.PeakAtUtc));
+end;
+
+function EncodeEvidence(const aEvidence: TMachineOverviewIncidentEvidence): string;
+var
+  g: TGarbos;
+  lRoot, lObject, lRow: TJSONObject;
+  lPhases, lRows, lGaps: TJSONArray;
+  lKind: TMachineOverviewEvidencePhaseKind;
+  lPhase: TMachineOverviewEvidencePhase;
+  lProcess: TMachineOverviewProcessContribution;
+  lApplication: TMachineOverviewApplicationContribution;
+  lGap: TMachineOverviewEvidenceGap;
+begin
+  g := Default(TGarbos);
+  GC(lRoot, TJSONObject.Create, g);
+  JsonInteger(lRoot, 'v', 1);
+  JsonInteger(lRoot, 'lp', aEvidence.LogicalProcessorCount);
+  JsonInteger(lRoot, 'pms', aEvidence.ProcessIntervalMs);
+  JsonInteger(lRoot, 'sms', aEvidence.SystemIntervalMs);
+  JsonInteger(lRoot, 'den', aEvidence.InaccessibleProcessCountMax);
+  lRoot.AddPair('tr', TJSONBool.Create(aEvidence.Truncated));
+  JsonInteger(lRoot, 'go', aEvidence.GapsOmitted);
+  lPhases := TJSONArray.Create;
+  lRoot.AddPair('ph', lPhases);
+  for lKind := Low(lKind) to High(lKind) do
+  begin
+    lPhase := aEvidence.Phases[lKind];
+    lObject := TJSONObject.Create;
+    lPhases.AddElement(lObject);
+    lObject.AddPair('k', cPhaseNames[lKind]);
+    JsonInteger(lObject, 's', EvidenceUtcMs(lPhase.StartUtc));
+    JsonInteger(lObject, 'e', EvidenceUtcMs(lPhase.EndUtc));
+    JsonInteger(lObject, 'ps', lPhase.ProcessSampleCount);
+    JsonInteger(lObject, 'pe', lPhase.ExpectedProcessSampleCount);
+    JsonInteger(lObject, 'ss', lPhase.SystemSampleCount);
+    JsonInteger(lObject, 'se', lPhase.ExpectedSystemSampleCount);
+    JsonStatistic(lObject, 'cpu', lPhase.SystemCpu);
+    JsonStatistic(lObject, 'dpc', lPhase.Dpc);
+    JsonStatistic(lObject, 'irq', lPhase.Interrupt);
+    JsonStatistic(lObject, 'mp', lPhase.MeasuredProcessCpu);
+    JsonStatistic(lObject, 'un', lPhase.UnattributedCpu);
+    lRows := TJSONArray.Create;
+    lObject.AddPair('pr', lRows);
+    for lProcess in lPhase.Processes do
+    begin
+      lRow := TJSONObject.Create;
+      lRows.AddElement(lRow);
+      JsonInteger(lRow, 'pid', lProcess.ProcessId);
+      lRow.AddPair('ct', TJSONNumber.Create(UIntToStr(lProcess.CreationTime100ns)));
+      lRow.AddPair('n', lProcess.DisplayName);
+      lRow.AddPair('pa', lProcess.ImagePath);
+      lRow.AddPair('st', lProcess.PathStatus);
+      JsonPercent(lRow, 'a', lProcess.AverageCpuPercent);
+      JsonPercent(lRow, 'p', lProcess.PeakCpuPercent);
+      JsonInteger(lRow, 't', EvidenceUtcMs(lProcess.PeakAtUtc));
+      JsonInteger(lRow, 'ls', EvidenceUtcMs(lProcess.LastSeenUtc));
+      JsonInteger(lRow, 'c', lProcess.SampleCount);
+    end;
+    lRows := TJSONArray.Create;
+    lObject.AddPair('ap', lRows);
+    for lApplication in lPhase.Applications do
+    begin
+      lRow := TJSONObject.Create;
+      lRows.AddElement(lRow);
+      lRow.AddPair('n', lApplication.DisplayName);
+      JsonInteger(lRow, 'pc', lApplication.ProcessCount);
+      JsonPercent(lRow, 'a', lApplication.AverageCpuPercent);
+      JsonPercent(lRow, 'p', lApplication.PeakCpuPercent);
+      JsonInteger(lRow, 't', EvidenceUtcMs(lApplication.PeakAtUtc));
+    end;
+  end;
+  lGaps := TJSONArray.Create;
+  lRoot.AddPair('gp', lGaps);
+  for lGap in aEvidence.Gaps do
+  begin
+    lRow := TJSONObject.Create;
+    lGaps.AddElement(lRow);
+    JsonInteger(lRow, 's', EvidenceUtcMs(lGap.StartUtc));
+    JsonInteger(lRow, 'e', EvidenceUtcMs(lGap.EndUtc));
+    lRow.AddPair('r', cGapNames[lGap.Reason]);
+  end;
+  Result := lRoot.ToJSON;
+end;
+
+function MachineOverviewEvidenceToJson(const aEvidence: TMachineOverviewIncidentEvidence): string;
+var
+  lEvidence: TMachineOverviewIncidentEvidence;
+  lKind: TMachineOverviewEvidencePhaseKind;
+  i, lStep: Integer;
+begin
+  lEvidence := aEvidence;
+  // Our copy must own every dynamic array before applying the serialization budget.
+  lEvidence.Gaps := Copy(aEvidence.Gaps, 0, 16);
+  if Length(aEvidence.Gaps) > 16 then
+  begin
+    lEvidence.Truncated := True;
+    lEvidence.GapsOmitted := lEvidence.GapsOmitted + Length(aEvidence.Gaps) - 16;
+  end;
+  for lKind := Low(lKind) to High(lKind) do
+  begin
+    i := 5;
+    if lKind = TMachineOverviewEvidencePhaseKind.During then
+      i := 10;
+    lEvidence.Phases[lKind].Processes := Copy(aEvidence.Phases[lKind].Processes, 0, i);
+    lEvidence.Phases[lKind].Applications := Copy(aEvidence.Phases[lKind].Applications, 0, 5);
+    lEvidence.Truncated := lEvidence.Truncated or (Length(aEvidence.Phases[lKind].Processes) > i) or
+      (Length(aEvidence.Phases[lKind].Applications) > 5);
+  end;
+  for lStep := 0 to 7 do
+  begin
+    Result := EncodeEvidence(lEvidence);
+    if TEncoding.UTF8.GetByteCount(Result) <= cMaximumJsonBytes then
+      Exit;
+    lEvidence.Truncated := True;
+    case lStep of
+      0: SetLength(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.After].Processes,
+        Min(3, Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.After].Processes)));
+      1: SetLength(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.Before].Processes,
+        Min(3, Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.Before].Processes)));
+      2: SetLength(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes,
+        Min(5, Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes)));
+      3: for lKind := Low(lKind) to High(lKind) do
+           for i := 0 to High(lEvidence.Phases[lKind].Processes) do
+             lEvidence.Phases[lKind].Processes[i].ImagePath := '';
+      4: begin
+           lEvidence.GapsOmitted := lEvidence.GapsOmitted + Max(0, Length(lEvidence.Gaps) - 4);
+           SetLength(lEvidence.Gaps, Min(4, Length(lEvidence.Gaps)));
+         end;
+      5: for lKind := Low(lKind) to High(lKind) do
+         begin
+           for i := 0 to High(lEvidence.Phases[lKind].Processes) do
+           begin
+             lEvidence.Phases[lKind].Processes[i].DisplayName := EvidenceTextPrefix(lEvidence.Phases[lKind].Processes[i].DisplayName, 64);
+             lEvidence.Phases[lKind].Processes[i].PathStatus := EvidenceTextPrefix(lEvidence.Phases[lKind].Processes[i].PathStatus, 32);
+           end;
+           for i := 0 to High(lEvidence.Phases[lKind].Applications) do
+             lEvidence.Phases[lKind].Applications[i].DisplayName := EvidenceTextPrefix(lEvidence.Phases[lKind].Applications[i].DisplayName, 64);
+         end;
+      6: for lKind := Low(lKind) to High(lKind) do
+         begin
+           lEvidence.Phases[lKind].Processes := nil;
+           lEvidence.Phases[lKind].Applications := nil;
+         end;
+    end;
+  end;
+  raise EArgumentException.Create('Evidence statistics exceed the JSON budget');
+end;
+
+function ReadInteger(const aObject: TJSONObject; const aKey: string; const aMaximum: Int64): Int64;
+var
+  lValue: TJSONValue;
+begin
+  lValue := aObject.GetValue(aKey);
+  if not (lValue is TJSONNumber) or not TryStrToInt64(lValue.Value, Result) or
+    (Result < 0) or (Result > aMaximum) then
+    raise EConvertError.Create('Invalid evidence integer: ' + aKey);
+end;
+
+function ReadCount(const aObject: TJSONObject; const aKey: string): Integer;
+begin
+  Result := Integer(ReadInteger(aObject, aKey, Int64(MaxInt)));
+end;
+
+function ReadCardinal(const aObject: TJSONObject; const aKey: string): Cardinal;
+begin
+  Result := Cardinal(ReadInteger(aObject, aKey, Int64(High(Cardinal))));
+end;
+
+function ReadText(const aObject: TJSONObject; const aKey: string; const aMaximum: Integer): string;
+var
+  lValue: TJSONValue;
+begin
+  lValue := aObject.GetValue(aKey);
+  if not (lValue is TJSONString) or (Length(lValue.Value) > aMaximum) then
+    raise EConvertError.Create('Invalid evidence text: ' + aKey);
+  Result := lValue.Value;
+end;
+
+function ReadPercent(const aObject: TJSONObject; const aKey: string): Double;
+var
+  lValue: TJSONValue;
+begin
+  lValue := aObject.GetValue(aKey);
+  if not (lValue is TJSONNumber) or
+    not TryStrToFloat(lValue.Value, Result, TFormatSettings.Invariant) or
+    IsNan(Result) or IsInfinite(Result) or (Result < 0) or (Result > 100) then
+    raise EConvertError.Create('Invalid evidence percentage: ' + aKey);
+end;
+
+function ReadUtc(const aObject: TJSONObject; const aKey: string): TDateTime;
+begin
+  Result := EvidenceFromMs(ReadInteger(aObject, aKey, 253402300799999));
+end;
+
+procedure ValidateObject(const aObject: TJSONObject);
+var
+  i, j: Integer;
+begin
+  if aObject.Count > 32 then
+    raise EConvertError.Create('Too many evidence object members');
+  for i := 0 to aObject.Count - 1 do
+    for j := 0 to i - 1 do
+      if aObject.Pairs[i].JsonString.Value = aObject.Pairs[j].JsonString.Value then
+        raise EConvertError.Create('Duplicate evidence member');
+end;
+
+function ReadStatistic(const aObject: TJSONObject; const aKey: string): TMachineOverviewEvidenceStatistic;
+var
+  lValue: TJSONValue;
+begin
+  Result := Default(TMachineOverviewEvidenceStatistic);
+  lValue := aObject.GetValue(aKey);
+  if not Assigned(lValue) then
+    Exit;
+  if not (lValue is TJSONObject) then
+    raise EConvertError.Create('Invalid evidence statistic: ' + aKey);
+  ValidateObject(lValue as TJSONObject);
+  Result.Available := True;
+  Result.Average := ReadPercent((lValue as TJSONObject), 'a');
+  // Peak is optional for measured and residual aggregates in format v1.
+  if Assigned((lValue as TJSONObject).GetValue('p')) then
+    Result.Peak := ReadPercent((lValue as TJSONObject), 'p');
+  if Assigned((lValue as TJSONObject).GetValue('t')) then
+    Result.PeakAtUtc := ReadUtc((lValue as TJSONObject), 't');
+end;
+
+function ReadArray(const aObject: TJSONObject; const aKey: string; const aMaximum: Integer): TJSONArray;
+var
+  lValue: TJSONValue;
+begin
+  lValue := aObject.GetValue(aKey);
+  if not (lValue is TJSONArray) or ((lValue as TJSONArray).Count > aMaximum) then
+    raise EConvertError.Create('Invalid evidence array: ' + aKey);
+  Result := (lValue as TJSONArray);
+end;
+
+function ArrayObject(const aArray: TJSONArray; const aIndex: Integer): TJSONObject;
+begin
+  if not (aArray.Items[aIndex] is TJSONObject) then
+    raise EConvertError.Create('Invalid evidence row');
+  Result := TJSONObject(aArray.Items[aIndex]);
+  ValidateObject(Result);
+end;
+
+function ReadPhase(const aObject: TJSONObject; const aKind: TMachineOverviewEvidencePhaseKind): TMachineOverviewEvidencePhase;
+var
+  i: Integer;
+  lArray: TJSONArray;
+  lRow: TJSONObject;
+  lCreation: TJSONValue;
+begin
+  Result := Default(TMachineOverviewEvidencePhase);
+  Result.Kind := aKind;
+  if ReadText(aObject, 'k', 6) <> cPhaseNames[aKind] then
+    raise EConvertError.Create('Invalid evidence phase order');
+  Result.StartUtc := ReadUtc(aObject, 's');
+  Result.EndUtc := ReadUtc(aObject, 'e');
+  if Result.EndUtc < Result.StartUtc then
+    raise EConvertError.Create('Invalid evidence phase range');
+  Result.ProcessSampleCount := ReadCount(aObject, 'ps');
+  Result.ExpectedProcessSampleCount := ReadCount(aObject, 'pe');
+  Result.SystemSampleCount := ReadCount(aObject, 'ss');
+  Result.ExpectedSystemSampleCount := ReadCount(aObject, 'se');
+  Result.SystemCpu := ReadStatistic(aObject, 'cpu');
+  Result.Dpc := ReadStatistic(aObject, 'dpc');
+  Result.Interrupt := ReadStatistic(aObject, 'irq');
+  Result.MeasuredProcessCpu := ReadStatistic(aObject, 'mp');
+  Result.UnattributedCpu := ReadStatistic(aObject, 'un');
+  i := 5;
+  if aKind = TMachineOverviewEvidencePhaseKind.During then
+    i := 10;
+  lArray := ReadArray(aObject, 'pr', i);
+  SetLength(Result.Processes, lArray.Count);
+  for i := 0 to lArray.Count - 1 do
+  begin
+    lRow := ArrayObject(lArray, i);
+    Result.Processes[i].ProcessId := ReadCardinal(lRow, 'pid');
+    lCreation := lRow.GetValue('ct');
+    if not (lCreation is TJSONNumber) or
+      not TryStrToUInt64(lCreation.Value, Result.Processes[i].CreationTime100ns) then
+      raise EConvertError.Create('Invalid evidence creation time');
+    Result.Processes[i].DisplayName := ReadText(lRow, 'n', 256);
+    Result.Processes[i].ImagePath := ReadText(lRow, 'pa', 1024);
+    Result.Processes[i].PathStatus := ReadText(lRow, 'st', 64);
+    Result.Processes[i].AverageCpuPercent := ReadPercent(lRow, 'a');
+    Result.Processes[i].PeakCpuPercent := ReadPercent(lRow, 'p');
+    Result.Processes[i].PeakAtUtc := ReadUtc(lRow, 't');
+    Result.Processes[i].LastSeenUtc := ReadUtc(lRow, 'ls');
+    Result.Processes[i].SampleCount := ReadCount(lRow, 'c');
+  end;
+  lArray := ReadArray(aObject, 'ap', 5);
+  SetLength(Result.Applications, lArray.Count);
+  for i := 0 to lArray.Count - 1 do
+  begin
+    lRow := ArrayObject(lArray, i);
+    Result.Applications[i].DisplayName := ReadText(lRow, 'n', 256);
+    Result.Applications[i].ProcessCount := ReadCount(lRow, 'pc');
+    Result.Applications[i].AverageCpuPercent := ReadPercent(lRow, 'a');
+    Result.Applications[i].PeakCpuPercent := ReadPercent(lRow, 'p');
+    Result.Applications[i].PeakAtUtc := ReadUtc(lRow, 't');
+  end;
+end;
+
+function TryMachineOverviewEvidenceFromJson(const aText: string;
+  out aEvidence: TMachineOverviewIncidentEvidence; out aError: string): Boolean;
+var
+  g: TGarbos;
+  lValue, lBoolean: TJSONValue;
+  lRoot, lRow: TJSONObject;
+  lPhases, lGaps: TJSONArray;
+  lKind: TMachineOverviewEvidencePhaseKind;
+  lReason: TMachineOverviewEvidenceGapReason;
+  lCode: string;
+  i: Integer;
+  lFound: Boolean;
+begin
+  Result := False;
+  aEvidence := Default(TMachineOverviewIncidentEvidence);
+  aError := '';
+  g := Default(TGarbos);
+  try
+    if (Length(aText) > cMaximumJsonBytes) or (TEncoding.UTF8.GetByteCount(aText) > cMaximumJsonBytes) then
+      raise EConvertError.Create('Evidence exceeds the JSON budget');
+    lValue := TJSONObject.ParseJSONValue(aText);
+    GC(lValue, g);
+    if not (lValue is TJSONObject) then
+      raise EConvertError.Create('Evidence must be a JSON object');
+    lRoot := (lValue as TJSONObject);
+    ValidateObject(lRoot);
+    if ReadCount(lRoot, 'v') <> 1 then
+      raise EConvertError.Create('Unsupported evidence version');
+    aEvidence.LogicalProcessorCount := ReadCount(lRoot, 'lp');
+    if aEvidence.LogicalProcessorCount > 65536 then
+      raise EConvertError.Create('Invalid evidence logical processor count');
+    aEvidence.ProcessIntervalMs := ReadCardinal(lRoot, 'pms');
+    aEvidence.SystemIntervalMs := ReadCardinal(lRoot, 'sms');
+    if (aEvidence.ProcessIntervalMs = 0) or (aEvidence.SystemIntervalMs = 0) then
+      raise EConvertError.Create('Evidence intervals must be positive');
+    aEvidence.InaccessibleProcessCountMax := ReadCount(lRoot, 'den');
+    aEvidence.GapsOmitted := ReadCount(lRoot, 'go');
+    lBoolean := lRoot.GetValue('tr');
+    if not (lBoolean is TJSONBool) then
+      raise EConvertError.Create('Invalid evidence truncation flag');
+    aEvidence.Truncated := TJSONBool(lBoolean).AsBoolean;
+    lPhases := ReadArray(lRoot, 'ph', 3);
+    if lPhases.Count <> 3 then
+      raise EConvertError.Create('Evidence must contain three phases');
+    for lKind := Low(lKind) to High(lKind) do
+      aEvidence.Phases[lKind] := ReadPhase(ArrayObject(lPhases, Ord(lKind)), lKind);
+    lGaps := ReadArray(lRoot, 'gp', 16);
+    SetLength(aEvidence.Gaps, lGaps.Count);
+    for i := 0 to lGaps.Count - 1 do
+    begin
+      lRow := ArrayObject(lGaps, i);
+      aEvidence.Gaps[i].StartUtc := ReadUtc(lRow, 's');
+      aEvidence.Gaps[i].EndUtc := ReadUtc(lRow, 'e');
+      if aEvidence.Gaps[i].EndUtc < aEvidence.Gaps[i].StartUtc then
+        raise EConvertError.Create('Invalid evidence gap range');
+      lCode := ReadText(lRow, 'r', 24);
+      lFound := False;
+      for lReason := Low(lReason) to High(lReason) do
+        if lCode = cGapNames[lReason] then
+        begin
+          aEvidence.Gaps[i].Reason := lReason;
+          lFound := True;
+        end;
+      if not lFound then
+        raise EConvertError.Create('Invalid evidence gap reason');
+    end;
+    Result := True;
+  except
+    on lException: Exception do
+    begin
+      aEvidence := Default(TMachineOverviewIncidentEvidence);
+      aError := lException.Message;
+    end;
+  end;
+end;
+
+end.
