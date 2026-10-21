@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- Machine Overview incident history now shows measured CPU contributors before, during, and after an incident, including exited processes, application groups, sampling gaps, recording health (session start, dropped records, and provider status), and a Copy evidence command (ACV-067, ACV-068).
 - VMware Player and Workstation windows now have a `VM - ` prefix in Applications.
 - Applications (F1) now has All, New messages, and Non-responsive filters, selected with Ctrl+1/2/3 while the list has focus.
 - Console instances (F4) now has a Non-responsive filter (Ctrl+6).
@@ -22,6 +23,7 @@ All notable changes to this project are documented in this file.
 - `Scripts\Copy-MarkdownAsRichText.ps1` now converts markdown from the clipboard (a copied `.md` file, a path to one, or the text itself) into HTML, RTF, or pandoc plain text and puts it back on the clipboard for Jira, Outlook, Thunderbird, and other rich editors. Running it without `-Format` asks which flavor to use first; no temporary files are left behind.
 
 ### Fixed
+- Machine Overview history now applies one storage budget to samples, incident evidence, and headlines, retaining incidents for up to 365 days and 50,000 entries. Older databases are backed up before migration; obsolete context is removed and startup can reclaim its disk space (ACV-067).
 - Closing ActiveAppView now cancels chat-monitor metadata queries, so a stalled WMI provider cannot hold shutdown open.
 - Applications and File Explorer lists now populate when a bounded Codex session-log read starts inside a UTF-8 character.
 - Windows ghost windows now resolve to the original application HWND, PID, and filename, so unresponsive terminals stay in Console instances and do not create duplicate application rows.

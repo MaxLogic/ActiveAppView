@@ -8,7 +8,7 @@ Its purpose is triage, not exact root-cause analysis. Lightweight counters have 
 
 Sampling and display refresh
 
-Collection and display refresh run at different frequencies. System samples are normally collected every 1 second, process samples every 2 seconds, and optional temperature samples every 3 seconds. The panel normally replaces its visible snapshot every 10 seconds. History commits are batched at roughly 10-second intervals, so no synchronous disk write occurs for every sample.
+Collection and display refresh run at different frequencies. System samples are normally collected every 1 second, process samples every 5 seconds, and optional temperature samples every 3 seconds. The panel normally replaces its visible snapshot every 10 seconds. History commits are batched at roughly 10-second intervals, so no synchronous disk write occurs for every sample.
 
 Changing DisplayRefreshIntervalMs changes only how often the panel renders the newest immutable snapshot. It does not change collection frequency. Display refresh is clamped to 2 through 60 seconds.
 
@@ -56,21 +56,31 @@ The five CPU, RAM, and I/O ranks group processes case-insensitively by executabl
 
 Incidents
 
-Automatic incident detection uses named thresholds, hysteresis, and recovery periods so one sustained condition creates one incident. Severity words appear in text and are not conveyed by color alone. Incidents retain UTC and local time, the threshold explanation, provider freshness, peaks, related processes or disks, up to 5 minutes of available pre-context, and 10 minutes of post-context.
+Automatic incident detection uses named thresholds, hysteresis, and recovery periods so one sustained condition creates one incident. Severity words appear in text and are not conveyed by color alone. Incidents retain UTC and local start, peak and end times, the threshold explanation, provider freshness, and measured CPU evidence for up to 5 minutes before, the incident itself, and 10 minutes after. Evidence can be collecting, complete, incomplete, removed by the storage budget, or not recorded for an older incident. An incident interrupted by an application restart does not have a recorded end time.
 
-The Incidents row shows the last-24-hour count and the three newest summaries. Enter opens the history view. Its filters are Last 24 hours, Last 7 days, and All, ordered newest first. Freeze display does not freeze incident detection or history.
+The Incidents row shows the last-24-hour count and the three newest summaries. Enter opens the history view. Its filters are Last 24 hours, Last 7 days, and All, ordered newest first. Select an incident to load its measured evidence without moving selection or focus. The evidence list shows system CPU, DPC and interrupt time, individual processes identified by PID and creation time, application groups, sample coverage and gaps for each phase. Exited processes remain in the evidence. Copy evidence copies the details, recording health and raw database reference as text, including local timezone and UTC times. Freeze display does not freeze incident detection or history.
+
+Process CPU is kernel plus user time divided by the sampling interval and the number of logical processors. On a 32-logical-processor machine, one fully busy logical processor is 3.125% of the whole machine. Measured processes is the total CPU measured across processes; Not attributed is system CPU minus that measured total, clamped to zero. DPC/interrupt time, inaccessible processes, missed samples and processes that start and exit between samples can leave CPU unattributed. Application evidence combines matching executable names from the five busiest groups per sample, so it can understate a group total. These measurements describe contributors, not proof of the cause of an incident.
 
 History and storage
 
-HistoryEnabled controls persistence. Raw one-second system and disk samples are retained for 48 hours, 10-second rollups for 30 days, and one-minute rollups for 365 days. Ranked application snapshots and incident context are stored; every process is not written every second. The default approximate database cap is 2,048 MB.
+HistoryEnabled controls persistence. One-second system and disk samples are retained for up to 48 hours, 10-second rollups for 30 days, and one-minute rollups for 365 days. Incidents are retained for up to 365 days and at most 50,000 headlines. Ranked application snapshots and compact measured incident evidence share the same storage budget; the full process list is not written every second.
 
-The history database is MachineOverviewHistory.db next to ActiveAppView.exe. It uses the packaged Win64 SQLite 3.53.4 runtime, one background writer, WAL mode, synchronous=NORMAL, prepared batched transactions, bounded retry/backlog behavior, and small retention batches. If the database is busy, corrupt, or unavailable, live monitoring continues and the diagnostics report the failure. The active path does not run periodic VACUUM.
+MaxDatabaseSizeMB defaults to 2,048 MiB and is clamped to 256-65,536 MiB. The budget counts used database pages, including incident headlines and evidence. Maintenance trims older data in bounded batches, protects the current write batch and collecting evidence, and normally preserves recent data first. Evidence can be removed before its headline; the history view states when that happens. Trimming continues across commits toward 90% of the budget. Storage states and errors report when trimming is in progress or protected recent data prevents the budget from being met.
+
+The physical database file can stay larger than its used-page budget because SQLite reuses freed pages. The WAL is separate from that budget, with a 64 MiB journal-size limit after checkpoints. Leave additional space for backup and compaction. Before an older database is migrated, ActiveAppView creates a timestamped MachineOverviewHistory.db.pre-migration-v<version>-<timestamp>.bak beside it, verifies its size and incident count, and keeps it. Migration requires free space for the main file, WAL and 256 MiB headroom. If space is insufficient, history recording pauses with a MigrationBlocked message while live monitoring continues. Older context is cleared from the live database; the backup preserves it and the incident headlines remain.
+
+Startup may compact the database once when reclaimable space exceeds the larger of 256 MiB or one quarter of the budget and both the database and TEMP drives have enough free space. There is no periodic VACUUM during normal monitoring.
+
+The history database is MachineOverviewHistory.db next to ActiveAppView.exe. It uses the packaged Win64 SQLite 3.53.4 runtime, one background writer, WAL mode, synchronous=NORMAL, prepared batched transactions, bounded retry/backlog behavior, and small retention batches. If the database is busy, corrupt, or unavailable, live monitoring continues and the diagnostics report the failure.
+
+Recording health reports Recording, Stale, Unavailable or Error, with the recording session start, last successful write, newest process sample, retained time range, used bytes and budget, main-file and WAL sizes, storage state, records dropped during the current session, sampling intervals, logical-processor count, provider status, and database/backup paths. A last write older than three commit intervals is stale. A byte budget does not guarantee a fixed number of hours of coverage.
 
 DetailedTraceEnabled is off by default. When enabled, a DPC/ISR incident or a critical automatic incident can request one 15-second WPR trace. ActiveAppView combines the Windows General and GPU profiles so the trace contains CPU scheduling, context switches, DPC/ISR, disk, process/thread, and supported GPU events and stacks. Windows must grant the Profile system performance right; otherwise the incident records Trace: Unavailable without requiring ActiveAppView to elevate. WPA-compatible ETL files are saved under the MachineOverviewTraces directory next to ActiveAppView.exe. They can contain sensitive system activity. Retention keeps at most 10 ETL traces and 2 GB total, deleting the oldest trace files first.
 
 Privacy and information not stored
 
-Normal Machine Overview history does not store window titles, command-line arguments, typed text, clipboard contents, or keystrokes. It may store executable name, member PIDs, process creation times, best-effort executable path, ranked values, incident context, and provider errors. Copied diagnostics use the same privacy boundary and sanitize unrelated error text.
+Normal Machine Overview history does not store window titles, command-line arguments, typed text, clipboard contents, or keystrokes. It may store executable name, member PIDs, process creation times, best-effort executable path, ranked values, measured incident evidence, and provider errors. Copied diagnostics use the same privacy boundary and sanitize unrelated error text.
 
 Settings
 
