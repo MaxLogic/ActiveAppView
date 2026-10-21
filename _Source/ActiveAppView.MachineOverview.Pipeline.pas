@@ -1,4 +1,4 @@
-unit ActiveAppView.MachineOverview.Pipeline;
+﻿unit ActiveAppView.MachineOverview.Pipeline;
 
 interface
 
@@ -706,6 +706,7 @@ begin
   Result.CapturedAtUtc := aSample.CapturedAtUtc;
   Result.CapturedAtMonotonicMs := aSample.CapturedAtMonotonicMs;
   Result.TotalCpu := aSource.CpuAggregate.NowValue;
+  Result.LogicalProcessorCount := aSource.CpuAggregate.LogicalProcessorCount;
   Result.HotLogicalProcessorCount :=
     aSource.CpuAggregate.HotLogicalProcessorCount;
   if TryFindPresentationMeasurement(aSource.Measurements, 'dpc_percent',

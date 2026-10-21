@@ -1,4 +1,4 @@
-unit ActiveAppView.MachineOverview.History.SelfTests;
+﻿unit ActiveAppView.MachineOverview.History.SelfTests;
 
 interface
 
@@ -463,7 +463,7 @@ begin
     Exit;
   lQuery.Close;
   lQuery.Open('PRAGMA user_version');
-  if lQuery.Fields[0].AsInteger <> 3 then
+  if lQuery.Fields[0].AsInteger <> 4 then
     Exit;
   lQuery.Close;
   lQuery.Open('SELECT cpu_total, logical_cpu_blob FROM system_sample_raw ' +
@@ -757,7 +757,7 @@ begin
     lConnection.Params.Values['Database'] := lDatabaseFileName;
     lConnection.Params.Values['OpenMode'] := 'ReadWrite';
     lConnection.Connected := True;
-    if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 3) or
+    if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 4) or
       (QueryHistoryInt64(lConnection,
         'SELECT COUNT(*) FROM legacy_sentinel WHERE value=''preserve-me''') <> 1) then
     begin
@@ -987,7 +987,7 @@ begin
     lConnection.Params.Values['Database'] := lDatabaseFileName;
     lConnection.Params.Values['OpenMode'] := 'ReadWrite';
     lConnection.Connected := True;
-    if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 3) or
+    if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 4) or
       (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM ' +
        'pragma_table_info(''incident'') WHERE name=''pre_context_json''') <> 1) then
     begin
@@ -1462,7 +1462,7 @@ begin
     FreeAndNil(lService);
     GC(lConnection, TFDConnection.Create(nil), g);
     ConfigureHistoryTestConnection(lFileName, lConnection);
-    if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 3) or
+    if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 4) or
       (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE evidence_state=5') <> 200) or
       (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE evidence_state=0') <> 250) then
       raise Exception.Create('Migration chunk was not durable and bounded at 200 rows');
@@ -1964,7 +1964,7 @@ begin
       (QueryHistoryInt64(lConnection, 'PRAGMA freelist_count') = 0) or
       (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM system_sample_raw') <> 1) then
       raise Exception.Create('Deferred compaction status/free pages/sample not preserved');
-    lConnection.ExecSQL('PRAGMA user_version=4');
+    lConnection.ExecSQL('PRAGMA user_version=5');
     lConnection.Connected := False;
     lService := TMachineOverviewHistoryService.Create(nil, lConfig);
     lService.Start;
@@ -1973,7 +1973,7 @@ begin
       (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
       raise Exception.Create('Newer schema was not refused');
     lConnection.Connected := True;
-    if QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 4 then
+    if QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 5 then
       raise Exception.Create('Newer schema changed during refused open');
     lConnection.Connected := False;
     Writeln('PASS RunHistoryCompactionSpaceSelfTest: deferred nonfatal, recording continues, newer schema refused');
@@ -3062,6 +3062,186 @@ begin
   end;
 end;
 
+
+function RunHistoryLogicalCpuBlobSelfTest: Integer;
+var
+  g: TGarbos;
+  lFileName: string;
+  lConfig: TMachineOverviewHistoryConfig;
+  lService: TMachineOverviewHistoryService;
+  lConnection: TFDConnection;
+  lQuery: TFDQuery;
+  lSample: TMachineOverviewProviderSample;
+  lValues: TArray<TMachineOverviewOptionalDouble>;
+  i: Integer;
+begin
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('logical-v4');
+  try
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 16, 32 * 1024 * 1024);
+    GC(lService, StartHistoryBudgetService(lConfig), g);
+    lSample := CreateHistorySystemTestSample(TTimeZone.Local.ToUniversalTime(Now), 1000, 40).ProviderSample;
+    SetLength(lSample.Measurements, 35);
+    for i := 0 to 31 do
+    begin
+      lSample.Measurements[i].Name := 'cpu_logical:0,' + IntToStr(i);
+      lSample.Measurements[i].Available := i <> 17;
+      lSample.Measurements[i].Value := i * 2.25;
+    end;
+    lSample.Measurements[32].Name := 'paging_bytes_per_sec';
+    lSample.Measurements[32].Available := True;
+    lSample.Measurements[32].Value := 314572800;
+    lSample.Measurements[33].Name := 'physical_used_percent';
+    lSample.Measurements[33].Available := True;
+    lSample.Measurements[33].Value := 92;
+    lSample.Measurements[34].Name := 'cpu_total_percent';
+    lSample.Measurements[34].Available := True;
+    lSample.Measurements[34].Value := 40;
+    EnqueueHistoryBudgetRaw(lService, CreateMachineOverviewRawSample(lSample));
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('logical CPU fixture stop failed');
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := lConnection;
+    lQuery.Open('SELECT logical_cpu_blob FROM system_sample_raw');
+    if not TryUnpackMachineOverviewLogicalProcessors(lQuery.Fields[0].AsBytes, lValues) or
+      (Length(lValues) <> 32) then
+      raise Exception.Create('32 group,index logical processors were not stored');
+    for i := 0 to 31 do
+      if (lValues[i].Available <> (i <> 17)) or
+        ((i <> 17) and not SameValue(lValues[i].Value, i * 2.25, 0.001)) then
+        raise Exception.Create('logical CPU round trip differs');
+    lQuery.Close;
+    lQuery.Open('SELECT paging_bytes_per_sec, physical_used_percent FROM system_sample_raw');
+    if (lQuery.Fields[0].AsFloat <> 314572800) or (lQuery.Fields[1].AsFloat <> 92) then
+      raise Exception.Create('paging/physical use was not stored');
+    Writeln('RunHistoryLogicalCpuBlobSelfTest passed: 32 values and paging/physical use');
+    Result := 0;
+  except
+    on E: Exception do
+      Writeln('SELFTEST FAILED: RunHistoryLogicalCpuBlobSelfTest: ', E.Message);
+  end;
+  g.Clear;
+  DeleteHistoryReliabilityFiles(lFileName);
+end;
+
+function RunHistoryV4MigrationSelfTest: Integer;
+var
+  g: TGarbos;
+  lFileName, lBackup, lStaleBackup, lError: string;
+  lConfig: TMachineOverviewHistoryConfig;
+  lService: TMachineOverviewHistoryService;
+  lConnection: TFDConnection;
+  lBackupConnection: TFDConnection;
+  lIncidents: TArray<TMachineOverviewIncident>;
+  lVerified: Boolean;
+begin
+  Result := 1;
+  lVerified := False;
+  lFileName := NewHistoryMigrationFile('migration-v4');
+  try
+    CreateHistoryV2Fixture(lFileName, 3);
+    lStaleBackup := lFileName + '.pre-migration-v2-20000101000000.bak';
+    TFile.Copy(lFileName, lStaleBackup);
+    GC(lBackupConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lStaleBackup, lBackupConnection);
+    if (QueryHistoryInt64(lBackupConnection, 'PRAGMA user_version') <> 2) or
+      (QueryHistoryInt64(lBackupConnection, 'SELECT COUNT(*) FROM system_sample_raw') <> 0) then
+      raise Exception.Create('retained v2 fixture must precede later v3 raw writes');
+    lBackupConnection.Connected := False;
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 16, 32 * 1024 * 1024);
+    GC(lService, StartHistoryBudgetService(lConfig), g);
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('v3 fixture setup stop failed');
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    // A genuine v3 shape, without any of the four v4 columns.
+    lConnection.ExecSQL('CREATE TABLE IF NOT EXISTS incident_evidence (' +
+      'incident_key TEXT PRIMARY KEY NOT NULL, started_utc_ms INTEGER NOT NULL, ' +
+      'updated_utc_ms INTEGER NOT NULL, state INTEGER NOT NULL, byte_count INTEGER NOT NULL, evidence_json TEXT NOT NULL)');
+    if QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM pragma_table_info(''system_sample_raw'') ' +
+      'WHERE name=''paging_bytes_per_sec''') <> 0 then
+    begin
+      lConnection.ExecSQL('ALTER TABLE system_sample_raw DROP COLUMN paging_bytes_per_sec');
+      lConnection.ExecSQL('ALTER TABLE system_sample_raw DROP COLUMN physical_used_percent');
+      lConnection.ExecSQL('ALTER TABLE incident DROP COLUMN trace_file');
+      lConnection.ExecSQL('ALTER TABLE incident DROP COLUMN trace_detail');
+    end;
+    lConnection.ExecSQL('UPDATE history_status SET migration_backup_path=? WHERE id=1', [lStaleBackup]);
+    lConnection.ExecSQL('INSERT INTO system_sample_raw(utc_ms, monotonic_ms, provider_status, provider_error, ' +
+      'cpu_available, cpu_total, physical_available_bytes, logical_cpu_blob) VALUES (1,1,0,'''',0,0,0,X'''')');
+    lConnection.ExecSQL('PRAGMA user_version=3');
+    lConnection.Connected := False;
+    if not TryLoadMachineOverviewIncidents(lFileName, 0, 10, lIncidents, lError) or
+      (Length(lIncidents) <> 3) then
+      raise Exception.Create('v3 reader: ' + lError);
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 16, 32 * 1024 * 1024);
+    lConfig.MigrationObserver :=
+      procedure(aStage: string)
+      begin
+        if aStage = 'BackupVerified' then
+        begin
+          lVerified := True;
+          if Length(TDirectory.GetFiles(ExtractFilePath(lFileName),
+            ExtractFileName(lFileName) + '.pre-migration-v3-*.bak')) <> 1 then
+            raise Exception.Create('stale v2 backup accepted for later v3 writes; fresh v3 backup required');
+          lBackup := TDirectory.GetFiles(ExtractFilePath(lFileName),
+            ExtractFileName(lFileName) + '.pre-migration-v3-*.bak')[0];
+          if not TFile.Exists(lBackup) then
+            raise Exception.Create('verified v3 backup missing');
+          ConfigureHistoryTestConnection(lBackup, lBackupConnection);
+          if (QueryHistoryInt64(lBackupConnection, 'PRAGMA user_version') <> 3) or
+            (QueryHistoryInt64(lBackupConnection, 'SELECT COUNT(*) FROM system_sample_raw') <> 1) then
+            raise Exception.Create('verified v3 backup lost later raw writes');
+          lBackupConnection.Connected := False;
+          ConfigureHistoryTestConnection(lFileName, lConnection);
+          if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_migration_backup ' +
+            'WHERE source_version=3 AND source_bytes>0 AND incident_count=3 AND raw_count=1 AND verified_utc_ms>0') <> 1) or
+            (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_migration_backup ' +
+            'WHERE source_version=-1 AND verified_utc_ms=0') <> 1) then
+            raise Exception.Create('backup ownership must record current source verification separately from stale ownership');
+          lConnection.Connected := False;
+          Writeln('V4 BACKUP verified source=v3 raw=1 incidents=3; retained v2 raw=0 never accepted as verified');
+        end;
+        if aStage = 'BeforeBackupDeletion' then
+        begin
+          TFile.WriteAllText(lBackup + '-wal', 'owned v3 backup WAL');
+          TFile.WriteAllText(lBackup + '-shm', 'owned v3 backup SHM');
+        end;
+      end;
+    GC(lService, StartHistoryBudgetService(lConfig), g);
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('v4 migration stop failed');
+    if not lVerified or lBackup.IsEmpty or TFile.Exists(lBackup) or TFile.Exists(lStaleBackup) or
+      TFile.Exists(lBackup + '-wal') or TFile.Exists(lBackup + '-shm') then
+      raise Exception.Create('v3 backup was not verified and deleted after success');
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    if QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 4 then
+      raise Exception.Create('v3 was not upgraded to v4');
+    if QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_status WHERE migration_backup_path=''''') <> 1 then
+      raise Exception.Create('successful v4 migration retained backup path');
+    if QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_migration_backup') <> 0 then
+      raise Exception.Create('successful v4 migration retained backup ownership rows');
+    if QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM system_sample_raw WHERE ' +
+      'paging_bytes_per_sec=-1 AND physical_used_percent=-1') <> 1 then
+      raise Exception.Create('v4 raw defaults must be unavailable');
+    if QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE trace_file='''' AND trace_detail=''''') <> 3 then
+      raise Exception.Create('v4 trace defaults must be empty');
+    lConnection.Connected := False;
+    if not TryLoadMachineOverviewIncidents(lFileName, 0, 10, lIncidents, lError) or
+      (Length(lIncidents) <> 3) then
+      raise Exception.Create('v4 reader: ' + lError);
+    Writeln('RunHistoryV4MigrationSelfTest passed: v3/v4 reads, verified backup deleted, defaults preserved');
+    Result := 0;
+  except
+    on E: Exception do
+      Writeln('SELFTEST FAILED: RunHistoryV4MigrationSelfTest: ', E.Message);
+  end;
+  g.Clear;
+  DeleteHistoryReliabilityFiles(lFileName);
+end;
+
 function RunMachineOverviewHistorySelfTests(const aArg: string): Integer;
 begin
   Result := -1;
@@ -3070,6 +3250,9 @@ begin
   if not SameText(aArg, cMachineOverviewHistorySelfTestArg) then
     Exit;
   try
+    Result := RunHistoryLogicalCpuBlobSelfTest + RunHistoryV4MigrationSelfTest;
+    if Result <> 0 then
+      Exit;
     Result := RunHistoryBackupLifetimeSelfTest(False, False);
     if Result = 0 then
       Result := RunHistoryBackupLifetimeSelfTest(True, False);

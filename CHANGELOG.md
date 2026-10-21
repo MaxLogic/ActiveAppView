@@ -15,6 +15,8 @@ All notable changes to this project are documented in this file.
 - Top CPU applications show both the share of the whole machine and the load in cores, e.g. `0.7% (23% of one core)`; a process using five cores shows `500% of one core`.
 
 ### Changed
+- Machine Overview migration now backs up and verifies the current input for each schema upgrade; retained older backups are cleaned up after success. Memory-pressure recovery requires physical use strictly below 90%, keeping the exact 90% paging activation boundary distinct (ACV-071).
+- Machine Overview reduces noisy hot-logical-processor and paging incidents with sustained machine-relative thresholds and a physical-memory pressure requirement. History schema v4 fixes per-processor CPU recording and stores paging and physical-use signals; a read-only replay command compares legacy and tuned rules (ACV-071).
 - Machine Overview background sampling uses less than half the CPU it did (about 6% of one core instead of 15% on a 32-thread machine). The Responsiveness row no longer shows the processor queue length, which alone cost about 50 ms of CPU per second to read.
 - Console instances now knows Claude sessions whose window title shows no marker, and Claude sessions waiting for input behind an idle title. It reads Claude Code's own session registry and finds `claude.exe`/`codex.exe` (also a self-updated `claude.exe.old.*`) below each terminal.
 - A Setup harnesses... button adds a state hook to Claude Code and Codex on Windows and in WSL, after a preview and with a backup. Hooked sessions report working, idle, and permission waits directly instead of through title guesses.

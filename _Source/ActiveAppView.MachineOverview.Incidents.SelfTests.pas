@@ -1,4 +1,4 @@
-﻿unit ActiveAppView.MachineOverview.Incidents.SelfTests;
+unit ActiveAppView.MachineOverview.Incidents.SelfTests;
 
 interface
 
@@ -7,10 +7,11 @@ function RunMachineOverviewIncidentSelfTests(const aArg: string): Integer;
 implementation
 
 uses
-  System.DateUtils, System.Diagnostics, System.Generics.Collections, System.IOUtils, System.Math, System.StrUtils,
-  System.SysUtils,
+  System.Classes, System.DateUtils, System.Diagnostics, System.Generics.Collections, System.IOUtils, System.Math, System.StrUtils,
+  System.SysUtils, System.TypInfo,
   Winapi.Windows,
-  AutoFree, FireDAC.Comp.Client,
+  AutoFree, Data.DB, FireDAC.Comp.Client, FireDAC.Phys.SQLite, FireDAC.Phys.SQLiteWrapper,
+  ActiveAppView.MachineOverview.Domain,
   ActiveAppView.MachineOverview.Evidence,
   ActiveAppView.MachineOverview.History,
   ActiveAppView.MachineOverview.Incidents,
@@ -208,6 +209,8 @@ begin
   Result := 1;
   lThresholds := TMachineOverviewIncidentThresholds.Defaults;
   lUtc := EncodeDate(2026, 8, 29);
+  lThresholds.HotLogicalProcessorActivationDurationMs := lThresholds.SignalActivationDurationMs;
+  lThresholds.HotLogicalProcessorRecoveryDurationMs := lThresholds.SignalRecoveryDurationMs;
   for lCategory in cCategories do
   begin
     lDetector := TMachineOverviewIncidentDetector.Create(lThresholds);
@@ -1658,12 +1661,673 @@ begin
   Writeln('Evidence review regressions passed');
 end;
 
+
+procedure ThresholdCheck(const aCondition: Boolean; const aMessage: string;
+  var aFailures: Integer);
+begin
+  if aCondition then
+    Exit;
+  Inc(aFailures);
+  Writeln('SELFTEST FAILED: ', aMessage);
+end;
+
+function RunHotLogicalProcessorThresholdSelfTest: Integer;
+var
+  g: TGarbos;
+  lDetector: TMachineOverviewIncidentDetector;
+  lSignals: TMachineOverviewIncidentSignals;
+  lChanges: TArray<TMachineOverviewIncidentChange>;
+  lChange: TMachineOverviewIncidentChange;
+  lStarted, lEnded, lFailures: Integer;
+  lUtc: TDateTime;
+  i: Int64;
+begin
+  g := Default(TGarbos);
+  lFailures := 0;
+  lUtc := EncodeDate(2026, 10, 21);
+  GC(lDetector, TMachineOverviewIncidentDetector.Create(
+    TMachineOverviewIncidentThresholds.Defaults), g);
+  lStarted := 0;
+  lEnded := 0;
+  for i := 0 to 149 do
+  begin
+    lSignals := CreateCpuSignals(IncSecond(lUtc, Int64(i)), UInt64(i + 1) * 1000, 40, 'threshold');
+    lSignals.LogicalProcessorCount := 32;
+    if i < 60 then
+      lSignals.HotLogicalProcessorCount := 2
+    else if (i < 80) or ((i >= 90) and (i < 125)) then
+      lSignals.HotLogicalProcessorCount := 4
+    else
+      lSignals.HotLogicalProcessorCount := 3;
+    lChanges := lDetector.Accept(lSignals);
+    for lChange in lChanges do
+      if lChange.Incident.Category = TMachineOverviewIncidentCategory.HotLogicalProcessors then
+      begin
+        if lChange.Kind = TMachineOverviewIncidentChangeKind.Started then
+        begin
+          Inc(lStarted);
+          ThresholdCheck((i = 120) and (Abs(lChange.Incident.StartedAtUtc -
+            IncSecond(lUtc, 90)) < 0.0000001), 'hot LP activation must be 30s at four of 32', lFailures);
+        end;
+        if lChange.Kind = TMachineOverviewIncidentChangeKind.Ended then
+        begin
+          Inc(lEnded);
+          ThresholdCheck(i = 135, 'hot LP recovery must be 10s below count', lFailures);
+        end;
+      end;
+  end;
+  ThresholdCheck((lStarted = 1) and (lEnded = 1),
+    'hot LP: two for 60s and four for 20s suppressed; sustained four starts and three recovers', lFailures);
+  Writeln('RunHotLogicalProcessorThresholdSelfTest failures=', lFailures);
+  Result := Ord(lFailures <> 0);
+end;
+
+function RunHotLogicalProcessorBoundarySelfTest: Integer;
+var
+  g: TGarbos;
+  lDetector: TMachineOverviewIncidentDetector;
+  lThresholds: TMachineOverviewIncidentThresholds;
+  lSignals: TMachineOverviewIncidentSignals;
+  lChange: TMachineOverviewIncidentChange;
+  lUtc: TDateTime;
+  lStarted, lEnded, lHighCpuStarted, lFailures: Integer;
+  i: Int64;
+  j: Integer;
+begin
+  g := Default(TGarbos);
+  lFailures := 0;
+  lUtc := EncodeDate(2026, 10, 21);
+  for j := 0 to 1 do
+  begin
+    lStarted := 0;
+    lEnded := 0;
+    lHighCpuStarted := 0;
+    GC(lDetector, TMachineOverviewIncidentDetector.Create(TMachineOverviewIncidentThresholds.Defaults), g);
+    for i := 0 to 59 do
+    begin
+      lSignals := CreateCpuSignals(IncSecond(lUtc, Int64(i)), UInt64(i + 1) * 1000, 40, 'boundary');
+      if j = 0 then
+        lSignals.LogicalProcessorCount := 8;
+      lSignals.HotLogicalProcessorCount := 2;
+      if i >= 35 then
+      begin
+        lSignals.TotalCpu.Value := 95;
+        lSignals.HotLogicalProcessorCount := 8;
+      end;
+      for lChange in lDetector.Accept(lSignals) do
+      begin
+        if (lChange.Incident.Category = TMachineOverviewIncidentCategory.HighCpu) and
+          (lChange.Kind = TMachineOverviewIncidentChangeKind.Started) then
+          Inc(lHighCpuStarted);
+        if lChange.Incident.Category <> TMachineOverviewIncidentCategory.HotLogicalProcessors then
+          Continue;
+        if lChange.Kind = TMachineOverviewIncidentChangeKind.Started then
+        begin
+          Inc(lStarted);
+          ThresholdCheck(i = 30, 'small/unknown LP count uses minimum two for 30s', lFailures);
+        end;
+        if lChange.Kind = TMachineOverviewIncidentChangeKind.Ended then
+        begin
+          Inc(lEnded);
+          ThresholdCheck(i = 45, 'HighCpu-level CPU recovers hot LP after 10s despite all LPs hot', lFailures);
+        end;
+      end;
+    end;
+    ThresholdCheck((lStarted = 1) and (lEnded = 1) and (lHighCpuStarted = 1),
+      'HighCpu owns saturation; hot LP suppressed while total CPU >=90%', lFailures);
+  end;
+  for i := 0 to 3 do
+  begin
+    lThresholds := TMachineOverviewIncidentThresholds.Defaults;
+    case i of
+      0: lThresholds.HotLogicalProcessorMinimumCount := 0;
+      1: lThresholds.HotLogicalProcessorFraction := 0;
+      2: lThresholds.HotLogicalProcessorFraction := 1.01;
+      3: lThresholds.HotLogicalProcessorActivationDurationMs := 0;
+    end;
+    try
+      GC(lDetector, TMachineOverviewIncidentDetector.Create(lThresholds), g);
+      ThresholdCheck(False, 'invalid hot LP threshold accepted', lFailures);
+    except
+      on EArgumentException do
+        Continue;
+    end;
+  end;
+  Writeln('RunHotLogicalProcessorBoundarySelfTest failures=', lFailures);
+  Result := Ord(lFailures <> 0);
+end;
+
+function RunMemoryPressureThresholdSelfTest: Integer;
+var
+  g: TGarbos;
+  lDetector: TMachineOverviewIncidentDetector;
+  lSignals: TMachineOverviewIncidentSignals;
+  lChange: TMachineOverviewIncidentChange;
+  lStarted, lEnded, lFailures: Integer;
+  lUtc: TDateTime;
+  i: Int64;
+begin
+  g := Default(TGarbos);
+  lFailures := 0;
+  lStarted := 0;
+  lEnded := 0;
+  lUtc := EncodeDate(2026, 10, 21);
+  GC(lDetector, TMachineOverviewIncidentDetector.Create(
+    TMachineOverviewIncidentThresholds.Defaults), g);
+  for i := 0 to 96 do
+  begin
+    lSignals := CreateCpuSignals(IncSecond(lUtc, Int64(i)), UInt64(i + 1) * 1000, 40, 'threshold');
+    lSignals.LogicalProcessorCount := 32;
+    lSignals.PhysicalUsedPercent.Available := True;
+    lSignals.PagingBytesPerSecond.Available := True;
+    lSignals.PhysicalUsedPercent.Value := 80;
+    lSignals.PagingBytesPerSecond.Value := 300 * 1024 * 1024;
+    if (i >= 60) and (i < 78) then
+      lSignals.PhysicalUsedPercent.Value := 90;
+    if (i >= 67) and (i < 78) then
+      lSignals.PagingBytesPerSecond.Value := 0;
+    if (i >= 78) and (i < 89) then
+    begin
+      lSignals.PhysicalUsedPercent.Value := 89;
+      lSignals.PagingBytesPerSecond.Value := 50 * 1024 * 1024;
+    end;
+    if i >= 89 then
+    begin
+      lSignals.PhysicalUsedPercent.Value := 96;
+      lSignals.PagingBytesPerSecond.Available := False;
+    end;
+    for lChange in lDetector.Accept(lSignals) do
+      if lChange.Incident.Category = TMachineOverviewIncidentCategory.MemoryPressure then
+      begin
+        if lChange.Kind = TMachineOverviewIncidentChangeKind.Started then
+        begin
+          Inc(lStarted);
+          ThresholdCheck(((i = 65) and StartsText('Paging reached', lChange.Incident.Summary)) or
+            ((i = 94) and StartsText('Physical memory use reached', lChange.Incident.Summary)),
+            'memory activation requires constrained physical memory', lFailures);
+        end;
+        if lChange.Kind = TMachineOverviewIncidentChangeKind.Ended then
+        begin
+          Inc(lEnded);
+          ThresholdCheck(i = 83, 'memory must remain active at exactly 90%; recover only below 90%', lFailures);
+        end;
+      end;
+  end;
+  ThresholdCheck((lStarted = 2) and (lEnded = 1), 'memory pressure paging and physical-only episodes', lFailures);
+  Writeln('RunMemoryPressureThresholdSelfTest failures=', lFailures);
+  Result := Ord(lFailures <> 0);
+end;
+
+type
+  TReplayLegacyRule = record
+    Active: Boolean;
+    CandidateMs, RecoveryMs: UInt64;
+    StartedUtcMs: Int64;
+  end;
+
+  TReplayIncidentCounts = array[TMachineOverviewIncidentCategory] of Integer;
+  TReplayDbReadOnly = function(aDatabase: Pointer; aSchema: PAnsiChar): Integer; cdecl;
+
+  TIncidentReplay = class
+  private
+    fAggregator: TMachineOverviewDomainAggregator;
+    fDetector: TMachineOverviewIncidentDetector;
+    fLegacyRules: array[TMachineOverviewIncidentCategory] of TReplayLegacyRule;
+    fLegacyHighCpu, fTunedHighCpu: TStringList;
+    fLastMonotonicMs: UInt64;
+    procedure AcceptLegacy(const aSignals: TMachineOverviewIncidentSignals);
+    procedure ResetSession;
+  public
+    Legacy, Tuned: TReplayIncidentCounts;
+    Samples, Gaps: Int64;
+    FirstUtcMs, LastUtcMs: Int64;
+    constructor Create;
+    destructor Destroy; override;
+    procedure AcceptRow(const aQuery: TFDQuery);
+    function HighCpuIdentical: Boolean;
+  end;
+
+function ReplayUtcMilliseconds(const aUtc: TDateTime): Int64;
+begin
+  Result := DateTimeToUnix(aUtc, True) * 1000 + MilliSecondOf(aUtc);
+end;
+
+function ReplayDateTime(const aUtcMs: Int64): TDateTime;
+begin
+  Result := UnixToDateTime(aUtcMs div 1000, True) + (aUtcMs mod 1000) / Double(86400000);
+end;
+
+constructor TIncidentReplay.Create;
+begin
+  inherited Create;
+  fLegacyHighCpu := TStringList.Create;
+  fTunedHighCpu := TStringList.Create;
+  ResetSession;
+end;
+
+destructor TIncidentReplay.Destroy;
+begin
+  fAggregator.Free;
+  fDetector.Free;
+  fLegacyHighCpu.Free;
+  fTunedHighCpu.Free;
+  inherited Destroy;
+end;
+
+procedure TIncidentReplay.ResetSession;
+var
+  lCategory: TMachineOverviewIncidentCategory;
+begin
+  FreeAndNil(fAggregator);
+  FreeAndNil(fDetector);
+  for lCategory := Low(TMachineOverviewIncidentCategory) to High(TMachineOverviewIncidentCategory) do
+    fLegacyRules[lCategory] := Default(TReplayLegacyRule);
+  fAggregator := TMachineOverviewDomainAggregator.Create(1000, 80);
+  fDetector := TMachineOverviewIncidentDetector.Create(TMachineOverviewIncidentThresholds.Defaults);
+end;
+
+procedure TIncidentReplay.AcceptLegacy(const aSignals: TMachineOverviewIncidentSignals);
+var
+  lCategory: TMachineOverviewIncidentCategory;
+  lRule: TReplayLegacyRule;
+  lTriggered, lRecovered: Boolean;
+  lActivation, lRecovery: UInt64;
+begin
+  // Frozen pre-ACV-071 defaults and rules, independent of the production evaluator.
+  // Only these three categories have inputs in system_sample_raw.
+  for lCategory in [TMachineOverviewIncidentCategory.HighCpu,
+    TMachineOverviewIncidentCategory.HotLogicalProcessors, TMachineOverviewIncidentCategory.MemoryPressure] do
+  begin
+    lActivation := 5000;
+    lRecovery := 5000;
+    case lCategory of
+      TMachineOverviewIncidentCategory.HighCpu:
+      begin
+        lTriggered := aSignals.TotalCpu.Available and (aSignals.TotalCpu.Value >= 90);
+        lRecovered := aSignals.TotalCpu.Available and (aSignals.TotalCpu.Value <= 75);
+        lActivation := 15000;
+        lRecovery := 10000;
+      end;
+      TMachineOverviewIncidentCategory.HotLogicalProcessors:
+      begin
+        lTriggered := aSignals.HotLogicalProcessorCount >= 2;
+        lRecovered := aSignals.HotLogicalProcessorCount = 0;
+      end;
+    else
+      lTriggered := (aSignals.PhysicalUsedPercent.Available and (aSignals.PhysicalUsedPercent.Value >= 95)) or
+        (aSignals.PagingBytesPerSecond.Available and (aSignals.PagingBytesPerSecond.Value >= 100 * 1024 * 1024));
+      lRecovered := aSignals.PhysicalUsedPercent.Available and aSignals.PagingBytesPerSecond.Available and
+        (aSignals.PhysicalUsedPercent.Value <= 90) and (aSignals.PagingBytesPerSecond.Value <= 10 * 1024 * 1024);
+    end;
+    lRule := fLegacyRules[lCategory];
+    if not lRule.Active then
+    begin
+      if not lTriggered then
+        lRule.CandidateMs := 0
+      else if lRule.CandidateMs = 0 then
+        lRule.CandidateMs := aSignals.CapturedAtMonotonicMs
+      else if aSignals.CapturedAtMonotonicMs - lRule.CandidateMs >= lActivation then
+      begin
+        lRule.Active := True;
+        lRule.RecoveryMs := 0;
+        lRule.StartedUtcMs := ReplayUtcMilliseconds(IncMilliSecond(aSignals.CapturedAtUtc,
+          -Int64(aSignals.CapturedAtMonotonicMs - lRule.CandidateMs)));
+        Inc(Legacy[lCategory]);
+        if lCategory = TMachineOverviewIncidentCategory.HighCpu then
+          fLegacyHighCpu.Add('start ' + IntToStr(lRule.StartedUtcMs));
+      end;
+    end else if lTriggered or not lRecovered then
+      lRule.RecoveryMs := 0
+    else if lRule.RecoveryMs = 0 then
+      lRule.RecoveryMs := aSignals.CapturedAtMonotonicMs
+    else if aSignals.CapturedAtMonotonicMs - lRule.RecoveryMs >= lRecovery then
+    begin
+      if lCategory = TMachineOverviewIncidentCategory.HighCpu then
+        fLegacyHighCpu.Add('end ' + IntToStr(lRule.StartedUtcMs) + ' ' +
+          IntToStr(ReplayUtcMilliseconds(aSignals.CapturedAtUtc)));
+      lRule := Default(TReplayLegacyRule);
+    end;
+    fLegacyRules[lCategory] := lRule;
+  end;
+end;
+
+procedure TIncidentReplay.AcceptRow(const aQuery: TFDQuery);
+var
+  lSignals: TMachineOverviewIncidentSignals;
+  lLogical: TArray<TMachineOverviewOptionalDouble>;
+  lAggregate: TMachineOverviewCpuAggregate;
+  lChange: TMachineOverviewIncidentChange;
+  lUtcMs: Int64;
+  lMonotonicMs: UInt64;
+begin
+  lUtcMs := StrToInt64(aQuery.FieldByName('utc_text').AsWideString);
+  lMonotonicMs := StrToUInt64(aQuery.FieldByName('monotonic_text').AsWideString);
+  if (Samples > 0) and ((lMonotonicMs < fLastMonotonicMs) or
+    ((lMonotonicMs >= fLastMonotonicMs) and (lMonotonicMs - fLastMonotonicMs > 10000))) then
+  begin
+    Inc(Gaps);
+    ResetSession;
+  end;
+  fLastMonotonicMs := lMonotonicMs;
+  if Samples = 0 then
+    FirstUtcMs := lUtcMs;
+  LastUtcMs := lUtcMs;
+  Inc(Samples);
+  lSignals := Default(TMachineOverviewIncidentSignals);
+  lSignals.CapturedAtUtc := ReplayDateTime(lUtcMs);
+  lSignals.CapturedAtMonotonicMs := lMonotonicMs;
+  lSignals.TotalCpu.Available := aQuery.FieldByName('cpu_available').AsInteger <> 0;
+  lSignals.TotalCpu.Value := aQuery.FieldByName('cpu_total').AsFloat;
+  if not TryUnpackMachineOverviewLogicalProcessors(aQuery.FieldByName('logical_cpu_blob').AsBytes, lLogical) then
+    lLogical := nil;
+  fAggregator.AcceptCpuSample(CreateMachineOverviewCpuSample(lMonotonicMs,
+    lSignals.CapturedAtUtc, lSignals.TotalCpu, lLogical));
+  lAggregate := fAggregator.BuildCpuAggregate(lMonotonicMs);
+  lSignals.LogicalProcessorCount := lAggregate.LogicalProcessorCount;
+  lSignals.HotLogicalProcessorCount := lAggregate.HotLogicalProcessorCount;
+  lSignals.PhysicalUsedPercent.Value := aQuery.FieldByName('physical_used_percent').AsFloat;
+  lSignals.PhysicalUsedPercent.Available := lSignals.PhysicalUsedPercent.Value >= 0;
+  lSignals.PagingBytesPerSecond.Value := aQuery.FieldByName('paging_bytes_per_sec').AsFloat;
+  lSignals.PagingBytesPerSecond.Available := lSignals.PagingBytesPerSecond.Value >= 0;
+  lSignals.ProviderId := 'windows-core';
+  lSignals.ProviderStatus := TMachineOverviewProviderStatus.Available;
+  AcceptLegacy(lSignals);
+  for lChange in fDetector.Accept(lSignals) do
+  begin
+    if lChange.Kind = TMachineOverviewIncidentChangeKind.Started then
+      Inc(Tuned[lChange.Incident.Category]);
+    if lChange.Incident.Category <> TMachineOverviewIncidentCategory.HighCpu then
+      Continue;
+    if lChange.Kind = TMachineOverviewIncidentChangeKind.Started then
+      fTunedHighCpu.Add('start ' + IntToStr(ReplayUtcMilliseconds(lChange.Incident.StartedAtUtc)));
+    if lChange.Kind = TMachineOverviewIncidentChangeKind.Ended then
+      fTunedHighCpu.Add('end ' + IntToStr(ReplayUtcMilliseconds(lChange.Incident.StartedAtUtc)) + ' ' +
+        IntToStr(ReplayUtcMilliseconds(lChange.Incident.EndedAtUtc)));
+  end;
+end;
+
+function TIncidentReplay.HighCpuIdentical: Boolean;
+begin
+  Result := fLegacyHighCpu.Equals(fTunedHighCpu);
+end;
+
+function CreateIncidentReplayConnection(const aFileName, aMode: string): TFDConnection;
+var
+  lDriver: TFDPhysSQLiteDriverLink;
+  lHeader: array[0..19] of Byte;
+  lStream: TFileStream;
+  g: TGarbos;
+begin
+  g := Default(TGarbos);
+  Result := TFDConnection.Create(nil);
+  try
+    lDriver := TFDPhysSQLiteDriverLink.Create(Result);
+    lDriver.DriverID := 'SQLite_MachineOverviewReplay';
+    lDriver.EngineLinkage := slDynamic;
+    lDriver.VendorLib := TPath.Combine(ExtractFilePath(ParamStr(0)), 'sqlite3.dll');
+    Result.LoginPrompt := False;
+    Result.ResourceOptions.SilentMode := True;
+    Result.Params.Values['DriverID'] := lDriver.DriverID;
+    Result.Params.Values['Database'] := aFileName;
+    Result.Params.Values['OpenMode'] := aMode;
+    Result.Params.Values['BusyTimeout'] := '100';
+    Result.Params.Values['LockingMode'] := 'Normal';
+    Result.Params.Values['SharedCache'] := 'False';
+    Result.Params.Values['JournalMode'] := 'Delete';
+    if SameText(aMode, 'ReadOnly') then
+    begin
+      GC(lStream, TFileStream.Create(aFileName, fmOpenRead or fmShareDenyNone), g);
+      if (lStream.Read(lHeader[0], Length(lHeader)) = Length(lHeader)) and
+        (lHeader[18] = 2) and (lHeader[19] = 2) then
+        Result.Params.Values['JournalMode'] := 'WAL';
+    end;
+    Result.Connected := True;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+procedure ReadIncidentReplay(const aFileName: string; const aReplay: TIncidentReplay);
+const
+  cChunkSize = 10000;
+var
+  g: TGarbos;
+  lConnection: TFDConnection;
+  lQuery: TFDQuery;
+  lReadOnly: TReplayDbReadOnly;
+  lLastUtc, lLastId, lWindowLastId: Int64;
+  lRows, lVersion: Integer;
+begin
+  GC(lConnection, CreateIncidentReplayConnection(aFileName, 'ReadOnly'), g);
+  lReadOnly := GetProcAddress(GetModuleHandle('sqlite3.dll'), 'sqlite3_db_readonly');
+  if not Assigned(lReadOnly) or (lReadOnly(TSQLiteDatabase(lConnection.CliObj).Handle, 'main') <> 1) then
+    raise Exception.Create('Replay requires a native read-only SQLite connection');
+  lConnection.ExecSQL('PRAGMA query_only=ON');
+  GC(lQuery, TFDQuery.Create(nil), g);
+  lQuery.Connection := lConnection;
+  lQuery.Open('PRAGMA query_only');
+  if lQuery.Fields[0].AsInteger <> 1 then
+    raise Exception.Create('Replay query_only verification failed');
+  lQuery.Close;
+  Writeln('REPLAY safety sqlite3_db_readonly=1 query_only=1 busy_timeout_ms=100');
+  lQuery.Open('PRAGMA user_version');
+  lVersion := lQuery.Fields[0].AsInteger;
+  lQuery.Close;
+  if lVersion < 4 then
+    raise Exception.CreateFmt('Replay requires schema >= 4; found %d. Fresh v4 recording is required.', [lVersion]);
+  // Freeze the input horizon without retaining a transaction while the live writer appends.
+  lQuery.Open('SELECT CAST(COALESCE(MAX(id),0) AS TEXT) FROM system_sample_raw');
+  lWindowLastId := StrToInt64(lQuery.Fields[0].AsWideString);
+  lQuery.Close;
+  lLastUtc := Low(Int64);
+  lLastId := 0;
+  repeat
+    lRows := 0;
+    lConnection.StartTransaction;
+    try
+      lQuery.SQL.Text := 'SELECT CAST(id AS TEXT) AS id_text, CAST(utc_ms AS TEXT) AS utc_text, ' +
+        'CAST(monotonic_ms AS TEXT) AS monotonic_text, cpu_available, cpu_total, logical_cpu_blob, ' +
+        'physical_used_percent, paging_bytes_per_sec FROM system_sample_raw WHERE id<=:horizon AND ' +
+        '(utc_ms,id)>(:utc,:id) ORDER BY utc_ms,id LIMIT 10000';
+      lQuery.ParamByName('horizon').AsLargeInt := lWindowLastId;
+      lQuery.ParamByName('utc').AsLargeInt := lLastUtc;
+      lQuery.ParamByName('id').AsLargeInt := lLastId;
+      lQuery.Open;
+      while not lQuery.Eof do
+      begin
+        aReplay.AcceptRow(lQuery);
+        lLastUtc := StrToInt64(lQuery.FieldByName('utc_text').AsWideString);
+        lLastId := StrToInt64(lQuery.FieldByName('id_text').AsWideString);
+        Inc(lRows);
+        lQuery.Next;
+      end;
+      lQuery.Close;
+      lConnection.Commit;
+    except
+      if lConnection.InTransaction then
+        lConnection.Rollback;
+      raise;
+    end;
+  until lRows < cChunkSize;
+  lQuery.Open('SELECT total_changes()');
+  if lQuery.Fields[0].AsInteger <> 0 then
+    raise Exception.Create('Replay unexpectedly changed the database');
+  Writeln('REPLAY safety total_changes=0; application SQL: SELECT, PRAGMA query_only, BEGIN/COMMIT only');
+end;
+
+procedure WriteIncidentReplayReport(const aReplay: TIncidentReplay);
+var
+  lCategory: TMachineOverviewIncidentCategory;
+begin
+  Writeln('REPLAY window ', FormatDateTime('yyyy-mm-dd"T"hh:nn:ss.zzz"Z"', ReplayDateTime(aReplay.FirstUtcMs)),
+    ' - ', FormatDateTime('yyyy-mm-dd"T"hh:nn:ss.zzz"Z"', ReplayDateTime(aReplay.LastUtcMs)),
+    ' samples ', aReplay.Samples, ' gaps ', aReplay.Gaps);
+  for lCategory := Low(TMachineOverviewIncidentCategory) to High(TMachineOverviewIncidentCategory) do
+    Writeln('REPLAY ', GetEnumName(TypeInfo(TMachineOverviewIncidentCategory), Ord(lCategory)),
+      ' legacy=', aReplay.Legacy[lCategory], ' tuned=', aReplay.Tuned[lCategory]);
+  if aReplay.HighCpuIdentical then
+    Writeln('REPLAY high-cpu identical=yes')
+  else
+    Writeln('REPLAY high-cpu identical=no');
+end;
+
+function RunIncidentReplayMode(const aFileName: string): Integer;
+var
+  g: TGarbos;
+  lReplay: TIncidentReplay;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  try
+    if aFileName.Trim.IsEmpty then
+      raise Exception.Create('Replay requires a database path');
+    GC(lReplay, TIncidentReplay.Create, g);
+    ReadIncidentReplay(aFileName, lReplay);
+    WriteIncidentReplayReport(lReplay);
+    if lReplay.HighCpuIdentical then
+      Result := 0;
+  except
+    on E: Exception do
+      Writeln('REPLAY FAILED: ', E.ClassName, ': ', E.Message);
+  end;
+end;
+
+procedure RunIncidentReplaySelfTest;
+var
+  g: TGarbos;
+  lFileName: string;
+  lConnection: TFDConnection;
+  lQuery: TFDQuery;
+  lReplay, lChunkReplay: TIncidentReplay;
+  lLogical: TArray<TMachineOverviewOptionalDouble>;
+  lStream: TBytesStream;
+  lUtcMs: Int64;
+  lHotCount: Integer;
+  lCpu, lPaging: Double;
+  i, j: Integer;
+begin
+  g := Default(TGarbos);
+  lFileName := TPath.Combine(TPath.GetTempPath,
+    'ActiveAppView-MachineOverview-replay-' + TGUID.NewGuid.ToString + '.db');
+  try
+    GC(lConnection, CreateIncidentReplayConnection(lFileName, 'CreateUTF8'), g);
+    lConnection.ExecSQL('CREATE TABLE system_sample_raw(id INTEGER PRIMARY KEY, utc_ms INTEGER NOT NULL, ' +
+      'monotonic_ms INTEGER NOT NULL, cpu_available INTEGER NOT NULL, cpu_total REAL NOT NULL, ' +
+      'logical_cpu_blob BLOB NOT NULL, paging_bytes_per_sec REAL NOT NULL DEFAULT -1, ' +
+      'physical_used_percent REAL NOT NULL DEFAULT -1)');
+    lConnection.ExecSQL('CREATE INDEX idx_system_sample_raw_utc ON system_sample_raw(utc_ms)');
+    lConnection.ExecSQL('PRAGMA user_version=4');
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := lConnection;
+    lQuery.SQL.Text := 'INSERT INTO system_sample_raw(utc_ms,monotonic_ms,cpu_available,cpu_total,' +
+      'logical_cpu_blob,paging_bytes_per_sec,physical_used_percent) VALUES (:utc,:mono,1,:cpu,:blob,:paging,80)';
+    lQuery.ParamByName('utc').DataType := ftLargeint;
+    lQuery.ParamByName('mono').DataType := ftLargeint;
+    lQuery.ParamByName('cpu').DataType := ftFloat;
+    lQuery.ParamByName('paging').DataType := ftFloat;
+    lQuery.ParamByName('blob').DataType := ftBlob;
+    SetLength(lLogical, 32);
+    lUtcMs := ReplayUtcMilliseconds(EncodeDate(2026, 10, 21));
+    lConnection.StartTransaction;
+    for i := 0 to 1799 do
+    begin
+      lHotCount := 0;
+      lCpu := 20;
+      lPaging := 0;
+      if ((i >= 100) and (i < 130)) or ((i >= 300) and (i < 340)) then
+        lHotCount := 3;
+      if (i >= 500) and (i < 540) then
+        lHotCount := 5;
+      if (i >= 900) and (i < 940) then
+      begin
+        lCpu := 95;
+        lHotCount := 32;
+      end;
+      if (i >= 1100) and (i < 1140) then
+        lPaging := 300 * 1024 * 1024;
+      for j := 0 to 31 do
+      begin
+        lLogical[j].Available := True;
+        if j < lHotCount then
+          lLogical[j].Value := 95
+        else
+          lLogical[j].Value := 10;
+      end;
+      lQuery.ParamByName('utc').AsLargeInt := lUtcMs + Int64(i) * 1000;
+      lQuery.ParamByName('mono').AsLargeInt := Int64(i + 1) * 1000;
+      lQuery.ParamByName('cpu').AsFloat := lCpu;
+      lQuery.ParamByName('paging').AsFloat := lPaging;
+      lStream := TBytesStream.Create(PackMachineOverviewLogicalProcessors(lLogical));
+      try
+        lQuery.ParamByName('blob').LoadFromStream(lStream, ftBlob);
+        lQuery.ExecSQL;
+      finally
+        lStream.Free;
+      end;
+    end;
+    lConnection.Commit;
+    GC(lReplay, TIncidentReplay.Create, g);
+    ReadIncidentReplay(lFileName, lReplay);
+    WriteIncidentReplayReport(lReplay);
+    EvidenceCheck((lReplay.Samples = 1800) and (lReplay.Gaps = 0), 'replay 30-minute window');
+    EvidenceCheck(lReplay.HighCpuIdentical and
+      (lReplay.Legacy[TMachineOverviewIncidentCategory.HighCpu] = 1) and
+      (lReplay.Tuned[TMachineOverviewIncidentCategory.HighCpu] = 1), 'replay preserves real HighCpu');
+    EvidenceCheck((lReplay.Legacy[TMachineOverviewIncidentCategory.HotLogicalProcessors] > 1) and
+      (lReplay.Tuned[TMachineOverviewIncidentCategory.HotLogicalProcessors] = 1), 'replay filters short three-hot episodes');
+    EvidenceCheck((lReplay.Legacy[TMachineOverviewIncidentCategory.MemoryPressure] = 1) and
+      (lReplay.Tuned[TMachineOverviewIncidentCategory.MemoryPressure] = 0), 'replay filters paging at 80% physical use');
+    // Exercise chunk pagination, equal UTC keys, unavailable values and two session boundaries.
+    lConnection.ExecSQL('WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<10020) ' +
+      'INSERT INTO system_sample_raw(utc_ms,monotonic_ms,cpu_available,cpu_total,logical_cpu_blob) ' +
+      'SELECT ?+1800000+n*1000,CASE WHEN n<100 THEN 1800000+n*1000 ' +
+      'WHEN n<200 THEN n*1000 ELSE n*1000+20000 END,0,0,X'''' FROM rows', [lUtcMs]);
+    lConnection.ExecSQL('INSERT INTO system_sample_raw(utc_ms,monotonic_ms,cpu_available,cpu_total,logical_cpu_blob) ' +
+      'SELECT utc_ms,monotonic_ms,0,0,X'''' FROM system_sample_raw WHERE id=10000');
+    GC(lChunkReplay, TIncidentReplay.Create, g);
+    ReadIncidentReplay(lFileName, lChunkReplay);
+    EvidenceCheck((lChunkReplay.Samples = 11821) and (lChunkReplay.Gaps = 2) and lChunkReplay.HighCpuIdentical,
+      'replay chunk cursor or session boundary lost/duplicated rows');
+    EvidenceCheck((lChunkReplay.Tuned[TMachineOverviewIncidentCategory.HotLogicalProcessors] = 1) and
+      (lChunkReplay.Tuned[TMachineOverviewIncidentCategory.MemoryPressure] = 0), 'unavailable replay values triggered incidents');
+    Writeln('RunIncidentReplaySelfTest passed: 1800-row fixture; 11821-row chunk cursor; two session resets');
+  finally
+    g.Clear;
+    for var s in ['-wal', '-shm', ''] do
+      if TFile.Exists(lFileName + s) then
+        TFile.Delete(lFileName + s);
+  end;
+end;
+
+
 function RunMachineOverviewIncidentSelfTests(const aArg: string): Integer;
 begin
   Result := -1;
+  if StartsText('--replay-machine-overview-incidents=', aArg) then
+    Exit(RunIncidentReplayMode(Copy(aArg, Length('--replay-machine-overview-incidents=') + 1, MaxInt)));
+  if SameText(aArg, '--self-test-machine-overview-incident-replay') then
+  begin
+    try
+      RunIncidentReplaySelfTest;
+      Result := 0;
+    except
+      on E: Exception do
+      begin
+        Writeln('SELFTEST FAILED: RunIncidentReplaySelfTest: ', E.Message);
+        Result := 1;
+      end;
+    end;
+    Exit;
+  end;
   if not SameText(aArg, cMachineOverviewIncidentSelfTestArg) then
     Exit;
   try
+    Result := RunHotLogicalProcessorThresholdSelfTest + RunHotLogicalProcessorBoundarySelfTest +
+      RunMemoryPressureThresholdSelfTest;
+    if Result <> 0 then
+      Exit;
+    RunIncidentReplaySelfTest;
     RunEvidenceFinalizedLifecycleSelfTest;
     RunEvidenceFinalizedFifoSelfTest;
     RunEvidenceReviewRegressionSelfTests;

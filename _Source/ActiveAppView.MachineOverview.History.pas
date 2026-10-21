@@ -298,7 +298,7 @@ type
 
 const
   cMachineOverviewHistoryDatabaseFileName = 'MachineOverviewHistory.db';
-  cMachineOverviewHistorySchemaVersion = 3;
+  cMachineOverviewHistorySchemaVersion = 4;
   cMachineOverviewHistoryWriteBatchSize = 256;
   cMachineOverviewHistoryRetryDelayMs = 250;
   cMachineOverviewSQLiteDriverId = 'SQLite_MachineOverview';
@@ -492,29 +492,25 @@ end;
 function HistoryLogicalProcessors(
   const aSample: TMachineOverviewProviderSample):
   TArray<TMachineOverviewOptionalDouble>;
-const
-  cLogicalPrefix = 'cpu_logical:';
 var
   lIndex: Integer;
-  lMaximumIndex: Integer;
   lMeasurement: TMachineOverviewMeasurement;
 begin
-  lMaximumIndex := -1;
+  // Provider names contain group,index. Preserve provider order, just as our
+  // pipeline CPU sample does; parsing the suffix as an integer discarded them.
+  lIndex := 0;
   for lMeasurement in aSample.Measurements do
-    if StartsText(cLogicalPrefix, lMeasurement.Name) and
-      TryStrToInt(Copy(lMeasurement.Name, Length(cLogicalPrefix) + 1,
-        MaxInt), lIndex) and (lIndex >= 0) then
-      lMaximumIndex := Max(lMaximumIndex, lIndex);
-  SetLength(Result, lMaximumIndex + 1);
+    if StartsText('cpu_logical:', lMeasurement.Name) then
+      Inc(lIndex);
+  SetLength(Result, lIndex);
+  lIndex := 0;
   for lMeasurement in aSample.Measurements do
-    if StartsText(cLogicalPrefix, lMeasurement.Name) and
-      TryStrToInt(Copy(lMeasurement.Name, Length(cLogicalPrefix) + 1,
-        MaxInt), lIndex) and (lIndex >= 0) and
-      (lIndex < Length(Result)) then
+    if StartsText('cpu_logical:', lMeasurement.Name) then
     begin
       Result[lIndex].Available := lMeasurement.Available;
       if lMeasurement.Available then
         Result[lIndex].Value := lMeasurement.Value;
+      Inc(lIndex);
     end;
 end;
 
@@ -758,7 +754,7 @@ procedure TMachineOverviewHistoryStore.BackupDatabase(const aVersion: Integer);
 var
   g: TGarbos;
   lBackup: TFDConnection;
-  lCount: Int64;
+  lCount, lRawCount, lSourceBytes: Int64;
   lHasIncidents: Boolean;
   lPath: string;
   lQuery: TFDQuery;
@@ -780,14 +776,18 @@ begin
   Observe('BackupGatePassed');
   lHasIncidents := Scalar('SELECT COUNT(*) FROM sqlite_master WHERE ' +
     'type=''table'' AND name=''incident''') <> 0;
-  lCount := 0;
+  lCount := -1;
   if lHasIncidents then
     lCount := Scalar('SELECT COUNT(*) FROM incident');
+  lRawCount := -1;
+  if Scalar('SELECT COUNT(*) FROM sqlite_master WHERE type=''table'' AND name=''system_sample_raw''') <> 0 then
+    lRawCount := Scalar('SELECT COUNT(*) FROM system_sample_raw');
   fConnection.Connected := False;
   fConnection.Params.Values['OpenMode'] := 'ReadWrite';
   fConnection.Connected := True;
   fConnection.ExecSQL('PRAGMA wal_checkpoint(TRUNCATE)');
   fConnection.Connected := False;
+  lSourceBytes := TFile.GetSize(fConfig.DatabaseFileName);
   lBackupTime := Now;
   repeat
     lPath := fConfig.DatabaseFileName + '.pre-migration-v' + IntToStr(aVersion) +
@@ -806,7 +806,7 @@ begin
       CopyBackupFile(fConfig.DatabaseFileName + '-wal', lPath + '-wal');
       lWalCopied := True;
     end;
-    if TFile.GetSize(lPath) <> TFile.GetSize(fConfig.DatabaseFileName) then
+    if TFile.GetSize(lPath) <> lSourceBytes then
       raise EInvalidOperation.Create('History backup size verification failed');
     GC(lBackup, TFDConnection.Create(nil), g);
     lBackup.Params.Assign(fConnection.Params);
@@ -816,10 +816,21 @@ begin
     lBackup.ResourceOptions.SilentMode := True;
     lBackup.Connected := True;
     lBackup.ExecSQL('PRAGMA query_only=ON');
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := lBackup;
+    lQuery.Open('PRAGMA user_version');
+    if lQuery.Fields[0].AsInteger <> aVersion then
+      raise EInvalidOperation.Create('History backup source version verification failed');
+    lQuery.Close;
+    if lRawCount >= 0 then
+    begin
+      lQuery.Open('SELECT COUNT(*) FROM system_sample_raw');
+      if lQuery.Fields[0].AsLargeInt <> lRawCount then
+        raise EInvalidOperation.Create('History backup raw count verification failed');
+      lQuery.Close;
+    end;
     if lHasIncidents then
     begin
-      GC(lQuery, TFDQuery.Create(nil), g);
-      lQuery.Connection := lBackup;
       lQuery.Open('SELECT COUNT(*) FROM incident');
       if lQuery.Fields[0].AsLargeInt <> lCount then
         raise EInvalidOperation.Create('History backup incident count verification failed');
@@ -835,12 +846,29 @@ begin
       TFile.Delete(lPath);
     raise;
   end;
-  fBackupPath := lPath;
   fConnection.Connected := True;
   // Persist ownership before any cancellable schema/cleanup work. A rolled-back
   // schema transaction must not orphan the verified safety copy (ACV-074).
   EnsureHistoryStatus;
-  fConnection.ExecSQL('UPDATE history_status SET migration_backup_path=? WHERE id=1', [fBackupPath]);
+  fConnection.ExecSQL('CREATE TABLE IF NOT EXISTS history_migration_backup (' +
+    'path TEXT PRIMARY KEY NOT NULL, source_version INTEGER NOT NULL, source_bytes INTEGER NOT NULL, ' +
+    'incident_count INTEGER NOT NULL, raw_count INTEGER NOT NULL, verified_utc_ms INTEGER NOT NULL)');
+  fConnection.StartTransaction;
+  try
+    // Earlier recorded copies remain owned for cleanup, never verified for this step.
+    if not fBackupPath.IsEmpty then
+      fConnection.ExecSQL('INSERT OR IGNORE INTO history_migration_backup VALUES (?,-1,-1,-1,-1,0)', [fBackupPath]);
+    fConnection.ExecSQL('INSERT INTO history_migration_backup VALUES (?,?,?,?,?,?)',
+      [lPath, aVersion, lSourceBytes, lCount, lRawCount,
+       HistoryUtcMilliseconds(TTimeZone.Local.ToUniversalTime(Now))]);
+    fConnection.ExecSQL('UPDATE history_status SET migration_backup_path=? WHERE id=1', [lPath]);
+    fConnection.Commit;
+  except
+    if fConnection.InTransaction then
+      fConnection.Rollback;
+    raise;
+  end;
+  fBackupPath := lPath;
   Observe('BackupVerified');
 end;
 
@@ -872,7 +900,7 @@ begin
   if not StartsText(lPrefix, lSuffix) then
     Exit;
   Delete(lSuffix, 1, Length(lPrefix));
-  if (Length(lSuffix) <> 20) or not CharInSet(lSuffix[1], ['0', '1', '2']) or
+  if (Length(lSuffix) <> 20) or not CharInSet(lSuffix[1], ['0', '1', '2', '3']) or
     (lSuffix[2] <> '-') or (Copy(lSuffix, 17, 4) <> '.bak') then
     Exit;
   for i := 3 to 16 do
@@ -883,35 +911,59 @@ end;
 
 procedure TMachineOverviewHistoryStore.DeleteMigrationBackup;
 var
+  g: TGarbos;
+  lPaths: TList<string>;
+  lQuery: TFDQuery;
+  lHasRegistry: Boolean;
   lPath, lSuffix: string;
 begin
   if fBackupPath.IsEmpty then
     Exit;
-  Observe('BeforeBackupDeletion');
-  try
-    if not IsMigrationBackupPath(fBackupPath) then
-      raise EInvalidOperation.Create('recorded path does not match this database migration backup name');
-    lPath := TPath.GetFullPath(fBackupPath);
-    // SQLite verification can create these sidecars next to our exact backup.
-    // Never enumerate matching files: other backups may belong to the user.
-    for lSuffix in ['-wal', '-shm', ''] do
-      if TFile.Exists(lPath + lSuffix) then
-        TFile.Delete(lPath + lSuffix);
-    fConnection.ExecSQL('UPDATE history_status SET migration_backup_path='''', last_error=? WHERE id=1',
-      [fStartupError]);
-    fBackupPath := '';
-  except
-    on lException: Exception do
+  g := Default(TGarbos);
+  GC(lPaths, TList<string>.Create, g);
+  lPaths.Add(fBackupPath);
+  lHasRegistry := Scalar('SELECT COUNT(*) FROM sqlite_master WHERE type=''table'' ' +
+    'AND name=''history_migration_backup''') <> 0;
+  if lHasRegistry then
+  begin
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := fConnection;
+    lQuery.Open('SELECT path FROM history_migration_backup ORDER BY path');
+    while not lQuery.Eof do
     begin
-      fStartupError := Trim(fStartupError + ' History backup deletion failed: ' +
-        fBackupPath + ': ' + lException.Message);
-      try
-        fConnection.ExecSQL('UPDATE history_status SET last_error=? WHERE id=1', [fStartupError]);
-      except
-        on lStatusError: Exception do
-          fStartupError := fStartupError + '; recording backup deletion status failed: ' + lStatusError.Message;
+      lPath := lQuery.Fields[0].AsWideString;
+      if lPath <> fBackupPath then
+        lPaths.Add(lPath);
+      lQuery.Next;
+    end;
+    lQuery.Close;
+  end;
+  Observe('BeforeBackupDeletion');
+  fBackupPath := '';
+  for lPath in lPaths do
+    try
+      if not IsMigrationBackupPath(lPath) then
+        raise EInvalidOperation.Create('recorded path does not match this database migration backup name');
+      // Exact recorded ownership only; never enumerate similarly named files.
+      for lSuffix in ['-wal', '-shm', ''] do
+        if TFile.Exists(lPath + lSuffix) then
+          TFile.Delete(lPath + lSuffix);
+      if lHasRegistry then
+        fConnection.ExecSQL('DELETE FROM history_migration_backup WHERE path=?', [lPath]);
+    except
+      on lException: Exception do
+      begin
+        fBackupPath := lPath;
+        fStartupError := Trim(fStartupError + ' History backup deletion failed: ' +
+          lPath + ': ' + lException.Message);
       end;
     end;
+  try
+    fConnection.ExecSQL('UPDATE history_status SET migration_backup_path=?, last_error=? WHERE id=1',
+      [fBackupPath, fStartupError]);
+  except
+    on lStatusError: Exception do
+      fStartupError := fStartupError + '; recording backup deletion status failed: ' + lStatusError.Message;
   end;
 end;
 
@@ -1104,14 +1156,9 @@ begin
   ReadMigrationBackupPath;
   if fDatabaseExisted and (lVersion < cMachineOverviewHistorySchemaVersion) then
   begin
-    if IsMigrationBackupPath(fBackupPath) and TFile.Exists(fBackupPath) then
-    begin
-      fConnection.Connected := False;
-      fConnection.Params.Values['OpenMode'] := 'ReadWrite';
-      fConnection.Connected := True;
-      Observe('BackupVerified');
-    end else
-      BackupDatabase(lVersion);
+    // A restart before the schema commit can have later source writes. Always
+    // copy the current input; a recorded path is ownership, never proof of identity.
+    BackupDatabase(lVersion);
   end
   else if fDatabaseExisted then
   begin
@@ -1200,6 +1247,10 @@ begin
     EnsureColumn('incident', 'post_context_json',
       'TEXT NOT NULL DEFAULT ''[]''');
     EnsureColumn('incident', 'evidence_state', 'INTEGER NOT NULL DEFAULT 0');
+    EnsureColumn('incident', 'trace_file', 'TEXT NOT NULL DEFAULT ''''');
+    EnsureColumn('incident', 'trace_detail', 'TEXT NOT NULL DEFAULT ''''');
+    EnsureColumn('system_sample_raw', 'paging_bytes_per_sec', 'REAL NOT NULL DEFAULT -1');
+    EnsureColumn('system_sample_raw', 'physical_used_percent', 'REAL NOT NULL DEFAULT -1');
     EnsureColumn('process_top_sample', 'interval_ms', 'INTEGER NOT NULL DEFAULT 0');
     EnsureColumn('process_top_sample', 'logical_processor_count', 'INTEGER NOT NULL DEFAULT 0');
     fConnection.ExecSQL('CREATE TABLE IF NOT EXISTS incident_evidence (' +
@@ -1270,10 +1321,10 @@ begin
   fSystemInsert.Connection := fConnection;
   fSystemInsert.SQL.Text := 'INSERT INTO system_sample_raw(utc_ms, ' +
     'monotonic_ms, provider_status, provider_error, cpu_available, ' +
-    'cpu_total, physical_available_bytes, logical_cpu_blob) VALUES ' +
+    'cpu_total, physical_available_bytes, logical_cpu_blob, paging_bytes_per_sec, physical_used_percent) VALUES ' +
     '(:utc_ms, :monotonic_ms, :provider_status, :provider_error, ' +
     ':cpu_available, :cpu_total, :physical_available_bytes, ' +
-    ':logical_cpu_blob)';
+    ':logical_cpu_blob, :paging_bytes_per_sec, :physical_used_percent)';
   fSystemInsert.ParamByName('utc_ms').DataType := ftLargeint;
   fSystemInsert.ParamByName('monotonic_ms').DataType := ftLargeint;
   fSystemInsert.ParamByName('provider_status').DataType := ftInteger;
@@ -1282,6 +1333,8 @@ begin
   fSystemInsert.ParamByName('cpu_total').DataType := ftFloat;
   fSystemInsert.ParamByName('physical_available_bytes').DataType := ftFloat;
   fSystemInsert.ParamByName('logical_cpu_blob').DataType := ftBlob;
+  fSystemInsert.ParamByName('paging_bytes_per_sec').DataType := ftFloat;
+  fSystemInsert.ParamByName('physical_used_percent').DataType := ftFloat;
   fSystemInsert.Prepare;
   fDiskInsert := TFDQuery.Create(nil);
   fDiskInsert.Connection := fConnection;
@@ -1655,6 +1708,7 @@ var
   lCpu: TMachineOverviewMeasurement;
   lLogicalData: TBytes;
   lPhysicalAvailable: TMachineOverviewMeasurement;
+  lPaging, lPhysicalUsed: TMachineOverviewMeasurement;
   lProviderSample: TMachineOverviewProviderSample;
   lStream: TBytesStream;
   lUtcMs: Int64;
@@ -1664,6 +1718,14 @@ begin
   FindHistoryMeasurement(lProviderSample, 'cpu_total_percent', lCpu);
   FindHistoryMeasurement(lProviderSample, 'physical_available_bytes',
     lPhysicalAvailable);
+  FindHistoryMeasurement(lProviderSample, 'paging_bytes_per_sec', lPaging);
+  FindHistoryMeasurement(lProviderSample, 'physical_used_percent', lPhysicalUsed);
+  fSystemInsert.ParamByName('paging_bytes_per_sec').AsFloat := -1;
+  if lPaging.Available then
+    fSystemInsert.ParamByName('paging_bytes_per_sec').AsFloat := lPaging.Value;
+  fSystemInsert.ParamByName('physical_used_percent').AsFloat := -1;
+  if lPhysicalUsed.Available then
+    fSystemInsert.ParamByName('physical_used_percent').AsFloat := lPhysicalUsed.Value;
   lLogicalData := PackMachineOverviewLogicalProcessors(
     HistoryLogicalProcessors(lProviderSample));
   fSystemInsert.ParamByName('utc_ms').AsLargeInt := lUtcMs;
@@ -2996,7 +3058,7 @@ var
   lIndex: Integer;
   lOrdinal: Integer;
   lQuery: TFDQuery;
-  lStage, lEvidenceColumn: string;
+  lStage, lEvidenceColumn, lTraceColumns: string;
   lVersion: Integer;
 begin
   aIncidents := nil;
@@ -3042,7 +3104,11 @@ begin
       lEvidenceColumn := '5 AS evidence_state';
     end else
       lEvidenceColumn := 'evidence_state';
-      lQuery.SQL.Text := 'SELECT incident_key, ' +
+    if lVersion >= 4 then
+      lTraceColumns := 'trace_file, trace_detail, '
+    else
+      lTraceColumns := ''''' AS trace_file, '''' AS trace_detail, ';
+    lQuery.SQL.Text := 'SELECT ' + lTraceColumns + 'incident_key, ' +
         'CAST(started_utc_ms AS TEXT) AS started_utc_ms_text, ' +
         'CAST(peak_utc_ms AS TEXT) AS peak_utc_ms_text, ' +
         'CAST(ended_utc_ms AS TEXT) AS ended_utc_ms_text, ' +
@@ -3071,6 +3137,8 @@ begin
           raise EConvertError.Create('Invalid incident evidence state');
         lIncident.Evidence.State := TMachineOverviewEvidenceState(lOrdinal);
         lIncident.StableId := lQuery.FieldByName('incident_key').AsWideString;
+        lIncident.TraceFile := lQuery.FieldByName('trace_file').AsWideString;
+        lIncident.TraceDetail := lQuery.FieldByName('trace_detail').AsWideString;
         lIncident.StartedAtUtc := HistoryDateTimeFromMilliseconds(
           HistoryFieldInt64(lQuery.FieldByName('started_utc_ms_text')));
         lIncident.PeakAtUtc := HistoryDateTimeFromMilliseconds(
@@ -3182,7 +3250,7 @@ begin
       aError := rsHistoryUpgradePending;
       Exit;
     end;
-    if lVersion <> cMachineOverviewHistorySchemaVersion then
+    if (lVersion < 3) or (lVersion > cMachineOverviewHistorySchemaVersion) then
       raise EInvalidOperation.CreateFmt('Unsupported history reader schema %d', [lVersion]);
     // SQLite INTEGER metadata can resolve to ftInteger. Cast persisted 64-bit
     // counters and timestamps to text before conversion, as in our headline reader.
@@ -3291,7 +3359,7 @@ begin
       aError := rsHistoryUpgradePending;
       Exit(True);
     end;
-    if lVersion <> cMachineOverviewHistorySchemaVersion then
+    if (lVersion < 3) or (lVersion > cMachineOverviewHistorySchemaVersion) then
       raise EInvalidOperation.CreateFmt('Unsupported history reader schema %d', [lVersion]);
     lQuery.SQL.Text := 'SELECT i.evidence_state, e.state, e.byte_count, ' +
       'CASE WHEN e.byte_count<=16384 AND length(CAST(e.evidence_json AS BLOB))<=16384 ' +

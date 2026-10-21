@@ -1,4 +1,4 @@
-unit ActiveAppView.MachineOverview.Incidents;
+﻿unit ActiveAppView.MachineOverview.Incidents;
 
 interface
 
@@ -81,6 +81,7 @@ type
     RelatedEntityIds: TArray<string>;
     RelatedExecutablePaths: TArray<string>;
     TraceStatus: TMachineOverviewIncidentTraceStatus;
+    TraceFile, TraceDetail: string;
     Evidence: TMachineOverviewIncidentEvidence;
   end;
 
@@ -95,6 +96,7 @@ type
     CapturedAtMonotonicMs: UInt64;
     TotalCpu: TMachineOverviewOptionalDouble;
     HotLogicalProcessorCount: Integer;
+    LogicalProcessorCount: Integer;
     DpcPercent: TMachineOverviewOptionalDouble;
     InterruptPercent: TMachineOverviewOptionalDouble;
     ForegroundReplyMs: TMachineOverviewOptionalDouble;
@@ -124,11 +126,15 @@ type
     HighCpuRecoveryDurationMs: UInt64;
     SignalActivationDurationMs: UInt64;
     SignalRecoveryDurationMs: UInt64;
-    HotLogicalProcessorCount: Integer;
+    HotLogicalProcessorMinimumCount: Integer;
+    HotLogicalProcessorFraction: Double;
+    HotLogicalProcessorActivationDurationMs: UInt64;
+    HotLogicalProcessorRecoveryDurationMs: UInt64;
     DpcInterruptPercent: Double;
     ForegroundReplyMs: Double;
     DwmMissedFrames: Integer;
     PhysicalUsedPercent: Double;
+    PagingPhysicalUsedPercent: Double;
     PagingBytesPerSecond: Double;
     DiskActivePercent: Double;
     DiskLatencyMs: Double;
@@ -255,6 +261,8 @@ function BuildRuleEvaluation(
 var
   lDpcValue: Double;
   lPagingMegabytes: Double;
+  lHotCount: Integer;
+  lHighCpu: Boolean;
 begin
   Result := Default(TMachineOverviewIncidentRuleEvaluation);
   Result.Severity := TMachineOverviewSeverity.Warning;
@@ -280,16 +288,20 @@ begin
       end;
     TMachineOverviewIncidentCategory.HotLogicalProcessors:
       begin
-        Result.Triggered := aSignals.HotLogicalProcessorCount >=
-          aThresholds.HotLogicalProcessorCount;
-        Result.Recovered := aSignals.HotLogicalProcessorCount = 0;
+        lHotCount := Max(aThresholds.HotLogicalProcessorMinimumCount,
+          Ceil(Max(0, aSignals.LogicalProcessorCount) * aThresholds.HotLogicalProcessorFraction));
+        lHighCpu := aSignals.TotalCpu.Available and
+          (aSignals.TotalCpu.Value >= aThresholds.HighCpuActivationPercent);
+        Result.Triggered := (aSignals.HotLogicalProcessorCount >= lHotCount) and not lHighCpu;
+        Result.Recovered := (aSignals.HotLogicalProcessorCount < lHotCount) or lHighCpu;
         Result.PeakValue := aSignals.HotLogicalProcessorCount;
-        Result.Summary := Format('%d logical processors are hot',
-          [aSignals.HotLogicalProcessorCount]);
-        Result.Explanation :=
-          'Several logical processors remained locally saturated';
-        Result.ThresholdText := Format('activate >= %d hot processors; ' +
-          'recover at 0', [aThresholds.HotLogicalProcessorCount]);
+        Result.Summary := Format('%d logical processors are hot', [aSignals.HotLogicalProcessorCount]);
+        Result.Explanation := 'Several logical processors remained locally saturated';
+        Result.ThresholdText := Format('activate >= %d of %d logical processors hot ' +
+        '(5 s average >= 80%%) for %d ms while total CPU < %s%%; recover below %d for %d ms',
+          [lHotCount, aSignals.LogicalProcessorCount, aThresholds.HotLogicalProcessorActivationDurationMs,
+          FloatToStrF(aThresholds.HighCpuActivationPercent, ffFixed, 8, 1, TFormatSettings.Invariant),
+          lHotCount, aThresholds.HotLogicalProcessorRecoveryDurationMs]);
       end;
     TMachineOverviewIncidentCategory.DpcInterrupt:
       begin
@@ -363,12 +375,11 @@ begin
            (aSignals.PhysicalUsedPercent.Value >=
             aThresholds.PhysicalUsedPercent)) or
           (aSignals.PagingBytesPerSecond.Available and
-           (aSignals.PagingBytesPerSecond.Value >=
-            aThresholds.PagingBytesPerSecond));
+           (aSignals.PagingBytesPerSecond.Value >= aThresholds.PagingBytesPerSecond) and
+           aSignals.PhysicalUsedPercent.Available and
+           (aSignals.PhysicalUsedPercent.Value >= aThresholds.PagingPhysicalUsedPercent));
         Result.Recovered := aSignals.PhysicalUsedPercent.Available and
-          aSignals.PagingBytesPerSecond.Available and
-          (aSignals.PhysicalUsedPercent.Value <= 90) and
-          (aSignals.PagingBytesPerSecond.Value <= 10 * 1024 * 1024);
+          (aSignals.PhysicalUsedPercent.Value < aThresholds.PagingPhysicalUsedPercent);
         if aSignals.PhysicalUsedPercent.Available and
           (aSignals.PhysicalUsedPercent.Value >=
            aThresholds.PhysicalUsedPercent) then
@@ -385,11 +396,12 @@ begin
         Result.Severity := TMachineOverviewSeverity.Critical;
         Result.Explanation :=
           'Physical-memory pressure or paging remained severe';
-        Result.ThresholdText := Format(
-          'activate >= %.1f%% used or >= %.0f MB/s paging',
-          [aThresholds.PhysicalUsedPercent,
-           aThresholds.PagingBytesPerSecond / (1024 * 1024)],
-          TFormatSettings.Invariant);
+        Result.ThresholdText := Format('activate >= %s%% used, or >= %s MB/s ' +
+          'paging while >= %s%% used; recover below %s%% used',
+          [FloatToStrF(aThresholds.PhysicalUsedPercent, ffFixed, 8, 1, TFormatSettings.Invariant),
+          FloatToStrF(aThresholds.PagingBytesPerSecond / (1024 * 1024), ffFixed, 8, 0, TFormatSettings.Invariant),
+          FloatToStrF(aThresholds.PagingPhysicalUsedPercent, ffFixed, 8, 1, TFormatSettings.Invariant),
+          FloatToStrF(aThresholds.PagingPhysicalUsedPercent, ffFixed, 8, 1, TFormatSettings.Invariant)]);
       end;
     TMachineOverviewIncidentCategory.DiskPressure:
       begin
@@ -527,6 +539,8 @@ function ActivationDurationMs(
 begin
   if aCategory = TMachineOverviewIncidentCategory.HighCpu then
     Result := aState.Thresholds.HighCpuActivationDurationMs
+  else if aCategory = TMachineOverviewIncidentCategory.HotLogicalProcessors then
+    Result := aState.Thresholds.HotLogicalProcessorActivationDurationMs
   else
     Result := aState.Thresholds.SignalActivationDurationMs;
 end;
@@ -537,6 +551,8 @@ function RecoveryDurationMs(
 begin
   if aCategory = TMachineOverviewIncidentCategory.HighCpu then
     Result := aState.Thresholds.HighCpuRecoveryDurationMs
+  else if aCategory = TMachineOverviewIncidentCategory.HotLogicalProcessors then
+    Result := aState.Thresholds.HotLogicalProcessorRecoveryDurationMs
   else
     Result := aState.Thresholds.SignalRecoveryDurationMs;
 end;
@@ -551,7 +567,11 @@ begin
   Result.HighCpuRecoveryDurationMs := 10000;
   Result.SignalActivationDurationMs := 5000;
   Result.SignalRecoveryDurationMs := 5000;
-  Result.HotLogicalProcessorCount := 2;
+  Result.HotLogicalProcessorMinimumCount := 2;
+  Result.HotLogicalProcessorFraction := 0.125;
+  Result.HotLogicalProcessorActivationDurationMs := 30000;
+  Result.HotLogicalProcessorRecoveryDurationMs := 10000;
+  Result.PagingPhysicalUsedPercent := 90;
   Result.DpcInterruptPercent := 15;
   Result.ForegroundReplyMs := 1000;
   Result.DwmMissedFrames := 5;
@@ -573,8 +593,15 @@ begin
   if (aThresholds.HighCpuActivationDurationMs = 0) or
     (aThresholds.HighCpuRecoveryDurationMs = 0) or
     (aThresholds.SignalActivationDurationMs = 0) or
-    (aThresholds.SignalRecoveryDurationMs = 0) then
+    (aThresholds.SignalRecoveryDurationMs = 0) or
+    (aThresholds.HotLogicalProcessorActivationDurationMs = 0) or
+    (aThresholds.HotLogicalProcessorRecoveryDurationMs = 0) then
     raise EArgumentException.Create('Incident durations must be positive');
+  if (aThresholds.HotLogicalProcessorMinimumCount < 1) or
+    IsNan(aThresholds.HotLogicalProcessorFraction) or
+    (aThresholds.HotLogicalProcessorFraction <= 0) or
+    (aThresholds.HotLogicalProcessorFraction > 1) then
+    raise EArgumentException.Create('Hot logical processor thresholds are invalid');
   fState := TMachineOverviewIncidentDetectorState.Create(aThresholds);
 end;
 
