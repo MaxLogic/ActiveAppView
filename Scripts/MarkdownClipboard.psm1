@@ -572,94 +572,6 @@ function Copy-MarkdownAsRichText {
     return $Format
 }
 
-function ConvertFrom-MarkdownClipboardMenuKey {
-    [OutputType([string])]
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Key
-    )
-
-    switch ($Key) {
-        'Enter' { return 'Html' }
-        'D1' { return 'Html' }
-        'NumPad1' { return 'Html' }
-        'D2' { return 'Rtf' }
-        'NumPad2' { return 'Rtf' }
-        'D3' { return 'Plain' }
-        'NumPad3' { return 'Plain' }
-        'Escape' { return 'Cancel' }
-        default { return $null }
-    }
-}
-
-function Read-MarkdownClipboardFormatChoice {
-    [CmdletBinding()]
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'The console menu is the intended user interface.')]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SourceLabel,
-
-        [Parameter(Mandatory = $true)]
-        [int]$CharacterCount
-    )
-
-    $lCountText = $CharacterCount.ToString('N0', [Globalization.CultureInfo]::InvariantCulture)
-
-    Write-Host ''
-    Write-Host ("Clipboard: {0} ({1} characters)" -f $SourceLabel, $lCountText)
-    Write-Host '  1  HTML    paste into Jira, OWA, Thunderbird compose, rich editors'
-    Write-Host '  2  RTF     paste into Delphi RichEdit fields and WordPad-class apps'
-    Write-Host '  3  Plain   readable text without formatting (pandoc -t plain)'
-    Write-Host '  Esc        cancel without changing the clipboard'
-    Write-Host ''
-
-    while ($true) {
-        Write-Host 'Choice [1]: ' -NoNewline
-        $lKey = [Console]::ReadKey($true)
-        Write-Host ''
-
-        $lChoice = ConvertFrom-MarkdownClipboardMenuKey -Key $lKey.Key.ToString()
-        if ($null -eq $lChoice) {
-            Write-Host 'Press 1, 2, 3, or Esc.'
-            continue
-        }
-
-        if ($lChoice -eq 'Cancel') {
-            return $null
-        }
-
-        return $lChoice
-    }
-}
-
-function Resolve-MarkdownClipboardFormatChoice {
-    [OutputType([string])]
-    [CmdletBinding()]
-    param(
-        [AllowEmptyString()]
-        [string]$Format,
-
-        [switch]$ReturnToCaller,
-
-        [Parameter(Mandatory = $true)]
-        [string]$SourceLabel,
-
-        [Parameter(Mandatory = $true)]
-        [int]$CharacterCount
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($Format)) {
-        return $Format
-    }
-
-    if ($ReturnToCaller) {
-        return 'Html'
-    }
-
-    # A cancelled menu returns nothing; the caller decides how to exit.
-    return Read-MarkdownClipboardFormatChoice -SourceLabel $SourceLabel -CharacterCount $CharacterCount
-}
 function Invoke-MarkdownClipboardNoContentNotification {
     [CmdletBinding()]
     param()
@@ -683,7 +595,6 @@ function Invoke-MarkdownClipboardNoContentNotification {
 }
 
 Export-ModuleMember -Function @(
-    'ConvertFrom-MarkdownClipboardMenuKey'
     'ConvertFrom-MarkdownRawContent'
     'Convert-MarkdownToHtmlFragment'
     'Convert-MarkdownToPlainText'
@@ -693,8 +604,6 @@ Export-ModuleMember -Function @(
     'Get-MarkdownClipboardContent'
     'Invoke-MarkdownClipboardNoContentNotification'
     'Invoke-Pandoc'
-    'Read-MarkdownClipboardFormatChoice'
-    'Resolve-MarkdownClipboardFormatChoice'
     'Resolve-MarkdownClipboardContent'
     'Resolve-PandocPath'
     'Test-MarkdownFilePath'

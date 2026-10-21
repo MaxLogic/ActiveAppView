@@ -2,9 +2,6 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Html', 'Rtf', 'Plain')]
-    [string]$Format,
-
     [switch]$ReturnToCaller
 )
 
@@ -20,12 +17,7 @@ try {
         throw 'Clipboard does not contain markdown.'
     }
 
-    $lFormat = Resolve-MarkdownClipboardFormatChoice -Format $Format -ReturnToCaller:$ReturnToCaller -SourceLabel $lContent.SourceLabel -CharacterCount $lContent.Markdown.Length
-    if ($null -eq $lFormat) {
-        [Environment]::Exit(0)
-    }
-
-    $null = Copy-MarkdownAsRichText -Markdown $lContent.Markdown -Format $lFormat
+    $null = Copy-MarkdownAsRichText -Markdown $lContent.Markdown -Format Html
 
     if ($ReturnToCaller) {
         return

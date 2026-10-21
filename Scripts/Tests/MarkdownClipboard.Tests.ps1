@@ -301,47 +301,6 @@ Describe 'Pandoc conversions' {
     }
 }
 
-Describe 'ConvertFrom-MarkdownClipboardMenuKey' {
-    It 'maps enter and the number keys to formats' {
-        ConvertFrom-MarkdownClipboardMenuKey -Key 'Enter' | Should -Be 'Html'
-        ConvertFrom-MarkdownClipboardMenuKey -Key 'D1' | Should -Be 'Html'
-        ConvertFrom-MarkdownClipboardMenuKey -Key 'NumPad1' | Should -Be 'Html'
-        ConvertFrom-MarkdownClipboardMenuKey -Key 'D2' | Should -Be 'Rtf'
-        ConvertFrom-MarkdownClipboardMenuKey -Key 'NumPad2' | Should -Be 'Rtf'
-        ConvertFrom-MarkdownClipboardMenuKey -Key 'D3' | Should -Be 'Plain'
-        ConvertFrom-MarkdownClipboardMenuKey -Key 'NumPad3' | Should -Be 'Plain'
-    }
-
-    It 'maps escape to cancel and ignores other keys' {
-        ConvertFrom-MarkdownClipboardMenuKey -Key 'Escape' | Should -Be 'Cancel'
-        ConvertFrom-MarkdownClipboardMenuKey -Key 'D9' | Should -BeNullOrEmpty
-        ConvertFrom-MarkdownClipboardMenuKey -Key 'A' | Should -BeNullOrEmpty
-    }
-}
-
-Describe 'Resolve-MarkdownClipboardFormatChoice' {
-    It 'keeps an explicit format without asking the menu' {
-        Resolve-MarkdownClipboardFormatChoice -Format 'Rtf' -SourceLabel 'clipboard text' -CharacterCount 10 | Should -Be 'Rtf'
-    }
-
-    It 'defaults to HTML for caller returns' {
-        Resolve-MarkdownClipboardFormatChoice -Format '' -ReturnToCaller -SourceLabel 'clipboard text' -CharacterCount 10 | Should -Be 'Html'
-    }
-
-    It 'returns the menu choice' {
-        Mock -ModuleName MarkdownClipboard Read-MarkdownClipboardFormatChoice { 'Plain' }
-
-        Resolve-MarkdownClipboardFormatChoice -Format '' -SourceLabel 'clipboard text' -CharacterCount 10 | Should -Be 'Plain'
-    }
-
-    It 'reports a cancelled menu instead of failing format validation' {
-        Mock -ModuleName MarkdownClipboard Read-MarkdownClipboardFormatChoice { $null }
-
-        { Resolve-MarkdownClipboardFormatChoice -Format '' -SourceLabel 'clipboard text' -CharacterCount 10 } | Should -Not -Throw
-        Resolve-MarkdownClipboardFormatChoice -Format '' -SourceLabel 'clipboard text' -CharacterCount 10 | Should -BeNullOrEmpty
-    }
-}
-
 Describe 'Markdown clipboard entry point' {
     BeforeAll {
         $script:entryScriptPath = Join-Path $PSScriptRoot '..\Copy-MarkdownAsRichText.ps1'
@@ -358,9 +317,10 @@ Describe 'Markdown clipboard entry point' {
         $script:entryScriptText | Should -Match 'Import-Module'
     }
 
-    It 'offers HTML, RTF, and plain text formats' {
-        $script:entryScriptText | Should -Match "ValidateSet\('Html', 'Rtf', 'Plain'\)"
-        $script:entryScriptText | Should -Match 'Resolve-MarkdownClipboardFormatChoice'
+    It 'has no format parameter or menu' {
+        $command = Get-Command $script:entryScriptPath
+        $command.Parameters.ContainsKey('Format') | Should -BeFalse
+        $script:entryScriptText | Should -Not -Match 'FormatChoice|ReadKey'
     }
 
     It 'plays the no content notification and supports caller returns' {
@@ -369,10 +329,7 @@ Describe 'Markdown clipboard entry point' {
         $script:entryScriptText | Should -Match 'Copy-MarkdownAsRichText'
     }
 
-    It 'cancels cleanly when the menu is cancelled' {
-        $script:entryScriptText | Should -Match 'Resolve-MarkdownClipboardFormatChoice'
-        $script:entryScriptText | Should -Match 'if \(\$null -eq \$lFormat\)\s*\{\s*\[Environment\]::Exit\(0\)'
-    }
+
 }
 
 Describe 'Clipboard notification audio' {
@@ -386,5 +343,28 @@ Describe 'Clipboard notification audio' {
             [Text.Encoding]::ASCII.GetString($lBytes, 0, 4) | Should -Be 'RIFF'
             [Text.Encoding]::ASCII.GetString($lBytes, 8, 4) | Should -Be 'WAVE'
         }
+    }
+}
+Describe 'Markdown clipboard entry behavior' {
+    BeforeEach {
+        Mock Import-Module {}
+        Mock Get-MarkdownClipboardContent { [pscustomobject]@{ Markdown = '# Heading'; SourceLabel = 'clipboard text' } }
+        Mock Copy-MarkdownAsRichText {}
+        Mock Invoke-MarkdownClipboardNoContentNotification {}
+    }
+
+    It 'converts directly to HTML without requesting a format' {
+        & (Join-Path $PSScriptRoot '..\Copy-MarkdownAsRichText.ps1') -ReturnToCaller
+        Should -Invoke Copy-MarkdownAsRichText -Times 1 -Exactly -ParameterFilter {
+            $Markdown -eq '# Heading' -and $Format -eq 'Html'
+        }
+    }
+
+    It 'notifies and fails when no markdown is available' {
+        Mock Get-MarkdownClipboardContent { $null }
+        { & (Join-Path $PSScriptRoot '..\Copy-MarkdownAsRichText.ps1') -ReturnToCaller } |
+            Should -Throw -ExpectedMessage 'Clipboard does not contain markdown.'
+        Should -Invoke Invoke-MarkdownClipboardNoContentNotification -Times 1 -Exactly
+        Should -Invoke Copy-MarkdownAsRichText -Times 0 -Exactly
     }
 }
