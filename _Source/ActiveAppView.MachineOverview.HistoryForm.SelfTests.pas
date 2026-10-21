@@ -47,14 +47,7 @@ begin
     TArray<string>.Create('C:\Test\history.exe');
   Result.Incident.TraceStatus :=
     TMachineOverviewIncidentTraceStatus.Captured;
-  SetLength(Result.Incident.PreContext, 1);
-  Result.Incident.PreContext[0].CapturedAtUtc := IncSecond(aUtc, -1);
-  Result.Incident.PreContext[0].ProviderId := 'test-provider';
-  Result.Incident.PreContext[0].Summary := 'before ' + aId;
-  SetLength(Result.Incident.PostContext, 1);
-  Result.Incident.PostContext[0].CapturedAtUtc := IncSecond(aUtc, 3);
-  Result.Incident.PostContext[0].ProviderId := 'test-provider';
-  Result.Incident.PostContext[0].Summary := 'after ' + aId;
+
 end;
 
 function CreateHistoryConfig(const aDatabaseFileName: string):

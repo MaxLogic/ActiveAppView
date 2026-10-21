@@ -92,6 +92,7 @@ begin
       else
         lTemperatureIntervalMs := UInt64(
           TMachineOverviewSettings.Defaults.TemperatureSampleIntervalMs);
+      fPipeline.ConfigureEvidence(lHistoryConfig.ProcessSampleIntervalMs, lHistoryConfig.SystemSampleIntervalMs);
       fSystemCollector := TMachineOverviewSystemCollector.Create(fPipeline,
         lSystemIntervalMs);
       fDiskCollector := TMachineOverviewSystemCollector.Create(fPipeline,

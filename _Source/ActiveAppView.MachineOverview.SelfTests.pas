@@ -18,6 +18,7 @@ uses
   ActiveAppView.MachineOverview.HelpForm,
   ActiveAppView.MachineOverview.History.SelfTests,
   ActiveAppView.MachineOverview.HistoryForm.SelfTests,
+  ActiveAppView.MachineOverview.Incidents,
   ActiveAppView.MachineOverview.Incidents.SelfTests,
   ActiveAppView.MachineOverview.Layout,
   ActiveAppView.MachineOverview.OptionalProviders.SelfTests,
@@ -2270,6 +2271,65 @@ begin
   Result := CreateMachineOverviewRawSample(lSample);
 end;
 
+function RunPipelineIncidentMemoryBoundSelfTest: Integer;
+var
+  g: TGarbos;
+  lPipeline: TMachineOverviewPipeline;
+  lIncidents: TArray<TMachineOverviewIncident>;
+  lUtc: TDateTime;
+  lSample: TMachineOverviewProviderSample;
+  i: Int64;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  GC(lPipeline, TMachineOverviewPipeline.Create(16, 16), g);
+  lUtc := EncodeDate(2026, 10, 21);
+  SetLength(lIncidents, 2000);
+  for i := 0 to High(lIncidents) do
+  begin
+    lIncidents[i].StableId := 'memory-bound-' + IntToStr(i);
+    lIncidents[i].StartedAtUtc := IncSecond(lUtc, i * 130);
+    lIncidents[i].Evidence.ProcessIntervalMs := 5000;
+    SetLength(lIncidents[i].Evidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes, 1);
+    lIncidents[i].Evidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes[0].DisplayName :=
+      'must-not-be-retained.exe';
+  end;
+  lPipeline.MergePersistedIncidents(lIncidents);
+  if lPipeline.Diagnostics.StoredIncidentEvidenceCount <> 0 then
+    raise Exception.Create('Pipeline incident dictionary retained evidence payloads');
+  if (lPipeline.IncidentCount < 690) or (lPipeline.IncidentCount > 700) then
+  begin
+    Writeln('SELFTEST FAILED: pipeline incident dictionary is not bounded to 25 h: ' +
+      IntToStr(lPipeline.IncidentCount));
+    Exit;
+  end;
+  lPipeline.Start;
+  if not lPipeline.WaitUntilRunning(5000) then
+    raise Exception.Create('Memory-bound pipeline did not start');
+  lSample := Default(TMachineOverviewProviderSample);
+  lSample.State.ProviderId := 'windows-core';
+  lSample.State.Status := TMachineOverviewProviderStatus.Available;
+  lSample.State.CapturedAtUtc := IncHour(lIncidents[High(lIncidents)].StartedAtUtc, 26);
+  lSample.State.CapturedAtMonotonicMs := 1000;
+  if lPipeline.EnqueueRaw(CreateMachineOverviewRawSample(lSample)) <> TMachineOverviewEnqueueResult.Queued then
+    raise Exception.Create('Memory-bound sample was not queued');
+  if (not lPipeline.WaitForSequence(1, 5000)) or (lPipeline.IncidentCount <> 0) then
+    raise Exception.Create('Idle samples did not prune expired incident headlines');
+  // A backward UTC step and old hydration cannot resurrect expired incidents.
+  lSample.State.CapturedAtUtc := lUtc;
+  lSample.State.CapturedAtMonotonicMs := 2000;
+  if lPipeline.EnqueueRaw(CreateMachineOverviewRawSample(lSample)) <> TMachineOverviewEnqueueResult.Queued then
+    raise Exception.Create('Memory-bound sample was not queued');
+  if not lPipeline.WaitForSequence(2, 5000) then
+    raise Exception.Create('Backward UTC sample did not publish');
+  lPipeline.MergePersistedIncidents(lIncidents);
+  if (lPipeline.IncidentCount <> 0) or
+    (lPipeline.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+    raise Exception.Create('Backward UTC step extended in-memory retention');
+  Writeln('SELFTEST PASS: pipeline incident memory bound over 2000 incidents / three days');
+  Result := 0;
+end;
+
 function RunPipelineQueueOverflowSelfTest: Integer;
 var
   g: TGarbos;
@@ -3568,6 +3628,9 @@ begin
   begin
     try
       Result := RunPipelineQueueOverflowSelfTest;
+      lTestResult := RunPipelineIncidentMemoryBoundSelfTest;
+      if lTestResult <> 0 then
+        Result := lTestResult;
       lTestResult := RunPipelineInvalidCapacitySelfTest;
       if lTestResult <> 0 then
         Result := lTestResult;

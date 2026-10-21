@@ -25,6 +25,8 @@ type
     TraceQueueDepth: Integer;
     ActiveWorkerCount: Integer;
     AggregatorThreadId: Cardinal;
+    StoredIncidentEvidenceCount: Integer;
+    EvidenceSampleCount, EvidenceElapsedTicks: Int64;
   end;
 
   IMachineOverviewRawSample = interface(IInterface)
@@ -101,6 +103,7 @@ type
       const aChange: TMachineOverviewIncidentChange);
     procedure SetDetailedTraceEnabled(const aEnabled: Boolean);
     procedure SetHistoryEnabled(const aEnabled: Boolean);
+    procedure ConfigureEvidence(const aProcessMs, aSystemMs: Cardinal);
     procedure MergePersistedIncidents(
       const aIncidents: TArray<TMachineOverviewIncident>);
     function WaitUntilRunning(const aTimeoutMs: Cardinal): Boolean;
@@ -121,10 +124,11 @@ function CreateMachineOverviewRawSample(
 implementation
 
 uses
-  System.Classes, System.DateUtils, System.Generics.Collections, System.Math,
+  System.Classes, System.DateUtils, System.Diagnostics, System.Generics.Collections, System.Math,
   System.StrUtils, System.SyncObjs, System.SysUtils,
   Winapi.Windows,
   ActiveAppView.MachineOverview.Domain,
+  ActiveAppView.MachineOverview.Evidence,
   ActiveAppView.MachineOverview.Presentation,
   ActiveAppView.MachineOverview.TemperatureProvider,
   ActiveAppView.MachineOverview.Trace,
@@ -148,6 +152,9 @@ type
     IncidentQueue: TThreadedQueue<TMachineOverviewIncidentChange>;
     IncidentLock: TCriticalSection;
     Incidents: TDictionary<string, TMachineOverviewIncident>;
+    EvidenceConfig: TMachineOverviewEvidenceConfig;
+    EvidenceSampleCount, EvidenceElapsedTicks: Int64;
+    NewestIncidentUtc: TDateTime;
     HistoryWriterDropped: Int64;
     HistoryWriterQueueDepth: Integer;
     LastSQLiteCommitAvailable: Boolean;
@@ -173,6 +180,7 @@ type
     constructor Create(const aRawQueueCapacity, aHistoryQueueCapacity: Integer);
     destructor Destroy; override;
     procedure ApplyIncident(const aIncident: TMachineOverviewIncident);
+    procedure PruneIncidents(const aNowUtc: TDateTime);
     procedure PublishIncidentChange(
       const aChange: TMachineOverviewIncidentChange);
     procedure RequestDetailedTrace(
@@ -227,6 +235,8 @@ type
   private
     fCpuAggregator: TMachineOverviewDomainAggregator;
     fIncidentDetector: TMachineOverviewIncidentDetector;
+    fEvidenceRecorder: TMachineOverviewEvidenceRecorder;
+    fEvidenceElapsedTicks: Int64;
     fLastRecordsDropped: Int64;
     fLastCpuMonotonicMs: UInt64;
     fLatestLogicalProcessors: TArray<TMachineOverviewOptionalDouble>;
@@ -253,6 +263,7 @@ begin
   CounterLock := TCriticalSection.Create;
   IncidentLock := TCriticalSection.Create;
   Incidents := TDictionary<string, TMachineOverviewIncident>.Create;
+  EvidenceConfig := TMachineOverviewEvidenceConfig.Defaults;
   LifecycleLock := TCriticalSection.Create;
   MailboxLock := TCriticalSection.Create;
   ProviderDrops := TDictionary<string, Int64>.Create;
@@ -323,15 +334,40 @@ end;
 
 procedure TMachineOverviewPipelineState.ApplyIncident(
   const aIncident: TMachineOverviewIncident);
+var
+  lHeadline: TMachineOverviewIncident;
 begin
   if aIncident.StableId.IsEmpty then
     Exit;
   IncidentLock.Acquire;
   try
-    Incidents.AddOrSetValue(aIncident.StableId, aIncident);
+    lHeadline := aIncident;
+    lHeadline.Evidence := Default(TMachineOverviewIncidentEvidence);
+    Incidents.AddOrSetValue(aIncident.StableId, lHeadline);
+    PruneIncidents(Max(aIncident.StartedAtUtc, Max(aIncident.PeakAtUtc, aIncident.EndedAtUtc)));
   finally
     IncidentLock.Release;
   end;
+end;
+
+procedure TMachineOverviewPipelineState.PruneIncidents(const aNowUtc: TDateTime);
+var
+  lCutoffUtc: TDateTime;
+  lPair: TPair<string, TMachineOverviewIncident>;
+  lExpired: TArray<string>;
+  lKey: string;
+begin
+  // Our caller holds IncidentLock. A backward wall-clock step cannot extend retention.
+  NewestIncidentUtc := Max(NewestIncidentUtc, aNowUtc);
+  lCutoffUtc := IncHour(NewestIncidentUtc, -25);
+  for lPair in Incidents do
+    if lPair.Value.StartedAtUtc < lCutoffUtc then
+    begin
+      SetLength(lExpired, Length(lExpired) + 1);
+      lExpired[High(lExpired)] := lPair.Key;
+    end;
+  for lKey in lExpired do
+    Incidents.Remove(lKey);
 end;
 
 procedure TMachineOverviewPipelineState.PublishIncidentChange(
@@ -381,6 +417,7 @@ begin
   lCutoffUtc := IncHour(aCapturedAtUtc, -24);
   IncidentLock.Acquire;
   try
+    PruneIncidents(aCapturedAtUtc);
     for lIncident in Incidents.Values do
       if lIncident.StartedAtUtc >= lCutoffUtc then
       begin
@@ -794,14 +831,13 @@ begin
     lExecutablePaths.Free;
     lEntityIds.Free;
   end;
-  Result.ContextSummary := Result.ProviderId + '; ' +
-    aSource.OverallReason;
 end;
 
 function TMachineOverviewAggregatorThread.BuildPresentation(
   const aSequence: UInt64;
   const aSample: IMachineOverviewRawSample): TMachineOverviewPresentation;
 var
+  lEvidenceStarted: Int64;
   lChange: TMachineOverviewIncidentChange;
   lChanges: TArray<TMachineOverviewIncidentChange>;
   lIncidentSignals: TMachineOverviewIncidentSignals;
@@ -903,9 +939,17 @@ begin
   for i := 0 to High(lChanges) do
   begin
     lChange := lChanges[i];
+    lEvidenceStarted := TStopwatch.GetTimeStamp;
+    fEvidenceRecorder.Apply(lChange);
+    fEvidenceElapsedTicks := fEvidenceElapsedTicks + TStopwatch.GetTimeStamp - lEvidenceStarted;
     fPipelineState.RequestDetailedTrace(lChange);
     fPipelineState.PublishIncidentChange(lChange);
   end;
+  lEvidenceStarted := TStopwatch.GetTimeStamp;
+  lChanges := fEvidenceRecorder.TakeCompleted(aSample.CapturedAtUtc);
+  fEvidenceElapsedTicks := fEvidenceElapsedTicks + TStopwatch.GetTimeStamp - lEvidenceStarted;
+  for lChange in lChanges do
+    fPipelineState.PublishIncidentChange(lChange);
   fPipelineState.FillIncidentPresentation(lSource, aSample.CapturedAtUtc);
   Result := BuildMachineOverviewPresentation(lSource);
 end;
@@ -925,6 +969,7 @@ var
 begin
   fCpuAggregator := nil;
   fIncidentDetector := nil;
+  fEvidenceRecorder := nil;
   fProviderIds := nil;
   fProviderSamples := nil;
   TInterlocked.Increment(fPipelineState.ActiveWorkerCount);
@@ -933,6 +978,7 @@ begin
     fCpuAggregator := TMachineOverviewDomainAggregator.Create(1000, 80);
     fIncidentDetector := TMachineOverviewIncidentDetector.Create(
       TMachineOverviewIncidentThresholds.Defaults);
+    fEvidenceRecorder := TMachineOverviewEvidenceRecorder.Create(fPipelineState.EvidenceConfig);
     fProviderIds := TList<string>.Create;
     fProviderSamples := TDictionary<string,
       TMachineOverviewProviderSample>.Create;
@@ -953,6 +999,7 @@ begin
     FreeAndNil(fProviderSamples);
     FreeAndNil(fProviderIds);
     FreeAndNil(fIncidentDetector);
+    FreeAndNil(fEvidenceRecorder);
     FreeAndNil(fCpuAggregator);
   end;
 end;
@@ -960,6 +1007,7 @@ end;
 procedure TMachineOverviewAggregatorThread.ProcessSample(
   const aSample: IMachineOverviewRawSample);
 var
+  lEvidenceStarted: Int64;
   lCpuSample: IMachineOverviewCpuSample;
   lLogicalProcessors: TArray<TMachineOverviewOptionalDouble>;
   lPresentation: TMachineOverviewPresentation;
@@ -975,6 +1023,9 @@ begin
     else
       TInterlocked.Increment(fPipelineState.HistoryDropped);
   lProviderSample := aSample.ProviderSample;
+  lEvidenceStarted := TStopwatch.GetTimeStamp;
+  fEvidenceRecorder.ObserveSample(lProviderSample);
+  fEvidenceElapsedTicks := fEvidenceElapsedTicks + TStopwatch.GetTimeStamp - lEvidenceStarted;
   if not fProviderSamples.ContainsKey(aSample.ProviderId) then
   begin
     fProviderIds.Add(aSample.ProviderId);
@@ -994,6 +1045,8 @@ begin
   lSequence := TInterlocked.CompareExchange(
     fPipelineState.SnapshotSequence, 0, 0) + 1;
   lPresentation := BuildPresentation(UInt64(lSequence), aSample);
+  TInterlocked.Exchange(fPipelineState.EvidenceElapsedTicks, fEvidenceElapsedTicks);
+  TInterlocked.Increment(fPipelineState.EvidenceSampleCount);
   lSnapshot := TMachineOverviewSnapshot.Create(
     UInt64(lSequence),
     aSample.CapturedAtMonotonicMs,
@@ -1128,6 +1181,8 @@ end;
 
 function TMachineOverviewPipeline.Diagnostics: TMachineOverviewPipelineDiagnostics;
 var
+  lIncident: TMachineOverviewIncident;
+  lKind: TMachineOverviewEvidencePhaseKind;
   lState: TMachineOverviewPipelineState;
 begin
   Result := Default(TMachineOverviewPipelineDiagnostics);
@@ -1148,6 +1203,22 @@ begin
   Result.ActiveWorkerCount := TInterlocked.CompareExchange(lState.ActiveWorkerCount, 0, 0);
   Result.AggregatorThreadId := Cardinal(
     TInterlocked.CompareExchange(lState.AggregatorThreadId, 0, 0));
+  Result.EvidenceSampleCount := TInterlocked.CompareExchange(lState.EvidenceSampleCount, 0, 0);
+  Result.EvidenceElapsedTicks := TInterlocked.CompareExchange(lState.EvidenceElapsedTicks, 0, 0);
+  lState.IncidentLock.Acquire;
+  try
+    for lIncident in lState.Incidents.Values do
+    begin
+      if (Length(lIncident.Evidence.Gaps) > 0) or (lIncident.Evidence.ProcessIntervalMs <> 0) then
+        Inc(Result.StoredIncidentEvidenceCount);
+      for lKind := Low(lKind) to High(lKind) do
+        if (Length(lIncident.Evidence.Phases[lKind].Processes) > 0) or
+          (Length(lIncident.Evidence.Phases[lKind].Applications) > 0) then
+          Inc(Result.StoredIncidentEvidenceCount);
+    end;
+  finally
+    lState.IncidentLock.Release;
+  end;
 end;
 
 function TMachineOverviewPipeline.EnqueueRaw(
@@ -1367,8 +1438,31 @@ end;
 
 procedure TMachineOverviewPipeline.PublishDetailedTraceResult(
   const aChange: TMachineOverviewIncidentChange);
+var
+  lChange: TMachineOverviewIncidentChange;
 begin
-  GetPipelineState(fState).PublishIncidentChange(aChange);
+  lChange := aChange;
+  lChange.HasEvidenceUpdate := False;
+  lChange.Incident.Evidence := Default(TMachineOverviewIncidentEvidence);
+  GetPipelineState(fState).PublishIncidentChange(lChange);
+end;
+
+procedure TMachineOverviewPipeline.ConfigureEvidence(const aProcessMs, aSystemMs: Cardinal);
+var
+  lState: TMachineOverviewPipelineState;
+begin
+  if (aProcessMs = 0) or (aSystemMs = 0) then
+    raise EArgumentException.Create('Evidence intervals must be positive');
+  lState := GetPipelineState(fState);
+  lState.LifecycleLock.Acquire;
+  try
+    if Assigned(lState.Worker) then
+      raise EInvalidOperation.Create('Configure evidence before starting the pipeline');
+    lState.EvidenceConfig.ProcessIntervalMs := aProcessMs;
+    lState.EvidenceConfig.SystemIntervalMs := aSystemMs;
+  finally
+    lState.LifecycleLock.Release;
+  end;
 end;
 
 procedure TMachineOverviewPipeline.SetDetailedTraceEnabled(

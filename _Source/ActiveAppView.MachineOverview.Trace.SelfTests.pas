@@ -261,6 +261,9 @@ begin
   end;
   lPublished := lTaken;
   lPublished.Kind := TMachineOverviewIncidentChangeKind.Updated;
+  lPublished.HasEvidenceUpdate := True;
+  lPublished.Incident.Evidence.State := TMachineOverviewEvidenceState.Collecting;
+  lPublished.Incident.Evidence.ProcessIntervalMs := 5000;
   lPublished.Incident.TraceStatus :=
     TMachineOverviewIncidentTraceStatus.Captured;
   lPipeline.PublishDetailedTraceResult(lPublished);
@@ -268,6 +271,7 @@ begin
     (lTaken.Incident.StableId <> 'accepted') or
     (lTaken.Incident.TraceStatus <>
       TMachineOverviewIncidentTraceStatus.Captured) or
+    lTaken.HasEvidenceUpdate or (lTaken.Incident.Evidence.ProcessIntervalMs <> 0) or
     (lPipeline.IncidentCount <> 1) then
   begin
     Writeln('SELFTEST FAILED: a trace result was not published for history and presentation');

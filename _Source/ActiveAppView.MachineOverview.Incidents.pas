@@ -63,13 +63,6 @@ type
     Truncated: Boolean;
   end;
 
-  TMachineOverviewIncidentContext = record
-    CapturedAtUtc: TDateTime;
-    CapturedAtMonotonicMs: UInt64;
-    ProviderId: string;
-    Summary: string;
-  end;
-
   TMachineOverviewIncident = record
     StableId: string;
     Category: TMachineOverviewIncidentCategory;
@@ -88,8 +81,6 @@ type
     RelatedEntityIds: TArray<string>;
     RelatedExecutablePaths: TArray<string>;
     TraceStatus: TMachineOverviewIncidentTraceStatus;
-    PreContext: TArray<TMachineOverviewIncidentContext>;
-    PostContext: TArray<TMachineOverviewIncidentContext>;
     Evidence: TMachineOverviewIncidentEvidence;
   end;
 
@@ -124,7 +115,6 @@ type
     SQLiteError: string;
     RelatedEntityIds: TArray<string>;
     RelatedExecutablePaths: TArray<string>;
-    ContextSummary: string;
   end;
 
   TMachineOverviewIncidentThresholds = record
@@ -132,8 +122,6 @@ type
     HighCpuRecoveryPercent: Double;
     HighCpuActivationDurationMs: UInt64;
     HighCpuRecoveryDurationMs: UInt64;
-    PreContextDurationMs: UInt64;
-    PostContextDurationMs: UInt64;
     SignalActivationDurationMs: UInt64;
     SignalRecoveryDurationMs: UInt64;
     HotLogicalProcessorCount: Integer;
@@ -167,7 +155,7 @@ type
 implementation
 
 uses
-  System.DateUtils, System.Generics.Collections, System.Math, System.SysUtils;
+  System.DateUtils, System.Math, System.SysUtils;
 
 type
   TMachineOverviewIncidentRuleState = record
@@ -175,11 +163,6 @@ type
     CandidateSinceMs: UInt64;
     Incident: TMachineOverviewIncident;
     RecoverySinceMs: UInt64;
-  end;
-
-  TMachineOverviewPendingIncident = record
-    CaptureUntilMonotonicMs: UInt64;
-    Incident: TMachineOverviewIncident;
   end;
 
   TMachineOverviewIncidentRuleEvaluation = record
@@ -194,13 +177,10 @@ type
 
   TMachineOverviewIncidentDetectorState = class
   public
-    Context: TList<TMachineOverviewIncidentContext>;
-    PendingIncidents: TList<TMachineOverviewPendingIncident>;
     Rules: array[TMachineOverviewIncidentCategory] of
       TMachineOverviewIncidentRuleState;
     Thresholds: TMachineOverviewIncidentThresholds;
     constructor Create(const aThresholds: TMachineOverviewIncidentThresholds);
-    destructor Destroy; override;
   end;
 
 constructor TMachineOverviewIncidentDetectorState.Create(
@@ -208,43 +188,12 @@ constructor TMachineOverviewIncidentDetectorState.Create(
 begin
   inherited Create;
   Thresholds := aThresholds;
-  Context := TList<TMachineOverviewIncidentContext>.Create;
-  PendingIncidents := TList<TMachineOverviewPendingIncident>.Create;
-end;
-
-destructor TMachineOverviewIncidentDetectorState.Destroy;
-begin
-  PendingIncidents.Free;
-  Context.Free;
-  inherited Destroy;
 end;
 
 function GetIncidentDetectorState(const aState: TObject):
   TMachineOverviewIncidentDetectorState;
 begin
   Result := aState as TMachineOverviewIncidentDetectorState;
-end;
-
-function CreateIncidentContext(
-  const aSignals: TMachineOverviewIncidentSignals):
-  TMachineOverviewIncidentContext;
-begin
-  Result := Default(TMachineOverviewIncidentContext);
-  Result.CapturedAtUtc := aSignals.CapturedAtUtc;
-  Result.CapturedAtMonotonicMs := aSignals.CapturedAtMonotonicMs;
-  Result.ProviderId := aSignals.ProviderId;
-  Result.Summary := aSignals.ContextSummary;
-end;
-
-procedure AppendIncidentContext(
-  var aValues: TArray<TMachineOverviewIncidentContext>;
-  const aValue: TMachineOverviewIncidentContext);
-var
-  lIndex: Integer;
-begin
-  lIndex := Length(aValues);
-  SetLength(aValues, lIndex + 1);
-  aValues[lIndex] := aValue;
 end;
 
 procedure AppendIncidentChange(
@@ -258,23 +207,6 @@ begin
   SetLength(aChanges, lIndex + 1);
   aChanges[lIndex].Kind := aKind;
   aChanges[lIndex].Incident := aIncident;
-end;
-
-procedure AddCurrentContext(
-  const aState: TMachineOverviewIncidentDetectorState;
-  const aSignals: TMachineOverviewIncidentSignals);
-var
-  lContext: TMachineOverviewIncidentContext;
-begin
-  lContext := CreateIncidentContext(aSignals);
-  aState.Context.Add(lContext);
-  while (aState.Context.Count > 0) and
-    (aSignals.CapturedAtMonotonicMs >=
-      aState.Context[0].CapturedAtMonotonicMs) and
-    ((aSignals.CapturedAtMonotonicMs -
-      aState.Context[0].CapturedAtMonotonicMs) >
-      aState.Thresholds.PreContextDurationMs) do
-    aState.Context.Delete(0);
 end;
 
 function IncidentCategoryKey(
@@ -560,7 +492,6 @@ begin
 end;
 
 function CreateAutomaticIncident(
-  const aState: TMachineOverviewIncidentDetectorState;
   const aCategory: TMachineOverviewIncidentCategory;
   const aEvaluation: TMachineOverviewIncidentRuleEvaluation;
   const aSignals: TMachineOverviewIncidentSignals;
@@ -588,7 +519,6 @@ begin
   Result.RelatedEntityIds := Copy(aSignals.RelatedEntityIds);
   Result.RelatedExecutablePaths := Copy(aSignals.RelatedExecutablePaths);
   Result.TraceStatus := TMachineOverviewIncidentTraceStatus.NotRequested;
-  Result.PreContext := aState.Context.ToArray;
 end;
 
 function ActivationDurationMs(
@@ -611,33 +541,6 @@ begin
     Result := aState.Thresholds.SignalRecoveryDurationMs;
 end;
 
-procedure CapturePendingPostContext(
-  const aState: TMachineOverviewIncidentDetectorState;
-  const aSignals: TMachineOverviewIncidentSignals;
-  var aChanges: TArray<TMachineOverviewIncidentChange>);
-var
-  i: Integer;
-  lContext: TMachineOverviewIncidentContext;
-  lPending: TMachineOverviewPendingIncident;
-begin
-  lContext := CreateIncidentContext(aSignals);
-  for i := aState.PendingIncidents.Count - 1 downto 0 do
-  begin
-    lPending := aState.PendingIncidents[i];
-    if aSignals.CapturedAtMonotonicMs <=
-      lPending.CaptureUntilMonotonicMs then
-      AppendIncidentContext(lPending.Incident.PostContext, lContext);
-    if aSignals.CapturedAtMonotonicMs >=
-      lPending.CaptureUntilMonotonicMs then
-    begin
-      AppendIncidentChange(aChanges,
-        TMachineOverviewIncidentChangeKind.Updated, lPending.Incident);
-      aState.PendingIncidents.Delete(i);
-    end else
-      aState.PendingIncidents[i] := lPending;
-  end;
-end;
-
 class function TMachineOverviewIncidentThresholds.Defaults:
   TMachineOverviewIncidentThresholds;
 begin
@@ -646,8 +549,6 @@ begin
   Result.HighCpuRecoveryPercent := 75;
   Result.HighCpuActivationDurationMs := 15000;
   Result.HighCpuRecoveryDurationMs := 10000;
-  Result.PreContextDurationMs := 5 * 60 * 1000;
-  Result.PostContextDurationMs := 10 * 60 * 1000;
   Result.SignalActivationDurationMs := 5000;
   Result.SignalRecoveryDurationMs := 5000;
   Result.HotLogicalProcessorCount := 2;
@@ -671,8 +572,6 @@ begin
   inherited Create;
   if (aThresholds.HighCpuActivationDurationMs = 0) or
     (aThresholds.HighCpuRecoveryDurationMs = 0) or
-    (aThresholds.PreContextDurationMs = 0) or
-    (aThresholds.PostContextDurationMs = 0) or
     (aThresholds.SignalActivationDurationMs = 0) or
     (aThresholds.SignalRecoveryDurationMs = 0) then
     raise EArgumentException.Create('Incident durations must be positive');
@@ -691,9 +590,7 @@ function TMachineOverviewIncidentDetector.Accept(
 var
   lActivationDurationMs: UInt64;
   lCategory: TMachineOverviewIncidentCategory;
-  lContext: TMachineOverviewIncidentContext;
   lEvaluation: TMachineOverviewIncidentRuleEvaluation;
-  lPending: TMachineOverviewPendingIncident;
   lRecoveryDurationMs: UInt64;
   lRule: TMachineOverviewIncidentRuleState;
   lStartedAtUtc: TDateTime;
@@ -701,9 +598,6 @@ var
 begin
   Result := nil;
   lState := GetIncidentDetectorState(fState);
-  CapturePendingPostContext(lState, aSignals, Result);
-  AddCurrentContext(lState, aSignals);
-  lContext := CreateIncidentContext(aSignals);
   for lCategory := TMachineOverviewIncidentCategory.HighCpu to
     TMachineOverviewIncidentCategory.PipelineOverload do
   begin
@@ -736,7 +630,7 @@ begin
       lStartedAtUtc := IncMilliSecond(aSignals.CapturedAtUtc,
         -Int64(aSignals.CapturedAtMonotonicMs -
           lRule.CandidateSinceMs));
-      lRule.Incident := CreateAutomaticIncident(lState, lCategory,
+      lRule.Incident := CreateAutomaticIncident(lCategory,
         lEvaluation, aSignals, lStartedAtUtc);
       lRule.Active := True;
       lRule.RecoverySinceMs := 0;
@@ -767,7 +661,6 @@ begin
       lState.Rules[lCategory] := lRule;
       Continue;
     end;
-    AppendIncidentContext(lRule.Incident.PostContext, lContext);
     if lRule.RecoverySinceMs = 0 then
     begin
       lRule.RecoverySinceMs := aSignals.CapturedAtMonotonicMs;
@@ -784,12 +677,6 @@ begin
     lRule.Incident.EndedAtUtc := aSignals.CapturedAtUtc;
     AppendIncidentChange(Result, TMachineOverviewIncidentChangeKind.Ended,
       lRule.Incident);
-    lPending := Default(TMachineOverviewPendingIncident);
-    lPending.Incident := lRule.Incident;
-    lPending.CaptureUntilMonotonicMs :=
-      aSignals.CapturedAtMonotonicMs +
-      lState.Thresholds.PostContextDurationMs;
-    lState.PendingIncidents.Add(lPending);
     lRule := Default(TMachineOverviewIncidentRuleState);
     lState.Rules[lCategory] := lRule;
   end;
@@ -800,10 +687,7 @@ function TMachineOverviewIncidentDetector.MarkUserSlowdown(
   const aSummary: string): TMachineOverviewIncidentChange;
 var
   lIncident: TMachineOverviewIncident;
-  lState: TMachineOverviewIncidentDetectorState;
 begin
-  lState := GetIncidentDetectorState(fState);
-  AddCurrentContext(lState, aSignals);
   lIncident := Default(TMachineOverviewIncident);
   lIncident.StableId := 'user-marked-' +
     IntToStr(IncidentUtcMilliseconds(aSignals.CapturedAtUtc));
@@ -827,7 +711,7 @@ begin
   lIncident.RelatedExecutablePaths :=
     Copy(aSignals.RelatedExecutablePaths);
   lIncident.TraceStatus := TMachineOverviewIncidentTraceStatus.NotRequested;
-  lIncident.PreContext := lState.Context.ToArray;
+  Result := Default(TMachineOverviewIncidentChange);
   Result.Kind := TMachineOverviewIncidentChangeKind.Ended;
   Result.Incident := lIncident;
 end;

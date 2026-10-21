@@ -1,4 +1,4 @@
-unit ActiveAppView.MachineOverview.Incidents.SelfTests;
+﻿unit ActiveAppView.MachineOverview.Incidents.SelfTests;
 
 interface
 
@@ -32,7 +32,6 @@ begin
   Result.TotalCpu.Value := aCpuPercent;
   Result.ProviderId := 'windows-core';
   Result.ProviderFreshnessMs := 25;
-  Result.ContextSummary := aSummary;
 end;
 
 function RunHighCpuIncidentSelfTest: Integer;
@@ -74,7 +73,6 @@ begin
     (lChanges[0].Incident.Severity <> TMachineOverviewSeverity.Warning) or
     lChanges[0].Incident.StableId.IsEmpty or
     (not SameValue(lChanges[0].Incident.PeakValue, 97, 0.001)) or
-    (Length(lChanges[0].Incident.PreContext) <> 4) or
     (lChanges[0].Incident.ProviderId <> 'windows-core') or
     (lChanges[0].Incident.ProviderFreshnessMs <> 25) or
     (lChanges[0].Incident.TraceStatus <>
@@ -108,8 +106,7 @@ begin
   if (Length(lChanges) <> 1) or
     (lChanges[0].Kind <> TMachineOverviewIncidentChangeKind.Ended) or
     (lChanges[0].Incident.StableId <> lFirstId) or
-    (lChanges[0].Incident.EndedAtUtc = 0) or
-    (Length(lChanges[0].Incident.PostContext) <> 2) then
+    (lChanges[0].Incident.EndedAtUtc = 0) then
   begin
     Writeln('SELFTEST FAILED: high CPU recovery did not end the original incident');
     Exit;
@@ -124,73 +121,6 @@ begin
     (lChanges[0].Incident.StableId = lFirstId) then
   begin
     Writeln('SELFTEST FAILED: recovered high CPU could not create a new stable incident');
-    Exit;
-  end;
-  Result := 0;
-end;
-
-function RunPostContextContinuationSelfTest: Integer;
-var
-  g: TGarbos;
-  lChanges: TArray<TMachineOverviewIncidentChange>;
-  lDetector: TMachineOverviewIncidentDetector;
-  lEndedAtMs: UInt64;
-  lIncidentId: string;
-  lThresholds: TMachineOverviewIncidentThresholds;
-  lUtc: TDateTime;
-begin
-  g := Default(TGarbos);
-  Result := 1;
-  lThresholds := TMachineOverviewIncidentThresholds.Defaults;
-  GC(lDetector, TMachineOverviewIncidentDetector.Create(lThresholds), g);
-  lUtc := EncodeDate(2026, 8, 29) + EncodeTime(1, 0, 0, 0);
-  lDetector.Accept(CreateCpuSignals(lUtc, 1000, 95, 'activation begins'));
-  lChanges := lDetector.Accept(CreateCpuSignals(
-    IncMilliSecond(lUtc, lThresholds.HighCpuActivationDurationMs),
-    1000 + lThresholds.HighCpuActivationDurationMs, 95,
-    'activation complete'));
-  if Length(lChanges) <> 1 then
-    Exit;
-  lIncidentId := lChanges[0].Incident.StableId;
-  lEndedAtMs := 2000 + lThresholds.HighCpuActivationDurationMs +
-    lThresholds.HighCpuRecoveryDurationMs;
-  lDetector.Accept(CreateCpuSignals(
-    IncMilliSecond(lUtc, 1000 + lThresholds.HighCpuActivationDurationMs),
-    2000 + lThresholds.HighCpuActivationDurationMs, 60,
-    'recovery begins'));
-  lChanges := lDetector.Accept(CreateCpuSignals(
-    IncMilliSecond(lUtc, lEndedAtMs - 1000), lEndedAtMs, 60,
-    'incident ends'));
-  if (Length(lChanges) <> 1) or
-    (lChanges[0].Kind <> TMachineOverviewIncidentChangeKind.Ended) then
-    Exit;
-  lChanges := lDetector.Accept(CreateCpuSignals(
-    IncMilliSecond(lUtc, lEndedAtMs +
-      lThresholds.PostContextDurationMs - 1),
-    lEndedAtMs + lThresholds.PostContextDurationMs - 1, 40,
-    'post context before boundary'));
-  if Length(lChanges) <> 0 then
-    Exit;
-  lChanges := lDetector.Accept(CreateCpuSignals(
-    IncMilliSecond(lUtc, lEndedAtMs + lThresholds.PostContextDurationMs),
-    lEndedAtMs + lThresholds.PostContextDurationMs, 40,
-    'post context boundary'));
-  if (Length(lChanges) <> 1) or
-    (lChanges[0].Kind <> TMachineOverviewIncidentChangeKind.Updated) or
-    (lChanges[0].Incident.StableId <> lIncidentId) or
-    (Length(lChanges[0].Incident.PostContext) <> 4) then
-  begin
-    Writeln('SELFTEST FAILED: ten-minute post-incident context was not completed');
-    Exit;
-  end;
-  lChanges := lDetector.Accept(CreateCpuSignals(
-    IncMilliSecond(lUtc, lEndedAtMs +
-      lThresholds.PostContextDurationMs + 1),
-    lEndedAtMs + lThresholds.PostContextDurationMs + 1, 40,
-    'after post context'));
-  if Length(lChanges) <> 0 then
-  begin
-    Writeln('SELFTEST FAILED: completed incident kept accepting post context');
     Exit;
   end;
   Result := 0;
@@ -485,14 +415,6 @@ begin
     lChange := lDetector.MarkUserSlowdown(lSignals,
       'Initial persisted summary');
     lChange.Incident.PeakValue := 42.5;
-    lChange.Incident.PostContext := Copy(lChange.Incident.PreContext);
-    if lChange.Incident.Explanation.IsEmpty or
-      (Length(lChange.Incident.PreContext) = 0) or
-      (Length(lChange.Incident.PostContext) = 0) then
-    begin
-      Writeln('SELFTEST FAILED: incident context input must be nonempty');
-      Exit;
-    end;
     lConfig := Default(TMachineOverviewHistoryConfig);
     lConfig.DiskFreeBytesOverride := -1;
     lConfig.Enabled := True;
@@ -557,9 +479,7 @@ begin
       (lIncidents[0].Origin <>
        TMachineOverviewIncidentOrigin.UserMarked) or
       (Length(lIncidents[0].RelatedEntityIds) <> 2) or
-      (Length(lIncidents[0].RelatedExecutablePaths) <> 1) or
-      (Length(lIncidents[0].PreContext) <> 0) or
-      (Length(lIncidents[0].PostContext) <> 0) then
+      (Length(lIncidents[0].RelatedExecutablePaths) <> 1) then
     begin
       Writeln(Format('SELFTEST FAILED: incident did not survive persistence ' +
         'restart and stable-ID upsert: count=%d error=%s',
@@ -742,6 +662,17 @@ end;
 
 function RunIncidentPipelinePersistenceRestartSelfTest: Integer;
 var
+  g: TGarbos;
+  i: Int64;
+  lMonotonicMs: UInt64;
+  lSequence: UInt64;
+  lProcessSample: TMachineOverviewProviderSample;
+  lConnection: TFDConnection;
+  lQuery: TFDQuery;
+  lEvidence: TMachineOverviewIncidentEvidence;
+  lFoundExited: Boolean;
+  lContribution: TMachineOverviewProcessContribution;
+  lPipelineDiagnostics: TMachineOverviewPipelineDiagnostics;
   lConfig: TMachineOverviewHistoryConfig;
   lDatabaseFileName: string;
   lDirectory: string;
@@ -757,6 +688,7 @@ var
   lRow: TMachineOverviewRow;
   lUtc: TDateTime;
 begin
+  g := Default(TGarbos);
   Result := 1;
   lDirectory := TPath.Combine(TPath.GetTempPath,
     'ActiveAppView-MachineOverview\history-tests');
@@ -774,13 +706,13 @@ begin
     lConfig.Enabled := True;
     lConfig.DatabaseFileName := lDatabaseFileName;
     lConfig.CommitIntervalMs := 60000;
-    lConfig.QueueCapacity := 32;
+    lConfig.QueueCapacity := 4096;
     lConfig.RawRetentionHours := 48;
     lConfig.Rollup10sRetentionDays := 30;
     lConfig.Rollup1mRetentionDays := 365;
     lConfig.MaxDatabaseSizeBytes := 32 * 1024 * 1024;
     lConfig.BusyTimeoutMs := 100;
-    lPipeline := TMachineOverviewPipeline.Create(16, 16);
+    lPipeline := TMachineOverviewPipeline.Create(32, 4096);
     lHistory := TMachineOverviewHistoryService.Create(lPipeline, lConfig);
     lPipeline.Start;
     lHistory.Start;
@@ -796,14 +728,70 @@ begin
     end;
     // Restart hydration loads the wall-clock last 24 hours; keep this fixture recent.
     lUtc := IncMinute(TTimeZone.Local.ToUniversalTime(Now), -120);
-    lPipeline.EnqueueRaw(CreatePipelineIncidentSample(lUtc, 1000, 95));
-    lPipeline.EnqueueRaw(CreatePipelineIncidentSample(IncSecond(lUtc, 15),
-      16000, 97));
-    if (not lPipeline.WaitForSequence(2, 5000)) or
+    lSequence := 0;
+    lMonotonicMs := 1000;
+    for i := 0 to 631 do
+    begin
+      if (i >= 1) and (i <= 20) then
+      begin
+        if lPipeline.EnqueueRaw(CreatePipelineIncidentSample(IncSecond(lUtc, i),
+          lMonotonicMs, 97)) <> TMachineOverviewEnqueueResult.Queued then
+          raise Exception.Create('High CPU sample was not queued');
+      end else begin
+        if lPipeline.EnqueueRaw(CreatePipelineIncidentSample(IncSecond(lUtc, i),
+          lMonotonicMs, 40)) <> TMachineOverviewEnqueueResult.Queued then
+          raise Exception.Create('Normal CPU sample was not queued');
+      end;
+      Inc(lSequence);
+      if not lPipeline.WaitForSequence(lSequence, 5000) then
+        raise Exception.CreateFmt('Pipeline system sequence timed out at %d', [i]);
+      if (i mod 5) = 0 then
+      begin
+        lProcessSample := Default(TMachineOverviewProviderSample);
+        lProcessSample.State.ProviderId := 'processes';
+        lProcessSample.State.Status := TMachineOverviewProviderStatus.Available;
+        lProcessSample.State.CapturedAtUtc := IncSecond(lUtc, i);
+        lProcessSample.State.CapturedAtMonotonicMs := lMonotonicMs;
+        SetLength(lProcessSample.Measurements, 4 + Ord(i <= 10));
+        lProcessSample.Measurements[0].Name := 'logical_processor_count';
+        lProcessSample.Measurements[0].Value := 32;
+        lProcessSample.Measurements[1].Name := 'process_cpu_interval_ms';
+        lProcessSample.Measurements[1].Value := 5000;
+        lProcessSample.Measurements[2].Name := 'process_cpu_measured_total_percent';
+        lProcessSample.Measurements[2].Value := 12.5 + 3.125 * Ord(i <= 10);
+        lProcessSample.Measurements[3].Name := 'process_cpu_process:1';
+        lProcessSample.Measurements[3].Value := 12.5;
+        lProcessSample.Measurements[3].EntityId := '100:1234';
+        lProcessSample.Measurements[3].DisplayText := 'survivor.exe';
+        if i <= 10 then
+        begin
+          lProcessSample.Measurements[4].Name := 'process_cpu_process:2';
+          lProcessSample.Measurements[4].Value := 3.125;
+          lProcessSample.Measurements[4].EntityId := '200:5678';
+          lProcessSample.Measurements[4].DisplayText := 'exited-worker.exe';
+        end;
+        for var j := 0 to High(lProcessSample.Measurements) do
+          lProcessSample.Measurements[j].Available := True;
+        if lPipeline.EnqueueRaw(CreateMachineOverviewRawSample(lProcessSample)) <>
+          TMachineOverviewEnqueueResult.Queued then
+          raise Exception.Create('Process sample was not queued');
+        Inc(lSequence);
+        if not lPipeline.WaitForSequence(lSequence, 5000) then
+          raise Exception.CreateFmt('Pipeline process sequence timed out at %d', [i]);
+      end;
+      lMonotonicMs := lMonotonicMs + 1000;
+    end;
+    if (not lPipeline.WaitForSequence(lSequence, 5000)) or
       (not lHistory.Flush(5000)) or
       (lPipeline.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) or
       (lHistory.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
-      Exit;
+      raise Exception.Create('Pipeline evidence flush/stop failed: ' + lHistory.Diagnostics.LastError);
+    lPipelineDiagnostics := lPipeline.Diagnostics;
+    Writeln(Format('PIPELINE RECORDER COST Debug Win64 samples=%d total_us=%.3f mean_us_per_sample=%.3f',
+      [lPipelineDiagnostics.EvidenceSampleCount,
+       lPipelineDiagnostics.EvidenceElapsedTicks * 1000000.0 / TStopwatch.Frequency,
+       lPipelineDiagnostics.EvidenceElapsedTicks * 1000000.0 /
+         TStopwatch.Frequency / lPipelineDiagnostics.EvidenceSampleCount]));
     if (not TryLoadMachineOverviewIncidents(lDatabaseFileName, 0, 10,
         lIncidents, lError)) or (Length(lIncidents) <> 1) then
     begin
@@ -815,6 +803,41 @@ begin
          lHistoryDiagnostics.LastError]));
       Exit;
     end;
+    GC(lConnection, TFDConnection.Create(nil), g);
+    lConnection.Params.Values['DriverID'] := 'SQLite';
+    lConnection.Params.Values['Database'] := lDatabaseFileName;
+    lConnection.LoginPrompt := False;
+    lConnection.Connected := True;
+    lConnection.ExecSQL('PRAGMA query_only=ON');
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := lConnection;
+    lQuery.SQL.Text := 'SELECT evidence_json, state FROM incident_evidence WHERE incident_key=:key';
+    lQuery.ParamByName('key').AsWideString := lIncidents[0].StableId;
+    lQuery.Open;
+    if lQuery.Eof then
+    begin
+      Writeln('SELFTEST FAILED: pipeline did not persist measured incident evidence');
+      Exit;
+    end;
+    if (lQuery.FieldByName('state').AsInteger <> Ord(TMachineOverviewEvidenceState.Complete)) or
+      (not TryMachineOverviewEvidenceFromJson(lQuery.FieldByName('evidence_json').AsWideString,
+        lEvidence, lError)) then
+    begin
+      Writeln('SELFTEST FAILED: final post-window evidence was not Complete: ' + lError);
+      Exit;
+    end;
+    lFoundExited := False;
+    for lContribution in lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes do
+      if (lContribution.ProcessId = 200) and (lContribution.CreationTime100ns = 5678) and
+        (lContribution.DisplayName = 'exited-worker.exe') and (lContribution.AverageCpuPercent > 0) and
+        (Abs(lContribution.LastSeenUtc - IncSecond(lUtc, 10)) < 0.0000001) then
+        lFoundExited := True;
+    if not lFoundExited then
+    begin
+      Writeln('SELFTEST FAILED: exited process was lost from persisted During contributors');
+      Exit;
+    end;
+    g.Clear;
     lRestartPipeline := TMachineOverviewPipeline.Create(16, 16);
     lRestartHistory := TMachineOverviewHistoryService.Create(
       lRestartPipeline, lConfig);
@@ -824,6 +847,16 @@ begin
       (not lRestartHistory.WaitUntilInitialized(5000)) or
       (not lRestartHistory.Diagnostics.Available) then
       Exit;
+    if (not TryLoadMachineOverviewIncidentEvidence(lDatabaseFileName, lIncidents[0].StableId,
+        lEvidence, lError)) or (lEvidence.State <> TMachineOverviewEvidenceState.Complete) then
+      raise Exception.Create('Restart evidence reader failed: ' + lError);
+    lFoundExited := False;
+    for lContribution in lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes do
+      if (lContribution.ProcessId = 200) and (lContribution.CreationTime100ns = 5678) and
+        (lContribution.DisplayName = 'exited-worker.exe') and (lContribution.AverageCpuPercent > 0) then
+        lFoundExited := True;
+    if not lFoundExited then
+      raise Exception.Create('Restart reader lost exited process B');
     lRestartPipeline.EnqueueRaw(CreatePipelineIncidentSample(
       IncHour(lUtc, 1), 100000, 40));
     if (not lRestartPipeline.WaitForSequence(1, 5000)) or
@@ -850,7 +883,9 @@ begin
        TMachineOverviewShutdownResult.Stopped) then
       Exit;
     Result := 0;
+    Writeln('SELFTEST PASS: pipeline incident evidence survives process exit, post window and restart');
   finally
+    g.Clear;
     lRestartHistory.Free;
     lRestartPipeline.Free;
     lHistory.Free;
@@ -1641,8 +1676,6 @@ begin
     RunEvidenceCostMeasurement(1);
     RunEvidenceCostMeasurement(64);
     Result := RunHighCpuIncidentSelfTest;
-    if Result = 0 then
-      Result := RunPostContextContinuationSelfTest;
     if Result = 0 then
       Result := RunAutomaticCategoryReplaySelfTest;
     if Result = 0 then

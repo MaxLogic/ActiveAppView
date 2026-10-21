@@ -13,6 +13,7 @@ uses
   AutoFree, FireDAC.Comp.Client, FireDAC.Phys.SQLite,
   FireDAC.Phys.SQLiteDef, FireDAC.Phys.SQLiteWrapper.Stat,
   FireDAC.Stan.Async, FireDAC.Stan.Def,
+  ActiveAppView.MachineOverview.Evidence,
   ActiveAppView.MachineOverview.History,
   ActiveAppView.MachineOverview.Incidents,
   ActiveAppView.MachineOverview.Pipeline,
@@ -419,7 +420,7 @@ begin
   lSample.State.Status := TMachineOverviewProviderStatus.Available;
   lSample.State.CapturedAtMonotonicMs := 123461;
   lSample.State.CapturedAtUtc := aCapturedAtUtc;
-  SetLength(lSample.Measurements, Length(cNames));
+  SetLength(lSample.Measurements, Length(cNames) + 2);
   for i := 0 to High(cNames) do
   begin
     lSample.Measurements[i].Name := cNames[i];
@@ -430,6 +431,12 @@ begin
     lSample.Measurements[i].Available := True;
     lSample.Measurements[i].Value := cValues[i];
   end;
+  lSample.Measurements[3].Name := 'process_cpu_interval_ms';
+  lSample.Measurements[3].Available := True;
+  lSample.Measurements[3].Value := 5000;
+  lSample.Measurements[4].Name := 'logical_processor_count';
+  lSample.Measurements[4].Available := True;
+  lSample.Measurements[4].Value := 32;
   Result := CreateMachineOverviewRawSample(lSample);
 end;
 
@@ -499,7 +506,8 @@ begin
   if (lQuery.RecordCount <> 3) or
     (QueryHistoryInt64(lConnection,
       'SELECT COUNT(*) FROM process_top_sample WHERE entity_id=' +
-      '''4242:9876543210'' AND image_path=''C:\Test\history-test.exe''') <> 3) then
+      '''4242:9876543210'' AND image_path=''C:\Test\history-test.exe'' ' +
+      'AND interval_ms=5000 AND logical_processor_count=32') <> 3) then
     Exit;
   lQuery.Close;
   lQuery.Open('SELECT sample_count, cpu_sum, cpu_count, cpu_max FROM ' +
@@ -2242,6 +2250,488 @@ begin
   end;
 end;
 
+function RunHistoryBackwardUtcBatchSelfTest: Integer;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lService: TMachineOverviewHistoryService;
+  lFileName: string;
+  lUtc: TDateTime;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('backward-utc-batch');
+  lService := nil;
+  lConnection := nil;
+  try
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 16, 1);
+    lService := StartHistoryBudgetService(lConfig);
+    lUtc := TTimeZone.Local.ToUniversalTime(Now);
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(lUtc, 1000, 40));
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(IncHour(lUtc, -2), 2000, 41));
+    if not lService.Flush(5000) then
+      raise Exception.Create('Backward UTC batch did not flush: ' + lService.Diagnostics.LastError);
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    if QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM system_sample_raw') <> 2 then
+      raise Exception.Create('Backward UTC step deleted a committed batch row');
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Backward UTC writer did not stop');
+    Writeln('PASS RunHistoryBackwardUtcBatchSelfTest: both clock-step batch rows survive a one-byte budget');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    g.Clear;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryStopWithoutFlushSelfTest: Integer;
+const
+  cSampleCount = 100;
+  cAcceptedCount = cSampleCount * 3 + 1;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lService: TMachineOverviewHistoryService;
+  lDiagnostics: TMachineOverviewHistoryDiagnostics;
+  lChange: TMachineOverviewIncidentChange;
+  lEvidence: TMachineOverviewIncidentEvidence;
+  lFileName, lError: string;
+  lUtc: TDateTime;
+  i: UInt64;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('stop-without-flush');
+  lService := nil;
+  lConnection := nil;
+  try
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 512, 32 * 1024 * 1024);
+    // Keep all accepted records pending until Stop starts our two-batch drain.
+    lConfig.CommitIntervalMs := 60000;
+    lService := StartHistoryBudgetService(lConfig);
+    lUtc := IncMinute(TTimeZone.Local.ToUniversalTime(Now), -10);
+    i := 1;
+    while i <= cSampleCount do
+    begin
+      lUtc := IncSecond(lUtc);
+      if (lService.EnqueueRaw(CreateHistorySystemTestSample(lUtc, i, 42)) <>
+          TMachineOverviewHistoryEnqueueResult.Queued) or
+        (lService.EnqueueRaw(CreateHistoryDiskTestSample(lUtc)) <>
+          TMachineOverviewHistoryEnqueueResult.Queued) or
+        (lService.EnqueueRaw(CreateHistoryProcessTestSample(lUtc)) <>
+          TMachineOverviewHistoryEnqueueResult.Queued) then
+        raise Exception.Create('Stop-without-flush fixture enqueue failed');
+      Inc(i);
+    end;
+    lChange := Default(TMachineOverviewIncidentChange);
+    lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+    lChange.HasEvidenceUpdate := True;
+    lChange.Incident.StableId := 'stop-drain-evidence';
+    lChange.Incident.StartedAtUtc := lUtc;
+    lChange.Incident.PeakAtUtc := IncSecond(lUtc, 30);
+    lChange.Incident.EndedAtUtc := IncSecond(lUtc, 60);
+    lChange.Incident.Summary := 'Accepted headline survives Stop';
+    lChange.Incident.Evidence.State := TMachineOverviewEvidenceState.Complete;
+    lChange.Incident.Evidence.LogicalProcessorCount := 32;
+    lChange.Incident.Evidence.ProcessIntervalMs := 5000;
+    lChange.Incident.Evidence.SystemIntervalMs := 1000;
+    SetLength(lChange.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes, 1);
+    lChange.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During].Kind :=
+      TMachineOverviewEvidencePhaseKind.During;
+    lChange.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes[0].ProcessId := 4242;
+    lChange.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes[0].CreationTime100ns := 9876543210;
+    if lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued then
+      raise Exception.Create('Stop-without-flush incident enqueue failed');
+    lDiagnostics := lService.Diagnostics;
+    if (lDiagnostics.Accepted <> cAcceptedCount) or (lDiagnostics.Persisted <> 0) then
+      raise Exception.Create('Stop-without-flush fixture did not retain all records for shutdown');
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Stop-without-flush writer did not stop');
+    lDiagnostics := lService.Diagnostics;
+    FreeAndNil(lService);
+    // Reopen through the production writer and read the committed rows/evidence.
+    lService := StartHistoryBudgetService(lConfig);
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM system_sample_raw') <> cSampleCount) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM disk_sample_raw') <> cSampleCount) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM process_top_sample') <> cSampleCount * 3) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident ' +
+        'WHERE incident_key=''stop-drain-evidence'' AND summary=''Accepted headline survives Stop''') <> 1) then
+      raise Exception.CreateFmt('Stop without Flush lost accepted records: persisted=%d/%d queue=%d error=%s',
+        [lDiagnostics.Persisted, lDiagnostics.Accepted, lDiagnostics.QueueDepth, lDiagnostics.LastError]);
+    if (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'stop-drain-evidence', lEvidence, lError)) or
+      (lEvidence.State <> TMachineOverviewEvidenceState.Complete) or
+      (lEvidence.LogicalProcessorCount <> 32) or
+      (Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes) <> 1) or
+      (lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes[0].ProcessId <> 4242) or
+      (lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes[0].CreationTime100ns <> 9876543210) then
+      raise Exception.Create('Stop without Flush lost accepted evidence: ' + lError);
+    if (lDiagnostics.Persisted <> lDiagnostics.Accepted) or (lDiagnostics.QueueDepth <> 0) or
+      (lDiagnostics.RetryCount <> 0) or (lDiagnostics.ActiveWorkerCount <> 0) or
+      (not lDiagnostics.LastError.IsEmpty) or (not lDiagnostics.LastMaintenanceError.IsEmpty) then
+      raise Exception.Create('Stop without Flush reported an incomplete drain or writer error: ' + lDiagnostics.LastError);
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Stop-without-flush reopened writer did not stop');
+    Writeln('PASS RunHistoryStopWithoutFlushSelfTest: 301 accepted records, two batches, samples/headline/evidence durable, no writer error');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    g.Clear;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryEvidenceRetrySelfTest(const aFailCommit: Boolean): Integer;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lService: TMachineOverviewHistoryService;
+  lChange, lComplete: TMachineOverviewIncidentChange;
+  lEvidence: TMachineOverviewIncidentEvidence;
+  lFileName, lError: string;
+  lCommits, i: Integer;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('evidence-retry-' + BoolToStr(aFailCommit, True));
+  lService := nil;
+  lConnection := nil;
+  lCommits := 0;
+  try
+    try
+      lConfig := CreateHistoryReliabilityConfig(lFileName, 1024, 32 * 1024 * 1024);
+      lConfig.CommitIntervalMs := 60000;
+      lChange := Default(TMachineOverviewIncidentChange);
+      lChange.HasEvidenceUpdate := True;
+      lChange.Incident.StableId := 'retry-key';
+      lChange.Incident.StartedAtUtc := IncMinute(TTimeZone.Local.ToUniversalTime(Now), -5);
+      lChange.Incident.EndedAtUtc := IncMinute(lChange.Incident.StartedAtUtc, 1);
+      lChange.Incident.Summary := 'old collecting';
+      lChange.Incident.Evidence.State := TMachineOverviewEvidenceState.Collecting;
+      lChange.Incident.Evidence.ProcessIntervalMs := 5000;
+      lChange.Incident.Evidence.SystemIntervalMs := 1000;
+      lComplete := lChange;
+      lComplete.Incident.Summary := 'new complete';
+      lComplete.Incident.Evidence.State := TMachineOverviewEvidenceState.Complete;
+      lComplete.Incident.Evidence.LogicalProcessorCount := 32;
+      if aFailCommit then
+        lConfig.MigrationObserver :=
+          procedure(aStage: string)
+          begin
+            if aStage <> 'BeforeBatchCommit' then
+              Exit;
+            Inc(lCommits);
+            if lCommits = 1 then
+            begin
+              if lService.EnqueueIncident(lComplete) <> TMachineOverviewHistoryEnqueueResult.Queued then
+                raise Exception.Create('Fault fixture could not enqueue newer completion');
+              raise Exception.Create('Injected one batch commit failure');
+            end;
+          end;
+      lService := StartHistoryBudgetService(lConfig);
+      if aFailCommit then
+      begin
+        if lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued then
+          raise Exception.Create('Could not enqueue initial evidence');
+        // Fill the failed batch so the newer completion must cross a batch boundary.
+        lChange.HasEvidenceUpdate := False;
+        for i := 1 to 255 do
+        begin
+          lChange.Incident.StableId := 'filler-' + IntToStr(i);
+          if lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued then
+            raise Exception.Create('Could not enqueue retry batch filler');
+        end;
+      end else begin
+        if (lService.EnqueueIncident(lComplete) <> TMachineOverviewHistoryEnqueueResult.Queued) or
+          (not lService.Flush(5000)) then
+          raise Exception.Create('Could not persist initial completion');
+        if lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued then
+          raise Exception.Create('Could not enqueue stale Collecting');
+      end;
+      if not lService.Flush(10000) then
+        raise Exception.Create('Retry fixture did not flush: ' + lService.Diagnostics.LastError);
+      GC(lConnection, TFDConnection.Create(nil), g);
+      ConfigureHistoryTestConnection(lFileName, lConnection);
+      if aFailCommit then
+      begin
+        if (lService.Diagnostics.RetryCount <> 1) or (lCommits <> 3) then
+          raise Exception.Create('One failed batch was not retried exactly once');
+        if QueryHistoryInt64(lConnection,
+          'SELECT COUNT(*) FROM incident WHERE incident_key=''retry-key'' AND summary=''new complete''') <> 1 then
+          raise Exception.Create('Failed batch retried behind newer work');
+      end;
+      if (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'retry-key', lEvidence, lError)) or
+        (lEvidence.State <> TMachineOverviewEvidenceState.Complete) or (lEvidence.LogicalProcessorCount <> 32) then
+        raise Exception.Create('Stale Collecting replaced Complete evidence: ' + lError);
+      if QueryHistoryInt64(lConnection, 'SELECT evidence_bytes FROM history_status') <>
+        QueryHistoryInt64(lConnection, 'SELECT SUM(byte_count) FROM incident_evidence') then
+        raise Exception.Create('Evidence byte total drifted after rollback/retry or rejected upsert');
+      if not aFailCommit then
+      begin
+        // A stored future revision must reject even a terminal payload and preserve byte totals/state.
+        lConnection.ExecSQL('UPDATE incident_evidence SET updated_utc_ms=updated_utc_ms+3600000');
+        lComplete.Incident.Evidence.LogicalProcessorCount := 16;
+        if (lService.EnqueueIncident(lComplete) <> TMachineOverviewHistoryEnqueueResult.Queued) or
+          (not lService.Flush(5000)) then
+          raise Exception.Create('Older terminal update did not flush');
+        if (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'retry-key', lEvidence, lError)) or
+          (lEvidence.LogicalProcessorCount <> 32) then
+          raise Exception.Create('Older UTC revision replaced newer evidence');
+        if QueryHistoryInt64(lConnection, 'SELECT evidence_bytes FROM history_status') <>
+          QueryHistoryInt64(lConnection, 'SELECT SUM(byte_count) FROM incident_evidence') then
+          raise Exception.Create('Rejected older revision changed evidence accounting');
+      end;
+      if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+        raise Exception.Create('Retry fixture did not stop');
+      Writeln('PASS RunHistoryEvidenceRetrySelfTest fail_commit=' + BoolToStr(aFailCommit, True));
+      Result := 0;
+    except
+      on lException: Exception do
+        Writeln('SELFTEST FAILED: evidence retry fail_commit=' + BoolToStr(aFailCommit, True) + ': ' + lException.Message);
+    end;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    g.Clear;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryEvidenceRoundTripSelfTest: Integer;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lQuery: TFDQuery;
+  lService: TMachineOverviewHistoryService;
+  lChange: TMachineOverviewIncidentChange;
+  lEvidence: TMachineOverviewIncidentEvidence;
+  lKind: TMachineOverviewEvidencePhaseKind;
+  lFileName, lError, lOriginalJson, lRecoveredJson: string;
+  lUtc: TDateTime;
+  i: Integer;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('evidence-roundtrip');
+  lService := nil;
+  lConnection := nil;
+  try
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 512, 32 * 1024 * 1024);
+    lConfig.ProcessSampleIntervalMs := 7000;
+    lConfig.SystemSampleIntervalMs := 2000;
+    lService := StartHistoryBudgetService(lConfig);
+    lUtc := TTimeZone.Local.ToUniversalTime(Now);
+    lChange := Default(TMachineOverviewIncidentChange);
+    lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+    lChange.HasEvidenceUpdate := True;
+    lChange.Incident.StableId := 'complete';
+    lChange.Incident.StartedAtUtc := IncMinute(lUtc, -10);
+    lChange.Incident.PeakAtUtc := IncMinute(lUtc, -9);
+    lChange.Incident.EndedAtUtc := IncMinute(lUtc, -8);
+    lChange.Incident.Evidence.State := TMachineOverviewEvidenceState.Complete;
+    lChange.Incident.Evidence.ProcessIntervalMs := 7000;
+    lChange.Incident.Evidence.SystemIntervalMs := 2000;
+    lChange.Incident.Evidence.LogicalProcessorCount := 32;
+    for lKind := Low(lKind) to High(lKind) do
+    begin
+      lChange.Incident.Evidence.Phases[lKind].Kind := lKind;
+      SetLength(lChange.Incident.Evidence.Phases[lKind].Processes, 10);
+      for i := 0 to 9 do
+      begin
+        lChange.Incident.Evidence.Phases[lKind].Processes[i].ProcessId := Cardinal(i + 1);
+        lChange.Incident.Evidence.Phases[lKind].Processes[i].CreationTime100ns := 100;
+        lChange.Incident.Evidence.Phases[lKind].Processes[i].DisplayName := WideChar($0141) + 'odz-worker.exe';
+        lChange.Incident.Evidence.Phases[lKind].Processes[i].ImagePath := StringOfChar(WideChar($6F22), 10000);
+      end;
+    end;
+    if (lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued) or
+      (not lService.Flush(5000)) then
+      raise Exception.Create('Evidence INSERT failed: ' + lService.Diagnostics.LastError);
+    if not TryLoadMachineOverviewIncidentEvidence(lFileName, 'complete', lEvidence, lError) then
+      raise Exception.Create('Evidence read failed: ' + lError);
+    if (lEvidence.State <> TMachineOverviewEvidenceState.Complete) or
+      (not lEvidence.Truncated) or (lEvidence.ProcessIntervalMs <> 7000) or
+      (lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes[0].DisplayName <>
+        WideChar($0141) + 'odz-worker.exe') then
+      raise Exception.Create('Evidence Unicode/cap/interval roundtrip failed');
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := lConnection;
+    lQuery.Open('SELECT evidence_json FROM incident_evidence WHERE incident_key=''complete''');
+    lOriginalJson := lQuery.Fields[0].AsWideString;
+    lQuery.Close;
+    if (QueryHistoryInt64(lConnection, 'SELECT MAX(byte_count) FROM incident_evidence') > 16384) or
+      (QueryHistoryInt64(lConnection, 'SELECT byte_count-length(CAST(evidence_json AS BLOB)) FROM incident_evidence') <> 0) or
+      (QueryHistoryInt64(lConnection, 'SELECT evidence_bytes FROM history_status') <>
+       QueryHistoryInt64(lConnection, 'SELECT SUM(byte_count) FROM incident_evidence')) then
+      raise Exception.Create('Store evidence byte cap/accounting failed');
+    lChange.HasEvidenceUpdate := False;
+    lChange.Incident.Summary := 'headline-only updated';
+    lChange.Incident.Evidence := Default(TMachineOverviewIncidentEvidence);
+    lChange.Incident.Evidence.State := TMachineOverviewEvidenceState.Collecting;
+    if (lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued) or
+      (not lService.Flush(5000)) then
+      raise Exception.Create('Headline-only update failed');
+    lQuery.Open('SELECT evidence_json FROM incident_evidence WHERE incident_key=''complete''');
+    if lQuery.Fields[0].AsWideString <> lOriginalJson then
+      raise Exception.Create('Headline-only update rewrote finalized evidence');
+    lQuery.Close;
+    if (QueryHistoryInt64(lConnection, 'SELECT evidence_state FROM incident WHERE incident_key=''complete''') <> 2) or
+      (QueryHistoryInt64(lConnection, 'SELECT state FROM incident_evidence WHERE incident_key=''complete''') <> 2) then
+      raise Exception.Create('Headline-only update changed finalized state');
+    lChange.Incident.StableId := 'collecting';
+    lChange.Incident.EndedAtUtc := 0;
+    lChange.HasEvidenceUpdate := True;
+    lChange.Incident.Evidence.ProcessIntervalMs := 5000;
+    lChange.Incident.Evidence.SystemIntervalMs := 1000;
+    if lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued then
+      raise Exception.Create('Collecting persistence failed');
+    // Cross the 200-row recovery chunk, include the gap cap and malformed bytes.
+    for i := 0 to 200 do
+    begin
+      lChange.Incident.StableId := 'recovery-' + IntToStr(i);
+      lChange.Incident.Evidence.Gaps := nil;
+      if i = 0 then
+      begin
+        SetLength(lChange.Incident.Evidence.Gaps, 16);
+        for var j := 0 to 15 do
+        begin
+          lChange.Incident.Evidence.Gaps[j].StartUtc := lUtc;
+          lChange.Incident.Evidence.Gaps[j].EndUtc := lUtc;
+          lChange.Incident.Evidence.Gaps[j].Reason := TMachineOverviewEvidenceGapReason.ProviderUnavailable;
+        end;
+      end;
+      if lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued then
+        raise Exception.Create('Recovery chunk fixture enqueue failed');
+    end;
+    if (not lService.Flush(5000)) or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Collecting persistence failed');
+    FreeAndNil(lService);
+    lConnection.ExecSQL('UPDATE incident_evidence SET evidence_json=''invalid'', byte_count=7 ' +
+      'WHERE incident_key=''recovery-1''');
+    lConnection.ExecSQL('UPDATE history_status SET evidence_bytes=' +
+      '(SELECT SUM(byte_count) FROM incident_evidence)');
+    lConnection.Connected := False;
+    lService := StartHistoryBudgetService(lConfig);
+    if (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'collecting', lEvidence, lError)) or
+      (lEvidence.State <> TMachineOverviewEvidenceState.Partial) then
+      raise Exception.Create('Evidence reopen state recovery failed: ' + lError);
+    if (Length(lEvidence.Gaps) <> 1) or
+      (lEvidence.Gaps[0].Reason <> TMachineOverviewEvidenceGapReason.CollectionStopped) or
+      (lEvidence.Gaps[0].EndUtc < lEvidence.Gaps[0].StartUtc) then
+      raise Exception.Create('Reopen omitted the CollectionStopped gap');
+    lRecoveredJson := MachineOverviewEvidenceToJson(lEvidence);
+    if (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'complete', lEvidence, lError)) or
+      (lEvidence.State <> TMachineOverviewEvidenceState.Complete) then
+      raise Exception.Create('Evidence reopen state recovery failed: ' + lError);
+    if (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'recovery-0', lEvidence, lError)) or
+      (lEvidence.State <> TMachineOverviewEvidenceState.Partial) or
+      (Length(lEvidence.Gaps) <> 16) or (lEvidence.GapsOmitted <> 1) then
+      raise Exception.Create('Reopen violated the 16-gap/gaps_omitted contract: ' + lError);
+    if (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'recovery-200', lEvidence, lError)) or
+      (lEvidence.State <> TMachineOverviewEvidenceState.Partial) or (Length(lEvidence.Gaps) <> 1) then
+      raise Exception.Create('Recovery did not finish all bounded chunks: ' + lError);
+    if TryLoadMachineOverviewIncidentEvidence(lFileName, 'recovery-1', lEvidence, lError) or
+      lError.IsEmpty or (Pos('recovery-1', lService.Diagnostics.LastError) = 0) then
+      raise Exception.Create('Malformed recovery payload did not surface explicit diagnostics');
+    lConnection.Connected := True;
+    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence WHERE state=1') <> 0) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence ' +
+        'WHERE incident_key=''recovery-1'' AND state=3 AND evidence_json=''invalid''') <> 1) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE evidence_state=1') <> 0) then
+      raise Exception.Create('Recovery lost malformed bytes or left inconsistent Collecting states');
+    if (QueryHistoryInt64(lConnection, 'SELECT MAX(byte_count) FROM incident_evidence') > 16384) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence ' +
+        'WHERE byte_count<>length(CAST(evidence_json AS BLOB))') <> 0) or
+      (QueryHistoryInt64(lConnection, 'SELECT evidence_bytes FROM history_status') <>
+       QueryHistoryInt64(lConnection, 'SELECT SUM(byte_count) FROM incident_evidence')) then
+      raise Exception.Create('Recovery violated evidence size/byte accounting');
+    lChange.Incident.StableId := 'collecting';
+    if (lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued) or
+      (not lService.Flush(5000)) or
+      (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'collecting', lEvidence, lError)) or
+      (lEvidence.State <> TMachineOverviewEvidenceState.Partial) then
+      raise Exception.Create('Stale Collecting replaced recovered Partial: ' + lError);
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Evidence restart did not stop');
+    FreeAndNil(lService);
+    // Partial evidence must be stable across later opens, including the omitted-gap count.
+    for i := 1 to 2 do
+    begin
+      lConnection.Connected := False;
+      lService := StartHistoryBudgetService(lConfig);
+      if (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'collecting', lEvidence, lError)) or
+        (lEvidence.State <> TMachineOverviewEvidenceState.Partial) or
+        (Length(lEvidence.Gaps) <> 1) or (lEvidence.GapsOmitted <> 0) or
+        (MachineOverviewEvidenceToJson(lEvidence) <> lRecoveredJson) then
+        raise Exception.Create('Repeated reopen duplicated/changed CollectionStopped gap: ' + lError);
+      if (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'recovery-0', lEvidence, lError)) or
+        (Length(lEvidence.Gaps) <> 16) or (lEvidence.GapsOmitted <> 1) then
+        raise Exception.Create('Repeated reopen incremented omitted stopped gaps: ' + lError);
+      lConnection.Connected := True;
+      if QueryHistoryInt64(lConnection, 'SELECT evidence_bytes FROM history_status') <>
+        QueryHistoryInt64(lConnection, 'SELECT SUM(byte_count) FROM incident_evidence') then
+        raise Exception.Create('Repeated reopen changed evidence byte accounting');
+      if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+        raise Exception.Create('Repeated-reopen writer did not stop');
+      FreeAndNil(lService);
+      Writeln(Format('Repeated reopen %d: gap and byte totals stable', [i]));
+    end;
+    Writeln('PASS repeated reopen: one unchanged CollectionStopped gap, no omitted-gap or byte-total drift');
+    lConnection.Connected := True;
+    // Model the exact S2 trimming transition; its deletion policy has its own retained tests.
+    lConnection.ExecSQL('DELETE FROM incident_evidence WHERE incident_key=''complete''');
+    lConnection.ExecSQL('UPDATE incident SET evidence_state=4 WHERE incident_key=''complete''');
+    lConnection.Connected := False;
+    lService := StartHistoryBudgetService(lConfig);
+    lChange.Incident.StableId := 'complete';
+    lChange.Incident.EndedAtUtc := IncMinute(lUtc, -8);
+    lChange.HasEvidenceUpdate := False;
+    if (lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued) or
+      (not lService.Flush(5000)) then
+      raise Exception.Create('Trimmed headline update failed');
+    if (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'complete', lEvidence, lError)) or
+      (lEvidence.State <> TMachineOverviewEvidenceState.Trimmed) then
+      raise Exception.Create('Headline-only update undid Trimmed: ' + lError);
+    lChange.HasEvidenceUpdate := True;
+    if (lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued) or
+      (not lService.Flush(5000)) or
+      (not TryLoadMachineOverviewIncidentEvidence(lFileName, 'complete', lEvidence, lError)) or
+      (lEvidence.State <> TMachineOverviewEvidenceState.Trimmed) then
+      raise Exception.Create('Evidence-bearing replay undid Trimmed: ' + lError);
+    lConnection.Connected := True;
+    if QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident_evidence WHERE incident_key=''complete''') <> 0 then
+      raise Exception.Create('Headline-only update resurrected trimmed evidence');
+    lConnection.ExecSQL('UPDATE incident_evidence SET evidence_json=''invalid'' WHERE incident_key=''collecting''');
+    if TryLoadMachineOverviewIncidentEvidence(lFileName, 'collecting', lEvidence, lError) or lError.IsEmpty then
+      raise Exception.Create('Invalid evidence did not return an explicit read error');
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Evidence service did not stop');
+    Writeln('PASS RunHistoryEvidenceRoundTripSelfTest: Unicode, 16 KiB, state sync, headline-only, Trimmed, Partial/stopped gap, 202-row recovery, 16-gap cap, decode diagnostics');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    g.Clear;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
 function RunMachineOverviewHistorySelfTests(const aArg: string): Integer;
 begin
   Result := -1;
@@ -2250,7 +2740,16 @@ begin
   if not SameText(aArg, cMachineOverviewHistorySelfTestArg) then
     Exit;
   try
-    Result := RunHistoryBudgetSteadyStateSelfTest;
+    Result := RunHistoryStopWithoutFlushSelfTest;
+    if Result <> 0 then
+      Exit;
+    Result := RunHistoryEvidenceRetrySelfTest(True) + RunHistoryEvidenceRetrySelfTest(False);
+    Result := Result + RunHistoryEvidenceRoundTripSelfTest;
+    if Result <> 0 then
+      Exit;
+    Result := RunHistoryBackwardUtcBatchSelfTest;
+    if Result = 0 then
+      Result := RunHistoryBudgetSteadyStateSelfTest;
     if Result = 0 then
       Result := RunHistoryBudgetFloorBreachSelfTest;
     if Result = 0 then

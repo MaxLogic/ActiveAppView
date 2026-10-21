@@ -25,6 +25,7 @@ type
     Rollup1mRetentionDays: Integer;
     MaxDatabaseSizeBytes: UInt64;
     BusyTimeoutMs: Cardinal;
+    ProcessSampleIntervalMs, SystemSampleIntervalMs: Cardinal;
   DiskFreeBytesOverride: Int64;
   CompactionMinimumFreeBytes: UInt64;
     IncidentRetentionDays: Integer;
@@ -36,6 +37,7 @@ type
   end;
 
   TMachineOverviewHistoryItem = record
+    EvidenceUpdatedUtcMs: Int64;
     IncidentChange: TMachineOverviewIncidentChange;
     Kind: TMachineOverviewHistoryItemKind;
     Sample: IMachineOverviewRawSample;
@@ -56,6 +58,7 @@ type
   TMachineOverviewHistoryBacklog = class
   private
     fState: TObject;
+    procedure ReturnFirst(const aItems: TArray<TMachineOverviewHistoryItem>);
   public
     constructor Create(const aCapacity: Integer);
     destructor Destroy; override;
@@ -117,6 +120,8 @@ function TryLoadMachineOverviewIncidents(const aDatabaseFileName: string;
   const aEarliestUtc: TDateTime; const aMaximumCount: Integer;
   out aIncidents: TArray<TMachineOverviewIncident>;
   out aError: string): Boolean;
+function TryLoadMachineOverviewIncidentEvidence(const aDatabaseFileName, aIncidentKey: string;
+  out aEvidence: TMachineOverviewIncidentEvidence; out aError: string): Boolean;
 
 implementation
 
@@ -127,7 +132,7 @@ uses
   AutoFree, Data.DB, FireDAC.Comp.Client, FireDAC.Phys.SQLite,
   FireDAC.Phys.SQLiteDef, FireDAC.Phys.SQLiteWrapper,
   FireDAC.Stan.Async, FireDAC.Stan.Def,
-  ActiveAppView.MachineOverview.Providers;
+  ActiveAppView.MachineOverview.Evidence, ActiveAppView.MachineOverview.Providers;
 
 type
   TMachineOverviewHistoryBacklogState = class
@@ -172,6 +177,8 @@ type
     fDiskInsert: TFDQuery;
     fDriverLink: TFDPhysSQLiteDriverLink;
     fIncidentUpsert: TFDQuery;
+    fEvidenceUpsert, fEvidenceSize: TFDQuery;
+    fLogicalProcessorCount: Integer;
     fProcessInsert: TFDQuery;
     fRollup10s: TFDQuery;
     fRollup1m: TFDQuery;
@@ -198,10 +205,12 @@ type
     function Scalar(const aSql: string): Int64;
     function IsStopping: Boolean;
     procedure Observe(const aStage: string);
+    procedure ObserveTestHook(const aStage: string);
     function FreeBytes(const aPath: string): UInt64;
     procedure BackupDatabase(const aVersion: Integer);
     procedure CopyBackupFile(const aSource, aDestination: string);
     procedure RecoverLegacyIncidents;
+    procedure RecoverCollectingEvidence;
     procedure CompactAtStartup;
     function LoadIncidents(const aEarliestUtc: TDateTime;
       const aMaximumCount: Integer): TArray<TMachineOverviewIncident>;
@@ -210,7 +219,7 @@ type
       const aCpuAvailable: Boolean; const aCpuValue: Double;
       const aPhysicalAvailable: Double);
     procedure WriteDiskSample(const aSample: IMachineOverviewRawSample);
-    procedure WriteIncident(const aIncident: TMachineOverviewIncident);
+    procedure WriteIncident(const aChange: TMachineOverviewIncidentChange; const aUpdatedUtcMs: Int64);
     procedure WriteProcessSample(const aSample: IMachineOverviewRawSample);
     procedure WriteSystemSample(const aSample: IMachineOverviewRawSample);
   public
@@ -473,6 +482,10 @@ begin
   g := Default(TGarbos);
   inherited Create;
   fConfig := aConfig;
+  if fConfig.ProcessSampleIntervalMs = 0 then
+    fConfig.ProcessSampleIntervalMs := 5000;
+  if fConfig.SystemSampleIntervalMs = 0 then
+    fConfig.SystemSampleIntervalMs := 1000;
   if fConfig.IncidentRetentionDays <= 0 then
     fConfig.IncidentRetentionDays := 365;
   if fConfig.MaximumIncidentCount <= 0 then
@@ -496,6 +509,8 @@ begin
   except
     FreeAndNil(fRollup1m);
     FreeAndNil(fRollup10s);
+    FreeAndNil(fEvidenceSize);
+    FreeAndNil(fEvidenceUpsert);
     FreeAndNil(fIncidentUpsert);
     FreeAndNil(fProcessInsert);
     FreeAndNil(fDiskInsert);
@@ -510,6 +525,8 @@ destructor TMachineOverviewHistoryStore.Destroy;
 begin
   FreeAndNil(fRollup1m);
   FreeAndNil(fRollup10s);
+  FreeAndNil(fEvidenceSize);
+  FreeAndNil(fEvidenceUpsert);
   FreeAndNil(fIncidentUpsert);
   FreeAndNil(fProcessInsert);
   FreeAndNil(fDiskInsert);
@@ -617,10 +634,16 @@ end;
 
 procedure TMachineOverviewHistoryStore.Observe(const aStage: string);
 begin
-  if Assigned(fConfig.MigrationObserver) then
-    fConfig.MigrationObserver(aStage);
+  ObserveTestHook(aStage);
   if IsStopping then
     raise EAbort.Create('History upgrade cancelled');
+end;
+
+procedure TMachineOverviewHistoryStore.ObserveTestHook(const aStage: string);
+begin
+  // Our normal writer must drain after Stop; only upgrade stages cancel on Stopping.
+  if Assigned(fConfig.MigrationObserver) then
+    fConfig.MigrationObserver(aStage);
 end;
 
 function TMachineOverviewHistoryStore.FreeBytes(const aPath: string): UInt64;
@@ -785,18 +808,114 @@ begin
     if lCount > 0 then
       Observe('CleanupChunkCommitted');
   until lCount = 0;
+  RecoverCollectingEvidence;
   Observe('BeforeRecovery');
   fConnection.StartTransaction;
   try
-    fConnection.ExecSQL('UPDATE incident_evidence SET state=3 WHERE state=1 OR ' +
-      'incident_key IN (SELECT incident_key FROM incident WHERE ended_utc_ms=0)');
-    fConnection.ExecSQL('UPDATE incident SET evidence_state=3 WHERE evidence_state=1 OR ended_utc_ms=0');
+    fConnection.ExecSQL('UPDATE incident SET evidence_state=3 WHERE evidence_state=1 OR ' +
+      '(ended_utc_ms=0 AND evidence_state<>4)');
     fConnection.Commit;
   except
     if fConnection.InTransaction then
       fConnection.Rollback;
     raise;
   end;
+end;
+
+procedure TMachineOverviewHistoryStore.RecoverCollectingEvidence;
+var
+  g: TGarbos;
+  lQuery, lUpdate: TFDQuery;
+  lEvidence: TMachineOverviewIncidentEvidence;
+  lKey, lJson, lError: string;
+  lNowMs, lStartMs, lTotalBytes: Int64;
+  lBytes, lCount, lErrors, n: Integer;
+begin
+  g := Default(TGarbos);
+  GC(lQuery, TFDQuery.Create(nil), g);
+  GC(lUpdate, TFDQuery.Create(nil), g);
+  lQuery.Connection := fConnection;
+  lQuery.SQL.Text := 'SELECT incident_key, CAST(updated_utc_ms AS TEXT) AS updated_ms, ' +
+    'byte_count, CASE WHEN byte_count<=16384 AND length(CAST(evidence_json AS BLOB))<=16384 ' +
+    'THEN evidence_json ELSE NULL END AS evidence_json FROM incident_evidence WHERE state=1 OR ' +
+    '(state NOT IN (3,4) AND incident_key IN (SELECT incident_key FROM incident WHERE ended_utc_ms=0)) ' +
+    'ORDER BY incident_key LIMIT 200';
+  lUpdate.Connection := fConnection;
+  lUpdate.SQL.Text := 'UPDATE incident_evidence SET state=3, evidence_json=:json, byte_count=:bytes, ' +
+    'updated_utc_ms=:updated WHERE incident_key=:key';
+  lUpdate.ParamByName('json').DataType := ftWideMemo;
+  lUpdate.ParamByName('bytes').DataType := ftInteger;
+  lUpdate.ParamByName('updated').DataType := ftLargeint;
+  lUpdate.ParamByName('key').DataType := ftWideString;
+  lUpdate.Prepare;
+  lNowMs := HistoryUtcMilliseconds(TTimeZone.Local.ToUniversalTime(Now));
+  lErrors := 0;
+  lTotalBytes := Scalar('SELECT COALESCE(SUM(byte_count),0) FROM incident_evidence');
+  repeat
+    lCount := 0;
+    fConnection.StartTransaction;
+    try
+      lQuery.Open;
+      lQuery.FetchAll;
+      while not lQuery.Eof do
+      begin
+        Inc(lCount);
+        lKey := lQuery.FieldByName('incident_key').AsWideString;
+        lJson := lQuery.FieldByName('evidence_json').AsWideString;
+        lError := '';
+        if lQuery.FieldByName('evidence_json').IsNull then
+          lError := 'Evidence exceeds the 16 KiB recovery limit'
+        else if TryMachineOverviewEvidenceFromJson(lJson, lEvidence, lError) then
+        begin
+          lEvidence.State := TMachineOverviewEvidenceState.Partial;
+          n := Length(lEvidence.Gaps);
+          if n < 16 then
+          begin
+            SetLength(lEvidence.Gaps, n + 1);
+            lStartMs := HistoryFieldInt64(lQuery.FieldByName('updated_ms'));
+            // A backward UTC step cannot produce an inverted stopped interval.
+            lEvidence.Gaps[n].StartUtc := HistoryDateTimeFromMilliseconds(lStartMs);
+            lEvidence.Gaps[n].EndUtc := HistoryDateTimeFromMilliseconds(Max(lStartMs, lNowMs));
+            lEvidence.Gaps[n].Reason := TMachineOverviewEvidenceGapReason.CollectionStopped;
+          end else if lEvidence.GapsOmitted < MaxInt then
+            Inc(lEvidence.GapsOmitted);
+          lJson := MachineOverviewEvidenceToJson(lEvidence);
+          if TEncoding.UTF8.GetByteCount(lJson) > 16384 then
+            raise EInvalidOperation.Create('Recovered incident evidence exceeds the 16 KiB storage limit');
+          lUpdate.ParamByName('key').AsWideString := lKey;
+          lUpdate.ParamByName('json').AsWideMemo := lJson;
+          lBytes := TEncoding.UTF8.GetByteCount(lJson);
+          lUpdate.ParamByName('bytes').AsInteger := lBytes;
+          lUpdate.ParamByName('updated').AsLargeInt := Max(lNowMs,
+            HistoryFieldInt64(lQuery.FieldByName('updated_ms')));
+          lUpdate.ExecSQL;
+          lTotalBytes := lTotalBytes + lBytes - lQuery.FieldByName('byte_count').AsInteger;
+        end;
+        if not lError.IsEmpty then
+        begin
+          // Keep malformed bytes for diagnosis; recover the state without hiding the failure.
+          fConnection.ExecSQL('UPDATE incident_evidence SET state=3 WHERE incident_key=?', [lKey]);
+          Inc(lErrors);
+          if lErrors = 1 then
+            fStartupError := Trim(fStartupError + ' Evidence recovery failed for ' +
+              Copy(lKey, 1, 128) + ': ' + Copy(lError, 1, 512));
+        end;
+        fConnection.ExecSQL('UPDATE incident SET evidence_state=3 WHERE incident_key=?', [lKey]);
+        lQuery.Next;
+      end;
+      lQuery.Close;
+      fConnection.ExecSQL('UPDATE history_status SET evidence_bytes=?, last_error=? WHERE id=1',
+        [lTotalBytes, fStartupError]);
+      fConnection.Commit;
+    except
+      lQuery.Close;
+      if fConnection.InTransaction then
+        fConnection.Rollback;
+      raise;
+    end;
+  until lCount = 0;
+  if lErrors > 0 then
+    fStartupError := fStartupError + Format(' (%d recovery errors)', [lErrors]);
 end;
 
 procedure TMachineOverviewHistoryStore.CompactAtStartup;
@@ -1061,11 +1180,13 @@ begin
   fProcessInsert.SQL.Text := 'INSERT INTO process_top_sample(utc_ms, ' +
     'monotonic_ms, category, rank_value, entity_id, process_id, ' +
     'creation_time_100ns, display_name, image_path, path_status, ' +
-    'metric_value) VALUES (:utc_ms, :monotonic_ms, :category, ' +
+    'metric_value, interval_ms, logical_processor_count) VALUES (:utc_ms, :monotonic_ms, :category, ' +
     ':rank_value, :entity_id, :process_id, :creation_time_100ns, ' +
-    ':display_name, :image_path, :path_status, :metric_value)';
+    ':display_name, :image_path, :path_status, :metric_value, :interval_ms, :logical_processor_count)';
   fProcessInsert.ParamByName('utc_ms').DataType := ftLargeint;
   fProcessInsert.ParamByName('monotonic_ms').DataType := ftLargeint;
+  fProcessInsert.ParamByName('interval_ms').DataType := ftLargeint;
+  fProcessInsert.ParamByName('logical_processor_count').DataType := ftInteger;
   fProcessInsert.ParamByName('category').DataType := ftWideString;
   fProcessInsert.ParamByName('rank_value').DataType := ftInteger;
   fProcessInsert.ParamByName('entity_id').DataType := ftWideString;
@@ -1143,6 +1264,27 @@ begin
   fIncidentUpsert.ParamByName('post_context_json').DataType := ftWideMemo;
   fIncidentUpsert.ParamByName('context_text').DataType := ftWideMemo;
   fIncidentUpsert.Prepare;
+  fEvidenceSize := TFDQuery.Create(nil);
+  fEvidenceSize.Connection := fConnection;
+  fEvidenceSize.SQL.Text := 'SELECT byte_count FROM incident_evidence WHERE incident_key=:key';
+  fEvidenceSize.ParamByName('key').DataType := ftWideString;
+  fEvidenceSize.Prepare;
+  fEvidenceUpsert := TFDQuery.Create(nil);
+  fEvidenceUpsert.Connection := fConnection;
+  fEvidenceUpsert.SQL.Text := 'INSERT INTO incident_evidence(incident_key, started_utc_ms, ' +
+    'updated_utc_ms, state, byte_count, evidence_json) SELECT :key, :started, :updated, :state, :bytes, :json ' +
+    'WHERE NOT EXISTS (SELECT 1 FROM incident WHERE incident_key=:key AND evidence_state=4) ' +
+    'ON CONFLICT(incident_key) DO UPDATE SET updated_utc_ms=excluded.updated_utc_ms, ' +
+    'state=excluded.state, byte_count=excluded.byte_count, evidence_json=excluded.evidence_json ' +
+    'WHERE excluded.updated_utc_ms>=incident_evidence.updated_utc_ms AND incident_evidence.state<>4 ' +
+    'AND NOT (incident_evidence.state IN (2,3,4) AND excluded.state=1)';
+  fEvidenceUpsert.ParamByName('key').DataType := ftWideString;
+  fEvidenceUpsert.ParamByName('started').DataType := ftLargeint;
+  fEvidenceUpsert.ParamByName('updated').DataType := ftLargeint;
+  fEvidenceUpsert.ParamByName('state').DataType := ftInteger;
+  fEvidenceUpsert.ParamByName('bytes').DataType := ftInteger;
+  fEvidenceUpsert.ParamByName('json').DataType := ftWideMemo;
+  fEvidenceUpsert.Prepare;
 end;
 
 procedure TMachineOverviewHistoryStore.WriteRollup(const aQuery: TFDQuery;
@@ -1328,8 +1470,13 @@ var
   lProcessId: Int64;
   lProviderSample: TMachineOverviewProviderSample;
   lRank: Integer;
+  lInterval, lLogicalProcessors: TMachineOverviewMeasurement;
 begin
   lProviderSample := aSample.ProviderSample;
+  FindHistoryMeasurement(lProviderSample, 'process_cpu_interval_ms', lInterval);
+  FindHistoryMeasurement(lProviderSample, 'logical_processor_count', lLogicalProcessors);
+  if lLogicalProcessors.Available then
+    fLogicalProcessorCount := Max(0, Round(lLogicalProcessors.Value));
   for lMeasurement in lProviderSample.Measurements do
     if TryParseHistoryRank(lMeasurement.Name, lCategory, lRank) then
     begin
@@ -1354,6 +1501,8 @@ begin
         lMeasurement.StatusText;
       fProcessInsert.ParamByName('metric_value').AsFloat :=
         lMeasurement.Value;
+      fProcessInsert.ParamByName('interval_ms').AsLargeInt := Max(Int64(0), Round(lInterval.Value));
+      fProcessInsert.ParamByName('logical_processor_count').AsInteger := fLogicalProcessorCount;
       fProcessInsert.ExecSQL;
     end;
 end;
@@ -1401,43 +1550,48 @@ begin
 end;
 
 procedure TMachineOverviewHistoryStore.WriteIncident(
-  const aIncident: TMachineOverviewIncident);
+  const aChange: TMachineOverviewIncidentChange; const aUpdatedUtcMs: Int64);
+var
+  lIncident: TMachineOverviewIncident;
+  lJson: string;
+  lBytes, lPreviousBytes: Integer;
 begin
-  if aIncident.StableId.IsEmpty then
+  lIncident := aChange.Incident;
+  if lIncident.StableId.IsEmpty then
     Exit;
   fIncidentUpsert.ParamByName('incident_key').AsWideString :=
-    aIncident.StableId;
+    lIncident.StableId;
   fIncidentUpsert.ParamByName('started_utc_ms').AsLargeInt :=
-    HistoryUtcMilliseconds(aIncident.StartedAtUtc);
+    HistoryUtcMilliseconds(lIncident.StartedAtUtc);
   fIncidentUpsert.ParamByName('peak_utc_ms').AsLargeInt :=
-    HistoryUtcMilliseconds(aIncident.PeakAtUtc);
+    HistoryUtcMilliseconds(lIncident.PeakAtUtc);
   fIncidentUpsert.ParamByName('ended_utc_ms').AsLargeInt :=
-    HistoryUtcMilliseconds(aIncident.EndedAtUtc);
+    HistoryUtcMilliseconds(lIncident.EndedAtUtc);
   fIncidentUpsert.ParamByName('category').AsInteger :=
-    Ord(aIncident.Category);
+    Ord(lIncident.Category);
   fIncidentUpsert.ParamByName('severity').AsInteger :=
-    Ord(aIncident.Severity);
+    Ord(lIncident.Severity);
   fIncidentUpsert.ParamByName('origin').AsInteger :=
-    Ord(aIncident.Origin);
+    Ord(lIncident.Origin);
   fIncidentUpsert.ParamByName('local_display_time').AsWideString :=
-    aIncident.LocalDisplayTime;
-  fIncidentUpsert.ParamByName('summary').AsWideString := aIncident.Summary;
+    lIncident.LocalDisplayTime;
+  fIncidentUpsert.ParamByName('summary').AsWideString := lIncident.Summary;
   fIncidentUpsert.ParamByName('explanation').Value :=
-    aIncident.Explanation;
+    lIncident.Explanation;
   fIncidentUpsert.ParamByName('threshold_text').AsWideString :=
-    aIncident.ThresholdText;
-  fIncidentUpsert.ParamByName('peak_value').AsFloat := aIncident.PeakValue;
+    lIncident.ThresholdText;
+  fIncidentUpsert.ParamByName('peak_value').AsFloat := lIncident.PeakValue;
   fIncidentUpsert.ParamByName('provider_id').AsWideString :=
-    aIncident.ProviderId;
+    lIncident.ProviderId;
   fIncidentUpsert.ParamByName('provider_freshness_ms').AsLargeInt :=
-    aIncident.ProviderFreshnessMs;
+    lIncident.ProviderFreshnessMs;
   fIncidentUpsert.ParamByName('related_entity_ids_json').Value :=
-    HistoryStringArrayToJson(aIncident.RelatedEntityIds);
+    HistoryStringArrayToJson(lIncident.RelatedEntityIds);
   fIncidentUpsert.ParamByName(
     'related_executable_paths_json').Value :=
-    HistoryStringArrayToJson(aIncident.RelatedExecutablePaths);
+    HistoryStringArrayToJson(lIncident.RelatedExecutablePaths);
   fIncidentUpsert.ParamByName('trace_status').AsInteger :=
-    Ord(aIncident.TraceStatus);
+    Ord(lIncident.TraceStatus);
   fIncidentUpsert.ParamByName('pre_context_json').Value :=
     '[]';
   fIncidentUpsert.ParamByName('post_context_json').Value :=
@@ -1445,6 +1599,36 @@ begin
   fIncidentUpsert.ParamByName('context_text').Value :=
     '';
   fIncidentUpsert.ExecSQL;
+  // A finalized-key replay or trace update must preserve even a Trimmed state.
+  if (not aChange.HasEvidenceUpdate) or
+    (lIncident.Evidence.State in [TMachineOverviewEvidenceState.Legacy, TMachineOverviewEvidenceState.NotRecorded]) then
+    Exit;
+  lJson := MachineOverviewEvidenceToJson(lIncident.Evidence);
+  lBytes := TEncoding.UTF8.GetByteCount(lJson);
+  if lBytes > 16384 then
+    raise EInvalidOperation.Create('Incident evidence exceeds the 16 KiB storage limit');
+  fEvidenceSize.ParamByName('key').AsWideString := lIncident.StableId;
+  fEvidenceSize.Open;
+  try
+    lPreviousBytes := 0;
+    if not fEvidenceSize.Eof then
+      lPreviousBytes := fEvidenceSize.Fields[0].AsInteger;
+  finally
+    fEvidenceSize.Close;
+  end;
+  fEvidenceUpsert.ParamByName('key').AsWideString := lIncident.StableId;
+  fEvidenceUpsert.ParamByName('started').AsLargeInt := HistoryUtcMilliseconds(lIncident.StartedAtUtc);
+  fEvidenceUpsert.ParamByName('updated').AsLargeInt := aUpdatedUtcMs;
+  fEvidenceUpsert.ParamByName('state').AsInteger := Ord(lIncident.Evidence.State);
+  fEvidenceUpsert.ParamByName('bytes').AsInteger := lBytes;
+  // FireDAC AsWideString forces ftWideString; AsWideMemo preserves our prepared Unicode memo type.
+  fEvidenceUpsert.ParamByName('json').AsWideMemo := lJson;
+  fEvidenceUpsert.ExecSQL;
+  if fEvidenceUpsert.RowsAffected = 0 then
+    Exit;
+  fConnection.ExecSQL('UPDATE incident SET evidence_state=? WHERE incident_key=?',
+    [Ord(lIncident.Evidence.State), lIncident.StableId]);
+  fEvidenceBytes := fEvidenceBytes + lBytes - lPreviousBytes;
 end;
 
 function TMachineOverviewHistoryStore.CanDelete(const aStatements: Integer): Boolean;
@@ -1681,12 +1865,14 @@ begin
     'storage_state=?, storage_message=?, last_floor_breach_utc_ms=CASE WHEN ?=2 THEN ? ELSE ' +
     'last_floor_breach_utc_ms END, evidence_trimmed_total=evidence_trimmed_total+?, ' +
     'incidents_deleted_total=incidents_deleted_total+?, samples_deleted_total=samples_deleted_total+?, ' +
-    'last_error=? WHERE id=1', [lStatusUtc, Int64(fConfig.CommitIntervalMs),
+    'last_error=?, process_interval_ms=?, system_interval_ms=?, logical_processor_count=? WHERE id=1',
+    [lStatusUtc, Int64(fConfig.CommitIntervalMs),
     Int64(fConfig.MaxDatabaseSizeBytes), fUsedBytes,
     Scalar('PRAGMA page_count') * Scalar('PRAGMA page_size'), lWalBytes, fEvidenceBytes,
     Ord(fStorageState), fStorageMessage, Ord(fStorageState), lStatusUtc,
     fTrimmedEvidence, fDeletedIncidents, fDeletedSamples,
-    Trim(fStartupError + ' ' + fMaintenanceError)]);
+    Trim(fStartupError + ' ' + fMaintenanceError), Int64(fConfig.ProcessSampleIntervalMs),
+    Int64(fConfig.SystemSampleIntervalMs), fLogicalProcessorCount]);
 end;
 
 function TMachineOverviewHistoryStore.RunMaintenance: Integer;
@@ -1745,10 +1931,11 @@ procedure TMachineOverviewHistoryStore.WriteBatch(
   const aItems: TArray<TMachineOverviewHistoryItem>);
 var
   lItem: TMachineOverviewHistoryItem;
-  lTime: Int64;
+  lTime, lOriginalEvidenceBytes: Int64;
 begin
   fBatchBoundary := High(Int64);
   fMaintenanceNow := 0;
+  lOriginalEvidenceBytes := fEvidenceBytes;
   fConnection.StartTransaction;
   try
     for lItem in aItems do
@@ -1765,7 +1952,7 @@ begin
         lTime := HistoryUtcMilliseconds(lItem.Sample.CapturedAtUtc);
       end else if lItem.Kind = TMachineOverviewHistoryItemKind.Incident then
       begin
-        WriteIncident(lItem.IncidentChange.Incident);
+        WriteIncident(lItem.IncidentChange, lItem.EvidenceUpdatedUtcMs);
         lTime := HistoryUtcMilliseconds(lItem.IncidentChange.Incident.StartedAtUtc);
       end;
       if ((lItem.Kind = TMachineOverviewHistoryItemKind.RawSample) and Assigned(lItem.Sample)) or
@@ -1780,8 +1967,10 @@ begin
       fMaintenanceNow := HistoryUtcMilliseconds(TTimeZone.Local.ToUniversalTime(Now));
     fConnection.ExecSQL('UPDATE history_status SET updated_utc_ms=? WHERE id=1',
       [HistoryUtcMilliseconds(TTimeZone.Local.ToUniversalTime(Now))]);
+    ObserveTestHook('BeforeBatchCommit');
     fConnection.Commit;
   except
+    fEvidenceBytes := lOriginalEvidenceBytes;
     if fConnection.InTransaction then
       fConnection.Rollback;
     raise;
@@ -1803,7 +1992,7 @@ begin
     lQuery.Connection := fConnection;
     lQuery.SQL.Text := 'SELECT incident_key, ' +
       'CAST(started_utc_ms AS TEXT) AS started_utc_ms_text, severity, ' +
-      'summary, explanation, threshold_text FROM incident ' +
+      'summary, explanation, threshold_text, evidence_state FROM incident ' +
       'WHERE started_utc_ms >= :earliest ORDER BY started_utc_ms DESC, ' +
       'incident_key ASC LIMIT :maximum';
     lQuery.ParamByName('earliest').AsLargeInt :=
@@ -1816,6 +2005,7 @@ begin
     while not lQuery.Eof do
     begin
       lIncident := Default(TMachineOverviewIncident);
+      lIncident.Evidence.State := TMachineOverviewEvidenceState(lQuery.FieldByName('evidence_state').AsInteger);
       lIncident.StableId := lQuery.FieldByName('incident_key').AsString;
       lIncident.StartedAtUtc := HistoryDateTimeFromMilliseconds(
         HistoryFieldInt64(lQuery.FieldByName('started_utc_ms_text')));
@@ -1870,6 +2060,14 @@ begin
     Result.MaxDatabaseSizeBytes := UInt64(lDefaults.MaxDatabaseSizeMB) *
       1024 * 1024;
   Result.BusyTimeoutMs := 100;
+  if aSettings.ProcessSampleIntervalMs > 0 then
+    Result.ProcessSampleIntervalMs := Cardinal(aSettings.ProcessSampleIntervalMs)
+  else
+    Result.ProcessSampleIntervalMs := Cardinal(lDefaults.ProcessSampleIntervalMs);
+  if aSettings.SystemSampleIntervalMs > 0 then
+    Result.SystemSampleIntervalMs := Cardinal(aSettings.SystemSampleIntervalMs)
+  else
+    Result.SystemSampleIntervalMs := Cardinal(lDefaults.SystemSampleIntervalMs);
   Result.DiskFreeBytesOverride := -1;
 end;
 
@@ -1888,6 +2086,8 @@ begin
   Result := Default(TMachineOverviewHistoryItem);
   Result.Kind := TMachineOverviewHistoryItemKind.Incident;
   Result.IncidentChange := aChange;
+  // Retries retain the enqueue revision instead of acquiring a newer write timestamp.
+  Result.EvidenceUpdatedUtcMs := HistoryUtcMilliseconds(TTimeZone.Local.ToUniversalTime(Now));
 end;
 
 class function TMachineOverviewHistoryItem.CreateIncidentMarker:
@@ -2009,6 +2209,38 @@ begin
     begin
       lState.fItems.Delete(0);
       Dec(lRemainingCount);
+    end;
+  finally
+    lState.fLock.Release;
+  end;
+end;
+
+procedure TMachineOverviewHistoryBacklog.ReturnFirst(
+  const aItems: TArray<TMachineOverviewHistoryItem>);
+var
+  lState: TMachineOverviewHistoryBacklogState;
+  lDropIndex, i: NativeInt;
+begin
+  lState := GetHistoryBacklogState(fState);
+  lState.fLock.Acquire;
+  try
+    // Keep the failed batch in its original order ahead of work accepted during I/O.
+    lState.fItems.InsertRange(0, aItems);
+    while lState.fItems.Count > lState.fCapacity do
+    begin
+      lDropIndex := lState.fItems.Count - 1;
+      // Preserve failed items; apply our raw-first overflow policy to newer work.
+      for i := lState.fItems.Count - 1 downto Length(aItems) do
+        if lState.fItems[i].Kind = TMachineOverviewHistoryItemKind.RawSample then
+        begin
+          lDropIndex := i;
+          Break;
+        end;
+      if lState.fItems[lDropIndex].Kind = TMachineOverviewHistoryItemKind.RawSample then
+        Inc(lState.fRawDropped)
+      else
+        Inc(lState.fIncidentDropped);
+      lState.fItems.Delete(lDropIndex);
     end;
   finally
     lState.fLock.Release;
@@ -2211,7 +2443,6 @@ var
   lFlushRequested: Boolean;
   lIncidentError: string;
   lIncidents: TArray<TMachineOverviewIncident>;
-  lItem: TMachineOverviewHistoryItem;
   lNextCommitMs: UInt64;
   lNowMs: UInt64;
   lSample: IMachineOverviewRawSample;
@@ -2303,12 +2534,7 @@ begin
         except
           on lException: Exception do
           begin
-            for lItem in lBatch do
-            begin
-              lEnqueueResult := fServiceState.Backlog.Enqueue(lItem);
-              if lEnqueueResult = TMachineOverviewHistoryEnqueueResult.Dropped then
-                fServiceState.PublishDiagnostics;
-            end;
+            fServiceState.Backlog.ReturnFirst(lBatch);
             TInterlocked.Exchange(fServiceState.InFlightCount, 0);
             fServiceState.MarkCommitFailure(lException.Message);
             lCommitFailed := True;
@@ -2613,7 +2839,7 @@ var
   lIndex: Integer;
   lOrdinal: Integer;
   lQuery: TFDQuery;
-  lStage: string;
+  lStage, lEvidenceColumn: string;
   lVersion: Integer;
 begin
   aIncidents := nil;
@@ -2654,7 +2880,11 @@ begin
     if (lVersion < 2) or (lVersion > cMachineOverviewHistorySchemaVersion) then
       raise EInvalidOperation.CreateFmt('Unsupported history reader schema %d', [lVersion]);
     if lVersion = 2 then
+    begin
       aError := rsHistoryUpgradePending;
+      lEvidenceColumn := '5 AS evidence_state';
+    end else
+      lEvidenceColumn := 'evidence_state';
       lQuery.SQL.Text := 'SELECT incident_key, ' +
         'CAST(started_utc_ms AS TEXT) AS started_utc_ms_text, ' +
         'CAST(peak_utc_ms AS TEXT) AS peak_utc_ms_text, ' +
@@ -2663,7 +2893,7 @@ begin
         'summary, explanation, threshold_text, peak_value, provider_id, ' +
         'CAST(provider_freshness_ms AS TEXT) AS provider_freshness_ms_text, ' +
         'related_entity_ids_json, ' +
-        'related_executable_paths_json, trace_status ' +
+        'related_executable_paths_json, trace_status, ' + lEvidenceColumn + ' ' +
         'FROM incident WHERE started_utc_ms >= :earliest ' +
         'ORDER BY started_utc_ms DESC, incident_key ASC LIMIT :maximum';
       lQuery.ParamByName('earliest').AsLargeInt :=
@@ -2678,7 +2908,12 @@ begin
       while not lQuery.Eof do
       begin
         lIncident := Default(TMachineOverviewIncident);
-        lIncident.StableId := lQuery.FieldByName('incident_key').AsString;
+        lOrdinal := lQuery.FieldByName('evidence_state').AsInteger;
+        if (lOrdinal < Ord(Low(TMachineOverviewEvidenceState))) or
+          (lOrdinal > Ord(High(TMachineOverviewEvidenceState))) then
+          raise EConvertError.Create('Invalid incident evidence state');
+        lIncident.Evidence.State := TMachineOverviewEvidenceState(lOrdinal);
+        lIncident.StableId := lQuery.FieldByName('incident_key').AsWideString;
         lIncident.StartedAtUtc := HistoryDateTimeFromMilliseconds(
           HistoryFieldInt64(lQuery.FieldByName('started_utc_ms_text')));
         lIncident.PeakAtUtc := HistoryDateTimeFromMilliseconds(
@@ -2693,22 +2928,22 @@ begin
         lOrdinal := lQuery.FieldByName('origin').AsInteger;
         lIncident.Origin := HistoryIncidentOriginFromOrdinal(lOrdinal);
         lIncident.LocalDisplayTime :=
-          lQuery.FieldByName('local_display_time').AsString;
-        lIncident.Summary := lQuery.FieldByName('summary').AsString;
-        lIncident.Explanation := lQuery.FieldByName('explanation').AsString;
+          lQuery.FieldByName('local_display_time').AsWideString;
+        lIncident.Summary := lQuery.FieldByName('summary').AsWideString;
+        lIncident.Explanation := lQuery.FieldByName('explanation').AsWideString;
         lIncident.ThresholdText :=
-          lQuery.FieldByName('threshold_text').AsString;
+          lQuery.FieldByName('threshold_text').AsWideString;
         lIncident.PeakValue := lQuery.FieldByName('peak_value').AsFloat;
-        lIncident.ProviderId := lQuery.FieldByName('provider_id').AsString;
+        lIncident.ProviderId := lQuery.FieldByName('provider_id').AsWideString;
         lIncident.ProviderFreshnessMs :=
           HistoryFieldInt64(
             lQuery.FieldByName('provider_freshness_ms_text'));
         if not TryHistoryStringArrayFromJson(
-          lQuery.FieldByName('related_entity_ids_json').AsString,
+          lQuery.FieldByName('related_entity_ids_json').AsWideString,
           lIncident.RelatedEntityIds) then
           raise EConvertError.Create('Invalid incident related-entity data');
         if not TryHistoryStringArrayFromJson(
-          lQuery.FieldByName('related_executable_paths_json').AsString,
+          lQuery.FieldByName('related_executable_paths_json').AsWideString,
           lIncident.RelatedExecutablePaths) then
           raise EConvertError.Create('Invalid incident executable-path data');
         lOrdinal := lQuery.FieldByName('trace_status').AsInteger;
@@ -2730,6 +2965,89 @@ begin
   finally
     lQuery.Free;
     lConnection.Free;
+  end;
+end;
+
+function TryLoadMachineOverviewIncidentEvidence(const aDatabaseFileName, aIncidentKey: string;
+  out aEvidence: TMachineOverviewIncidentEvidence; out aError: string): Boolean;
+var
+  g: TGarbos;
+  lConnection: TFDConnection;
+  lDriverLink: TFDPhysSQLiteDriverLink;
+  lQuery: TFDQuery;
+  lState, lVersion: Integer;
+  lJson: string;
+begin
+  g := Default(TGarbos);
+  aEvidence := Default(TMachineOverviewIncidentEvidence);
+  aError := '';
+  Result := False;
+  try
+    if aDatabaseFileName.Trim.IsEmpty or (not TFile.Exists(aDatabaseFileName)) then
+      raise EInvalidOperation.Create('History database is unavailable');
+    GC(lConnection, TFDConnection.Create(nil), g);
+    lDriverLink := TFDPhysSQLiteDriverLink.Create(lConnection);
+    lDriverLink.DriverID := cMachineOverviewSQLiteDriverId;
+    lDriverLink.EngineLinkage := slDynamic;
+    lDriverLink.VendorLib := TPath.Combine(ExtractFilePath(ParamStr(0)), 'sqlite3.dll');
+    lConnection.LoginPrompt := False;
+    lConnection.ResourceOptions.SilentMode := True;
+    lConnection.Params.Values['DriverID'] := cMachineOverviewSQLiteDriverId;
+    lConnection.Params.Values['Database'] := aDatabaseFileName;
+    lConnection.Params.Values['OpenMode'] := 'ReadOnly';
+    lConnection.Params.Values['JournalMode'] := HistoryJournalMode(aDatabaseFileName);
+    lConnection.Params.Values['LockingMode'] := 'Normal';
+    lConnection.Params.Values['SharedCache'] := 'False';
+    lConnection.Params.Values['BusyTimeout'] := '100';
+    lConnection.Connected := True;
+    lConnection.ExecSQL('PRAGMA query_only=ON');
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := lConnection;
+    lQuery.Open('PRAGMA user_version');
+    lVersion := lQuery.Fields[0].AsInteger;
+    lQuery.Close;
+    if lVersion = 2 then
+    begin
+      aEvidence.State := TMachineOverviewEvidenceState.NotRecorded;
+      aError := rsHistoryUpgradePending;
+      Exit(True);
+    end;
+    if lVersion <> cMachineOverviewHistorySchemaVersion then
+      raise EInvalidOperation.CreateFmt('Unsupported history reader schema %d', [lVersion]);
+    lQuery.SQL.Text := 'SELECT i.evidence_state, e.state, e.byte_count, ' +
+      'CASE WHEN e.byte_count<=16384 AND length(CAST(e.evidence_json AS BLOB))<=16384 ' +
+      'THEN e.evidence_json ELSE NULL END AS evidence_json FROM incident i ' +
+      'LEFT JOIN incident_evidence e ON e.incident_key=i.incident_key WHERE i.incident_key=:key';
+    lQuery.ParamByName('key').AsWideString := aIncidentKey;
+    lQuery.Open;
+    if lQuery.Eof then
+      raise EInvalidOperation.Create('Incident evidence is unavailable: incident not found');
+    lState := lQuery.FieldByName('evidence_state').AsInteger;
+    if (lState < Ord(Low(TMachineOverviewEvidenceState))) or
+      (lState > Ord(High(TMachineOverviewEvidenceState))) then
+      raise EConvertError.Create('Invalid incident evidence state');
+    aEvidence.State := TMachineOverviewEvidenceState(lState);
+    if lQuery.FieldByName('state').IsNull then
+    begin
+      if aEvidence.State in [TMachineOverviewEvidenceState.Collecting, TMachineOverviewEvidenceState.Complete] then
+        raise EConvertError.Create('Incident evidence payload is missing');
+      Exit(True);
+    end;
+    if lQuery.FieldByName('state').AsInteger <> lState then
+      raise EConvertError.Create('Incident evidence state is inconsistent');
+    if lQuery.FieldByName('evidence_json').IsNull then
+      raise EConvertError.Create('Incident evidence exceeds the 16 KiB storage limit');
+    lJson := lQuery.FieldByName('evidence_json').AsWideString;
+    if not TryMachineOverviewEvidenceFromJson(lJson, aEvidence, aError) then
+      Exit(False);
+    aEvidence.State := TMachineOverviewEvidenceState(lState);
+    Result := True;
+  except
+    on lException: Exception do
+    begin
+      aEvidence := Default(TMachineOverviewIncidentEvidence);
+      aError := 'Incident evidence temporarily unavailable: ' + lException.Message;
+    end;
   end;
 end;
 

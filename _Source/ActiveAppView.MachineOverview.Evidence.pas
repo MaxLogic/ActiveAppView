@@ -375,8 +375,6 @@ begin
   inherited Create;
   Headline := aIncident;
   // Context belongs to the detector until S4; our recorder never duplicates it.
-  Headline.PreContext := nil;
-  Headline.PostContext := nil;
   Headline.Evidence := Default(TMachineOverviewIncidentEvidence);
   Config := aConfig;
   Value.State := TMachineOverviewEvidenceState.Collecting;
@@ -795,8 +793,6 @@ begin
     lState.Replay(lFound);
   end;
   lFound.Headline := lChange.Incident;
-  lFound.Headline.PreContext := nil;
-  lFound.Headline.PostContext := nil;
   lFound.Headline.Evidence := Default(TMachineOverviewIncidentEvidence);
   if lChange.Kind = TMachineOverviewIncidentChangeKind.Ended then
     lFound.Phases[TMachineOverviewEvidencePhaseKind.After].Value.StartUtc := lChange.Incident.EndedAtUtc;

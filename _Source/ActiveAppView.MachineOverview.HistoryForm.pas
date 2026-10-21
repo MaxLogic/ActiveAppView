@@ -207,23 +207,6 @@ begin
     TFormatSettings.Invariant);
 end;
 
-procedure AddIncidentContexts(const aLines: TStrings; const aHeading: string;
-  const aContexts: TArray<TMachineOverviewIncidentContext>);
-var
-  lContext: TMachineOverviewIncidentContext;
-begin
-  aLines.Add(aHeading + ':');
-  if Length(aContexts) = 0 then
-  begin
-    aLines.Add('  None');
-    Exit;
-  end;
-  for lContext in aContexts do
-    aLines.Add(Format('  %s | %s | %s',
-      [IncidentUtcText(lContext.CapturedAtUtc), lContext.ProviderId,
-       lContext.Summary]));
-end;
-
 procedure AddIncidentStrings(const aLines: TStrings; const aHeading: string;
   const aValues: TArray<string>);
 var
@@ -267,8 +250,6 @@ begin
     aIncident.RelatedEntityIds);
   AddIncidentStrings(lLines, 'Related executable paths',
     aIncident.RelatedExecutablePaths);
-  AddIncidentContexts(lLines, 'Pre-context', aIncident.PreContext);
-  AddIncidentContexts(lLines, 'Post-context', aIncident.PostContext);
   Result := lLines.Text.TrimRight;
 end;
 
