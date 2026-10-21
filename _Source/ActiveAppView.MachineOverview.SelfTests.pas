@@ -3329,7 +3329,8 @@ begin
   GC(lIniFile, TMemIniFile.Create(lFileName, TEncoding.UTF8, False), g);
   lSettings := LoadMachineOverviewSettings(lIniFile);
   if (not lSettings.Enabled) or
-    (lSettings.MaxDatabaseSizeMB <> TMachineOverviewSettings.Defaults.MaxDatabaseSizeMB) then
+    (lSettings.MaxDatabaseSizeMB <> TMachineOverviewSettings.Defaults.MaxDatabaseSizeMB) or
+    lSettings.OnsetTraceEnabled or (lSettings.OnsetTraceBufferMB <> 256) then
   begin
     Writeln('SELFTEST FAILED: Machine Overview must default to enabled after release acceptance');
     Exit;
@@ -3365,6 +3366,8 @@ begin
   lIniFile.WriteInteger('MachineOverview', 'Rollup1mRetentionDays', 180);
   lIniFile.WriteInteger('MachineOverview', 'MaxDatabaseSizeMB', 1024);
   lIniFile.WriteBool('MachineOverview', 'DetailedTraceEnabled', True);
+  lIniFile.WriteBool('MachineOverview', 'OnsetTraceEnabled', True);
+  lIniFile.WriteInteger('MachineOverview', 'OnsetTraceBufferMB', 512);
 
   lSettings := LoadMachineOverviewSettings(lIniFile);
   if (not lSettings.Enabled) or (lSettings.DisplayRefreshIntervalMs <> 12000) or
@@ -3373,7 +3376,8 @@ begin
     (lSettings.HistoryCommitIntervalMs <> 14000) or lSettings.HistoryEnabled or
     (lSettings.RawRetentionHours <> 36) or (lSettings.Rollup10sRetentionDays <> 20) or
     (lSettings.Rollup1mRetentionDays <> 180) or (lSettings.MaxDatabaseSizeMB <> 1024) or
-    (not lSettings.DetailedTraceEnabled) then
+    (not lSettings.DetailedTraceEnabled) or (not lSettings.OnsetTraceEnabled) or
+    (lSettings.OnsetTraceBufferMB <> 512) then
   begin
     Writeln('SELFTEST FAILED: Machine Overview did not load the configured settings');
     Exit;
@@ -3436,19 +3440,23 @@ begin
   GC(lIniFile, TMemIniFile.Create(lFileName, TEncoding.UTF8, False), g);
   lIniFile.WriteInteger('MachineOverview', 'DisplayRefreshIntervalMs', 500);
   lIniFile.WriteInteger('MachineOverview', 'MaxDatabaseSizeMB', 1);
+  lIniFile.WriteInteger('MachineOverview', 'OnsetTraceBufferMB', 32);
   lSettings := LoadMachineOverviewSettings(lIniFile);
-  if (lSettings.DisplayRefreshIntervalMs <> 2000) or (lSettings.MaxDatabaseSizeMB <> 256) then
+  if (lSettings.DisplayRefreshIntervalMs <> 2000) or (lSettings.MaxDatabaseSizeMB <> 256) or
+    (lSettings.OnsetTraceBufferMB <> 64) then
   begin
-    Writeln('SELFTEST FAILED: Machine Overview display refresh was not clamped to 2000 ms');
+    Writeln('SELFTEST FAILED: Machine Overview settings did not meet lower bounds (including 64 MB onset buffer)');
     Exit;
   end;
 
   lIniFile.WriteInteger('MachineOverview', 'DisplayRefreshIntervalMs', 61000);
   lIniFile.WriteInteger('MachineOverview', 'MaxDatabaseSizeMB', 70000);
+  lIniFile.WriteInteger('MachineOverview', 'OnsetTraceBufferMB', 4096);
   lSettings := LoadMachineOverviewSettings(lIniFile);
-  if (lSettings.DisplayRefreshIntervalMs <> 60000) or (lSettings.MaxDatabaseSizeMB <> 65536) then
+  if (lSettings.DisplayRefreshIntervalMs <> 60000) or (lSettings.MaxDatabaseSizeMB <> 65536) or
+    (lSettings.OnsetTraceBufferMB <> 1024) then
   begin
-    Writeln('SELFTEST FAILED: Machine Overview display refresh was not clamped to 60000 ms');
+    Writeln('SELFTEST FAILED: Machine Overview settings exceeded upper bounds (including 1024 MB onset buffer)');
     Exit;
   end;
 
@@ -3483,10 +3491,14 @@ begin
   lIniFile.WriteString('MachineOverview', 'Rollup1mRetentionDays', 'broken');
   lIniFile.WriteString('MachineOverview', 'MaxDatabaseSizeMB', 'broken');
   lIniFile.WriteString('MachineOverview', 'DetailedTraceEnabled', 'broken');
+  lIniFile.WriteString('MachineOverview', 'OnsetTraceEnabled', 'broken');
+  lIniFile.WriteString('MachineOverview', 'OnsetTraceBufferMB', 'broken');
 
   lDefaults := TMachineOverviewSettings.Defaults;
   lSettings := LoadMachineOverviewSettings(lIniFile);
   if (lSettings.Enabled <> lDefaults.Enabled) or
+    (lSettings.OnsetTraceEnabled <> lDefaults.OnsetTraceEnabled) or
+    (lSettings.OnsetTraceBufferMB <> lDefaults.OnsetTraceBufferMB) or
     (lSettings.DisplayRefreshIntervalMs <> lDefaults.DisplayRefreshIntervalMs) or
     (lSettings.PanelWidth <> lDefaults.PanelWidth) or
     (lSettings.SystemSampleIntervalMs <> lDefaults.SystemSampleIntervalMs) or

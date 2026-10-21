@@ -44,6 +44,7 @@ type
     MaximumIncidentCount: Integer;
   // Our fixture observer runs on the writer thread; production leaves it unset.
   MigrationObserver: TProc<string>;
+    StatusTextReader: TFunc<string>;
     class function FromSettings(const aSettings: TMachineOverviewSettings;
       const aDatabaseFileName: string): TMachineOverviewHistoryConfig; static;
   end;
@@ -112,6 +113,7 @@ type
       const aConfig: TMachineOverviewHistoryConfig);
     destructor Destroy; override;
     procedure Start;
+    procedure SetStatusText(const aKey, aText: string);
     function Stop(const aTimeoutMs: Cardinal): TMachineOverviewShutdownResult;
     function EnqueueRaw(const aSample: IMachineOverviewRawSample):
       TMachineOverviewHistoryEnqueueResult;
@@ -269,6 +271,7 @@ type
     Config: TMachineOverviewHistoryConfig;
     DiagnosticsData: TMachineOverviewHistoryDiagnostics;
     DiagnosticsLock: TCriticalSection;
+    StatusText: string;
     DrainedEvent: TEvent;
     FlushRequested: Integer;
     InitializedEvent: TEvent;
@@ -294,6 +297,7 @@ type
     procedure MarkWorkerStarted;
     procedure MarkWorkerStopped;
     procedure PublishDiagnostics;
+    function ReadStatusText: string;
   end;
 
 const
@@ -432,6 +436,7 @@ begin
     2: Result := TMachineOverviewIncidentTraceStatus.Captured;
     3: Result := TMachineOverviewIncidentTraceStatus.Failed;
     4: Result := TMachineOverviewIncidentTraceStatus.Unavailable;
+    5: Result := TMachineOverviewIncidentTraceStatus.Skipped;
   else
     raise EConvertError.CreateFmt('Invalid incident trace status %d',
       [aOrdinal]);
@@ -1416,13 +1421,13 @@ begin
     'started_utc_ms, peak_utc_ms, ended_utc_ms, category, severity, origin, ' +
     'local_display_time, summary, explanation, threshold_text, peak_value, ' +
     'provider_id, provider_freshness_ms, related_entity_ids_json, ' +
-    'related_executable_paths_json, trace_status, pre_context_json, ' +
+    'related_executable_paths_json, trace_status, trace_file, trace_detail, pre_context_json, ' +
     'post_context_json, context_text, evidence_state) VALUES (:incident_key, ' +
     ':started_utc_ms, :peak_utc_ms, :ended_utc_ms, :category, :severity, ' +
     ':origin, :local_display_time, :summary, :explanation, :threshold_text, ' +
     ':peak_value, :provider_id, :provider_freshness_ms, ' +
     ':related_entity_ids_json, :related_executable_paths_json, ' +
-    ':trace_status, :pre_context_json, :post_context_json, :context_text, 5) ' +
+    ':trace_status, :trace_file, :trace_detail, :pre_context_json, :post_context_json, :context_text, 5) ' +
     'ON CONFLICT(incident_key) DO UPDATE SET ' +
     'peak_utc_ms=excluded.peak_utc_ms, ended_utc_ms=excluded.ended_utc_ms, ' +
     'category=excluded.category, severity=excluded.severity, ' +
@@ -1433,7 +1438,9 @@ begin
     'provider_freshness_ms=excluded.provider_freshness_ms, ' +
     'related_entity_ids_json=excluded.related_entity_ids_json, ' +
     'related_executable_paths_json=excluded.related_executable_paths_json, ' +
-    'trace_status=excluded.trace_status, ' +
+    'trace_status=CASE WHEN excluded.trace_status=0 THEN incident.trace_status ELSE excluded.trace_status END, ' +
+    'trace_file=CASE WHEN excluded.trace_status=0 THEN incident.trace_file ELSE excluded.trace_file END, ' +
+    'trace_detail=CASE WHEN excluded.trace_status=0 THEN incident.trace_detail ELSE excluded.trace_detail END, ' +
     'pre_context_json=excluded.pre_context_json, ' +
     'post_context_json=excluded.post_context_json, ' +
     'context_text=excluded.context_text';
@@ -1455,6 +1462,8 @@ begin
   fIncidentUpsert.ParamByName('related_executable_paths_json').DataType :=
     ftWideMemo;
   fIncidentUpsert.ParamByName('trace_status').DataType := ftInteger;
+  fIncidentUpsert.ParamByName('trace_file').DataType := ftWideString;
+  fIncidentUpsert.ParamByName('trace_detail').DataType := ftWideString;
   fIncidentUpsert.ParamByName('pre_context_json').DataType := ftWideMemo;
   fIncidentUpsert.ParamByName('post_context_json').DataType := ftWideMemo;
   fIncidentUpsert.ParamByName('context_text').DataType := ftWideMemo;
@@ -1796,6 +1805,8 @@ begin
     HistoryStringArrayToJson(lIncident.RelatedExecutablePaths);
   fIncidentUpsert.ParamByName('trace_status').AsInteger :=
     Ord(lIncident.TraceStatus);
+  fIncidentUpsert.ParamByName('trace_file').AsWideString := lIncident.TraceFile;
+  fIncidentUpsert.ParamByName('trace_detail').AsWideString := lIncident.TraceDetail;
   fIncidentUpsert.ParamByName('pre_context_json').Value :=
     '[]';
   fIncidentUpsert.ParamByName('post_context_json').Value :=
@@ -2059,7 +2070,13 @@ end;
 procedure TMachineOverviewHistoryStore.PersistStatus;
 var
   lStatusUtc, lWalBytes: Int64;
+  lProviderText: string;
 begin
+  lProviderText := Trim(fProviderStatus.Text);
+  if Assigned(fConfig.StatusTextReader) then
+    lProviderText := Trim(lProviderText + sLineBreak + fConfig.StatusTextReader());
+  if lProviderText.IsEmpty then
+    lProviderText := rsHistoryNoProviderSamples;
   lStatusUtc := HistoryUtcMilliseconds(TTimeZone.Local.ToUniversalTime(Now));
   lWalBytes := 0;
   if TFile.Exists(fConfig.DatabaseFileName + '-wal') then
@@ -2078,8 +2095,7 @@ begin
     fTrimmedEvidence, fDeletedIncidents, fDeletedSamples,
     Trim(fStartupError + ' ' + fMaintenanceError), Int64(fConfig.ProcessSampleIntervalMs),
     Int64(fConfig.SystemSampleIntervalMs), fLogicalProcessorCount,
-    fSessionDroppedRecords, IfThen(fProviderStatus.Count = 0,
-    rsHistoryNoProviderSamples, Trim(fProviderStatus.Text))]);
+    fSessionDroppedRecords, lProviderText]);
 end;
 
 function TMachineOverviewHistoryStore.RunMaintenance: Integer;
@@ -2202,7 +2218,7 @@ begin
     lQuery.Connection := fConnection;
     lQuery.SQL.Text := 'SELECT incident_key, ' +
       'CAST(started_utc_ms AS TEXT) AS started_utc_ms_text, severity, ' +
-      'summary, explanation, threshold_text, evidence_state FROM incident ' +
+      'summary, explanation, threshold_text, evidence_state, trace_status, trace_file, trace_detail FROM incident ' +
       'WHERE started_utc_ms >= :earliest ORDER BY started_utc_ms DESC, ' +
       'incident_key ASC LIMIT :maximum';
     lQuery.ParamByName('earliest').AsLargeInt :=
@@ -2216,6 +2232,9 @@ begin
     begin
       lIncident := Default(TMachineOverviewIncident);
       lIncident.Evidence.State := TMachineOverviewEvidenceState(lQuery.FieldByName('evidence_state').AsInteger);
+      lIncident.TraceStatus := HistoryTraceStatusFromOrdinal(lQuery.FieldByName('trace_status').AsInteger);
+      lIncident.TraceFile := lQuery.FieldByName('trace_file').AsWideString;
+      lIncident.TraceDetail := lQuery.FieldByName('trace_detail').AsWideString;
       lIncident.StableId := lQuery.FieldByName('incident_key').AsString;
       lIncident.StartedAtUtc := HistoryDateTimeFromMilliseconds(
         HistoryFieldInt64(lQuery.FieldByName('started_utc_ms_text')));
@@ -2486,6 +2505,7 @@ begin
   Backlog := TMachineOverviewHistoryBacklog.Create(Max(1,
     aConfig.QueueCapacity));
   DiagnosticsLock := TCriticalSection.Create;
+  Config.StatusTextReader := ReadStatusText;
   DrainedEvent := TEvent.Create(nil, True, True, '');
   InitializedEvent := TEvent.Create(nil, True, False, '');
   LifecycleLock := TCriticalSection.Create;
@@ -2494,6 +2514,7 @@ end;
 
 destructor TMachineOverviewHistoryServiceState.Destroy;
 begin
+  Config.StatusTextReader := nil;
   Worker.Free;
   WakeEvent.Free;
   LifecycleLock.Free;
@@ -2502,6 +2523,32 @@ begin
   DiagnosticsLock.Free;
   Backlog.Free;
   inherited Destroy;
+end;
+
+function TMachineOverviewHistoryServiceState.ReadStatusText: string;
+begin
+  DiagnosticsLock.Acquire;
+  try
+    Result := StatusText;
+  finally
+    DiagnosticsLock.Release;
+  end;
+end;
+
+procedure TMachineOverviewHistoryService.SetStatusText(const aKey, aText: string);
+var
+  lState: TMachineOverviewHistoryServiceState;
+begin
+  if aKey <> 'onset-trace' then
+    raise EArgumentException.Create('Unknown history status key');
+  lState := GetHistoryServiceState(fState);
+  lState.DiagnosticsLock.Acquire;
+  try
+    lState.StatusText := aKey + '=' + Copy(aText, 1, 512);
+  finally
+    lState.DiagnosticsLock.Release;
+  end;
+  lState.WakeEvent.SetEvent;
 end;
 
 procedure TMachineOverviewHistoryServiceState.MarkAccepted;

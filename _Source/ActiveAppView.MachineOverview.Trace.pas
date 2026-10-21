@@ -3,12 +3,26 @@ unit ActiveAppView.MachineOverview.Trace;
 interface
 
 uses
+  System.SysUtils,
+  ActiveAppView.MachineOverview.BoundedProcess,
+  ActiveAppView.MachineOverview.EtlInfo,
   ActiveAppView.MachineOverview.Incidents,
   ActiveAppView.MachineOverview.Pipeline,
   ActiveAppView.MachineOverview.Types;
 
 type
+  TMachineOverviewOnsetTraceState = (Off, Unavailable, Busy, Starting, Recording, Saving, Failed);
+  TMachineOverviewWprRunner = reference to function(const aArguments: string;
+    const aTimeoutMs: Cardinal; const aCancelHandle: NativeUInt): TMachineOverviewProcessResult;
+  TMachineOverviewTraceStatusWriter = procedure(const aKey, aText: string) of object;
   TMachineOverviewTraceConfig = record
+    OnsetEnabled: Boolean;
+    OnsetBufferMB, OnsetCooldownMs, StopTimeoutMs, BusyRecheckMs, FailureRetryMs: Cardinal;
+    Runner: TMachineOverviewWprRunner;
+    IsElevated: TFunc<Boolean>;
+    InspectEtl: TFunc<string, TMachineOverviewEtlInfo>;
+    FreeBytes: TFunc<string, Int64>;
+    StatusText: TMachineOverviewTraceStatusWriter;
     Enabled: Boolean;
     CaptureDurationMs: Cardinal;
     CommandTimeoutMs: Cardinal;
@@ -30,6 +44,11 @@ type
   end;
 
   TMachineOverviewTraceDiagnostics = record
+    OnsetState: TMachineOverviewOnsetTraceState;
+    OnsetStateText: string;
+    RingStartedUtc: TDateTime;
+    OnsetSaved, OnsetSkipped: Int64;
+    LastEventsLost, LastBuffersLost: Cardinal;
     ActiveWorkerCount: Integer;
     Requested: Int64;
     Captured: Int64;
@@ -55,6 +74,8 @@ type
 
 function ShouldCaptureMachineOverviewTrace(
   const aIncident: TMachineOverviewIncident): Boolean;
+function ShouldSaveMachineOverviewOnsetTrace(const aIncident: TMachineOverviewIncident): Boolean;
+function BuildMachineOverviewOnsetProfile(const aBufferMB: Cardinal): string;
 function BuildMachineOverviewTraceCommand(
   const aConfig: TMachineOverviewTraceConfig;
   const aIncident: TMachineOverviewIncident; const aProcessId: Cardinal):
@@ -68,11 +89,13 @@ implementation
 
 uses
   System.Character, System.Classes, System.DateUtils, System.IOUtils,
-  System.StrUtils, System.SyncObjs, System.SysUtils,
-  Winapi.Windows,
-  ActiveAppView.MachineOverview.BoundedProcess;
+  System.JSON, System.Math, System.StrUtils, System.SyncObjs,
+  Winapi.Windows;
 
 const
+  cOnsetReconcileMinimumMs: Cardinal = 20;
+  cOnsetReconcileInitialMs: Cardinal = 30000;
+  cOnsetReconcileMaximumMs: Cardinal = 300000;
   cMachineOverviewTraceCaptureDurationMs = 15000;
   cMachineOverviewTraceCommandTimeoutMs = 5000;
   cMachineOverviewTraceMaximumCount = 10;
@@ -89,11 +112,37 @@ type
     Size: UInt64;
   end;
 
+  TMachineOverviewOnsetMarker = record
+    InstanceName, State: string;
+    CreatedUtc: TDateTime;
+    PreexistingAtStart: Boolean;
+    BufferMB: Cardinal;
+  end;
+
   TMachineOverviewTraceServiceState = class;
 
   TMachineOverviewTraceThread = class(TThread)
   private
     fServiceState: TMachineOverviewTraceServiceState;
+    fOnsetMutex: THandle;
+    fNextReconcileMs: UInt64;
+    fReconcileDelayMs: Cardinal;
+    fStartAttempts: Integer;
+    fNextStartMs, fLastSaveMs: UInt64;
+    function RunWpr(const aArguments: string; const aTimeoutMs: Cardinal;
+      const aCancelHandle: NativeUInt = 0): TMachineOverviewProcessResult;
+    procedure SetOnsetState(const aState: TMachineOverviewOnsetTraceState; const aText: string);
+    procedure StartOnset;
+    function OnsetElevated: Boolean;
+    function EnsureOnsetAccess: Boolean;
+    function QueryOnsetRecording: Boolean;
+    function ReconcileOnset(const aCancel: Boolean): Boolean;
+    procedure ScheduleOnsetReconcile(const aBackoff: Boolean);
+    procedure CaptureOnset(const aChange: TMachineOverviewIncidentChange);
+    function OnsetMarker: string;
+    function ReadOnsetOwnership(out aMarker: TMachineOverviewOnsetMarker): Boolean;
+    procedure PersistOnsetOwnership(const aMarker: TMachineOverviewOnsetMarker);
+    function StaleOnsetBufferMB: Cardinal;
     procedure CaptureTrace(
       const aChange: TMachineOverviewIncidentChange);
     procedure PublishOutcome(var aChange: TMachineOverviewIncidentChange;
@@ -110,6 +159,7 @@ type
   TMachineOverviewTraceServiceState = class
   public
     ActiveWorkerCount: Integer;
+    OnsetDiagnostics: TMachineOverviewTraceDiagnostics;
     Captured: Int64;
     Config: TMachineOverviewTraceConfig;
     DiagnosticsLock: TCriticalSection;
@@ -139,6 +189,9 @@ begin
   Result := aState as TMachineOverviewTraceServiceState;
 end;
 
+function QuoteTraceArgument(const aValue: string): string; forward;
+function SanitizeTraceName(const aValue: string): string; forward;
+
 constructor TMachineOverviewTraceServiceState.Create(
   const aPipeline: TMachineOverviewPipeline;
   const aConfig: TMachineOverviewTraceConfig);
@@ -154,7 +207,14 @@ begin
      (aConfig.MaximumTraceCount <= 0) or
      (aConfig.MaximumTraceBytes = 0)) then
     raise EArgumentException.Create('Invalid Machine Overview trace configuration');
+  if aConfig.OnsetEnabled and ((aConfig.CommandTimeoutMs = 0) or (aConfig.StopTimeoutMs = 0) or
+    (aConfig.BusyRecheckMs = 0) or (aConfig.FailureRetryMs = 0) or
+    (aConfig.MaximumOutputBytes = 0) or (aConfig.MaximumTraceCount <= 0) or
+    (aConfig.MaximumTraceBytes = 0)) then
+    raise EArgumentException.Create('Invalid onset trace configuration');
   Config := aConfig;
+  Config.OnsetBufferMB := EnsureRange(Config.OnsetBufferMB, Cardinal(64), Cardinal(1024));
+  OnsetDiagnostics.OnsetStateText := 'Onset recording off';
   Pipeline := aPipeline;
   DiagnosticsLock := TCriticalSection.Create;
   try
@@ -252,6 +312,11 @@ procedure TMachineOverviewTraceThread.PublishOutcome(
 begin
   aChange.Kind := TMachineOverviewIncidentChangeKind.Updated;
   aChange.Incident.TraceStatus := aStatus;
+  aChange.Incident.TraceFile := aTraceFileName;
+  aChange.Incident.TraceDetail := SanitizeMachineOverviewTraceDiagnostic(aErrorText);
+  if (not fServiceState.Config.OnsetEnabled) and (not aChange.Incident.TraceDetail.IsEmpty) then
+    aChange.Incident.TraceDetail := SanitizeMachineOverviewTraceDiagnostic(
+      'Post-detection trace: ' + aChange.Incident.TraceDetail);
   fServiceState.Pipeline.PublishDetailedTraceResult(aChange);
   fServiceState.RecordOutcome(aStatus, aDurationMs, aTraceFileName,
     aErrorText);
@@ -279,7 +344,8 @@ begin
   lErrorText := '';
   try
     try
-    if not TFile.Exists(fServiceState.Config.WprFileName) then
+    if (not Assigned(fServiceState.Config.Runner)) and
+      (not TFile.Exists(fServiceState.Config.WprFileName)) then
     begin
       lStatus := TMachineOverviewIncidentTraceStatus.Unavailable;
       lErrorText := 'Windows Performance Recorder is unavailable: ' +
@@ -292,18 +358,12 @@ begin
     lCommand := BuildMachineOverviewTraceCommand(fServiceState.Config,
       lChange.Incident, GetCurrentProcessId);
     lTraceFileName := lCommand.TraceFileName;
-    lResult := RunMachineOverviewBoundedProcessCancelable(
-      fServiceState.Config.WprFileName, lCommand.StartArguments,
-      fServiceState.Config.CommandTimeoutMs,
-      fServiceState.Config.MaximumOutputBytes,
-      NativeUInt(fServiceState.StopEvent.Handle));
+    lResult := RunWpr(lCommand.StartArguments, fServiceState.Config.CommandTimeoutMs,
+        NativeUInt(fServiceState.StopEvent.Handle));
     if lResult.Cancelled then
     begin
       lErrorText := 'Trace capture cancelled during shutdown';
-      lCancelResult := RunMachineOverviewBoundedProcess(
-        fServiceState.Config.WprFileName, lCommand.CancelArguments,
-        fServiceState.Config.CommandTimeoutMs,
-        fServiceState.Config.MaximumOutputBytes);
+      lCancelResult := RunWpr(lCommand.CancelArguments, fServiceState.Config.CommandTimeoutMs);
       if (not lCancelResult.Started) or lCancelResult.TimedOut or
         (lCancelResult.ExitCode <> 0) then
         lErrorText := lErrorText + '; WPR cleanup: ' +
@@ -314,27 +374,17 @@ begin
       (lResult.ExitCode <> 0) then
     begin
       lErrorText := ProcessFailureText(lResult);
-      lCancelResult := RunMachineOverviewBoundedProcess(
-        fServiceState.Config.WprFileName, lCommand.CancelArguments,
-        fServiceState.Config.CommandTimeoutMs,
-        fServiceState.Config.MaximumOutputBytes);
+      lCancelResult := RunWpr(lCommand.CancelArguments, fServiceState.Config.CommandTimeoutMs);
       if (not lCancelResult.Started) or lCancelResult.TimedOut or
         (lCancelResult.ExitCode <> 0) then
         lErrorText := lErrorText + '; WPR cleanup: ' +
           ProcessFailureText(lCancelResult);
-      lResult := RunMachineOverviewBoundedProcessCancelable(
-        fServiceState.Config.WprFileName,
-        lCommand.FallbackStartArguments,
-        fServiceState.Config.CommandTimeoutMs,
-        fServiceState.Config.MaximumOutputBytes,
+      lResult := RunWpr(lCommand.FallbackStartArguments, fServiceState.Config.CommandTimeoutMs,
         NativeUInt(fServiceState.StopEvent.Handle));
       if lResult.Cancelled then
       begin
         lErrorText := 'Trace capture cancelled during shutdown';
-        lCancelResult := RunMachineOverviewBoundedProcess(
-          fServiceState.Config.WprFileName, lCommand.CancelArguments,
-          fServiceState.Config.CommandTimeoutMs,
-          fServiceState.Config.MaximumOutputBytes);
+        lCancelResult := RunWpr(lCommand.CancelArguments, fServiceState.Config.CommandTimeoutMs);
         if (not lCancelResult.Started) or lCancelResult.TimedOut or
           (lCancelResult.ExitCode <> 0) then
           lErrorText := lErrorText + '; WPR cleanup: ' +
@@ -345,10 +395,7 @@ begin
         (lResult.ExitCode <> 0) then
       begin
         lErrorText := ProcessFailureText(lResult);
-        lCancelResult := RunMachineOverviewBoundedProcess(
-          fServiceState.Config.WprFileName, lCommand.CancelArguments,
-          fServiceState.Config.CommandTimeoutMs,
-          fServiceState.Config.MaximumOutputBytes);
+        lCancelResult := RunWpr(lCommand.CancelArguments, fServiceState.Config.CommandTimeoutMs);
         if (not lCancelResult.Started) or lCancelResult.TimedOut or
           (lCancelResult.ExitCode <> 0) then
           lErrorText := lErrorText + '; WPR cleanup: ' +
@@ -361,10 +408,7 @@ begin
     if fServiceState.StopEvent.WaitFor(
         fServiceState.Config.CaptureDurationMs) = wrSignaled then
     begin
-      lCancelResult := RunMachineOverviewBoundedProcess(
-        fServiceState.Config.WprFileName, lCommand.CancelArguments,
-        fServiceState.Config.CommandTimeoutMs,
-        fServiceState.Config.MaximumOutputBytes);
+      lCancelResult := RunWpr(lCommand.CancelArguments, fServiceState.Config.CommandTimeoutMs);
       lErrorText := 'Trace capture cancelled during shutdown';
       if (not lCancelResult.Started) or lCancelResult.TimedOut or
         (lCancelResult.ExitCode <> 0) then
@@ -372,17 +416,11 @@ begin
           ProcessFailureText(lCancelResult);
       Exit;
     end;
-    lResult := RunMachineOverviewBoundedProcessCancelable(
-      fServiceState.Config.WprFileName, lCommand.StopArguments,
-      fServiceState.Config.CommandTimeoutMs,
-      fServiceState.Config.MaximumOutputBytes,
-      NativeUInt(fServiceState.StopEvent.Handle));
+    lResult := RunWpr(lCommand.StopArguments, fServiceState.Config.CommandTimeoutMs,
+        NativeUInt(fServiceState.StopEvent.Handle));
     if lResult.Cancelled then
     begin
-      lCancelResult := RunMachineOverviewBoundedProcess(
-        fServiceState.Config.WprFileName, lCommand.CancelArguments,
-        fServiceState.Config.CommandTimeoutMs,
-        fServiceState.Config.MaximumOutputBytes);
+      lCancelResult := RunWpr(lCommand.CancelArguments, fServiceState.Config.CommandTimeoutMs);
       lErrorText := 'Trace finalization cancelled during shutdown';
       if (not lCancelResult.Started) or lCancelResult.TimedOut or
         (lCancelResult.ExitCode <> 0) then
@@ -394,10 +432,7 @@ begin
       (lResult.ExitCode <> 0) then
     begin
       lErrorText := ProcessFailureText(lResult);
-      lCancelResult := RunMachineOverviewBoundedProcess(
-        fServiceState.Config.WprFileName, lCommand.CancelArguments,
-        fServiceState.Config.CommandTimeoutMs,
-        fServiceState.Config.MaximumOutputBytes);
+      lCancelResult := RunWpr(lCommand.CancelArguments, fServiceState.Config.CommandTimeoutMs);
       if (not lCancelResult.Started) or lCancelResult.TimedOut or
         (lCancelResult.ExitCode <> 0) then
         lErrorText := lErrorText + '; WPR cleanup: ' +
@@ -432,6 +467,535 @@ begin
   end;
 end;
 
+function ShouldSaveMachineOverviewOnsetTrace(const aIncident: TMachineOverviewIncident): Boolean;
+begin
+  Result := (aIncident.Origin = TMachineOverviewIncidentOrigin.UserMarked) or
+    (aIncident.Category in [TMachineOverviewIncidentCategory.HighCpu,
+      TMachineOverviewIncidentCategory.DpcInterrupt]) or
+    ((aIncident.Category = TMachineOverviewIncidentCategory.ForegroundResponse) and
+      (aIncident.Severity = TMachineOverviewSeverity.Critical));
+end;
+
+function BuildMachineOverviewOnsetProfile(const aBufferMB: Cardinal): string;
+begin
+  Result := '<?xml version="1.0" encoding="utf-8"?>' + sLineBreak +
+    '<WindowsPerformanceRecorder Version="1.0" Author="ActiveAppView">' +
+    '<Profiles><SystemCollector Id="AAVCollector" Name="ActiveAppView onset">' +
+    '<BufferSize Value="1024"/><Buffers Value="' +
+    UIntToStr(EnsureRange(aBufferMB, Cardinal(64), Cardinal(1024))) + '"/>' +
+    '</SystemCollector><SystemProvider Id="AAVSystem"><Keywords>' +
+    '<Keyword Value="ProcessThread"/><Keyword Value="Loader"/>' +
+    '<Keyword Value="SampledProfile"/><Keyword Value="DPC"/><Keyword Value="Interrupt"/>' +
+    '</Keywords><Stacks><Stack Value="SampledProfile"/></Stacks></SystemProvider>' +
+    '<Profile Id="AAVOnset.Light.Memory" Name="AAVOnset" Description="ActiveAppView onset CPU ring" ' +
+    'LoggingMode="Memory" DetailLevel="Light"><Collectors>' +
+    '<SystemCollectorId Value="AAVCollector"><SystemProviderId Value="AAVSystem"/>' +
+    '</SystemCollectorId></Collectors></Profile></Profiles></WindowsPerformanceRecorder>';
+end;
+
+function TraceProcessElevated: Boolean;
+var
+  lToken: THandle;
+  lElevation, lSize: Cardinal;
+begin
+  Result := False;
+  if not OpenProcessToken(GetCurrentProcess, TOKEN_QUERY, lToken) then
+    Exit;
+  try
+    Result := GetTokenInformation(lToken, TokenElevation, @lElevation, SizeOf(lElevation), lSize);
+    if Result then
+      Result := (lSize >= SizeOf(lElevation)) and (lElevation <> 0);
+  finally
+    CloseHandle(lToken);
+  end;
+end;
+
+function WprSucceeded(const aResult: TMachineOverviewProcessResult): Boolean;
+begin
+  Result := aResult.Started and (not aResult.TimedOut) and (not aResult.Cancelled) and
+    (aResult.ExitCode = 0);
+end;
+
+function TMachineOverviewTraceThread.RunWpr(const aArguments: string;
+  const aTimeoutMs: Cardinal; const aCancelHandle: NativeUInt): TMachineOverviewProcessResult;
+begin
+  if Assigned(fServiceState.Config.Runner) then
+    Exit(fServiceState.Config.Runner(aArguments, aTimeoutMs, aCancelHandle));
+  Result := RunMachineOverviewBoundedProcessCancelable(fServiceState.Config.WprFileName,
+    aArguments, aTimeoutMs, fServiceState.Config.MaximumOutputBytes, aCancelHandle);
+end;
+
+function TMachineOverviewTraceThread.OnsetMarker: string;
+begin
+  Result := TPath.Combine(fServiceState.Config.OutputDirectory, 'onset-session.active');
+end;
+
+function TMachineOverviewTraceThread.ReadOnsetOwnership(
+  out aMarker: TMachineOverviewOnsetMarker): Boolean;
+var
+  lJson: TJSONValue;
+begin
+  aMarker := Default(TMachineOverviewOnsetMarker);
+  Result := TFile.Exists(OnsetMarker);
+  if not Result then
+    Exit;
+  if TFile.GetSize(OnsetMarker) > 4096 then
+    raise EInvalidOpException.Create('Invalid onset ownership marker; session left untouched');
+  lJson := TJSONObject.ParseJSONValue(TFile.ReadAllText(OnsetMarker, TEncoding.UTF8));
+  try
+    if not (lJson is TJSONObject) then
+      raise EInvalidOpException.Create('Invalid onset ownership marker; session left untouched');
+    aMarker.InstanceName := lJson.GetValue<string>('instance');
+    aMarker.State := lJson.GetValue<string>('state');
+    aMarker.CreatedUtc := ISO8601ToDate(lJson.GetValue<string>('createdUtc'), True);
+    aMarker.PreexistingAtStart := lJson.GetValue<Boolean>('PreexistingAtStart');
+    aMarker.BufferMB := lJson.GetValue<Cardinal>('bufferMB');
+    if (aMarker.InstanceName <> 'ActiveAppViewOnset') or
+      ((aMarker.State <> 'Pending') and (aMarker.State <> 'Owned')) or
+      (aMarker.BufferMB < 64) or (aMarker.BufferMB > 1024) then
+      raise EInvalidOpException.Create('Invalid onset ownership marker; session left untouched');
+  finally
+    lJson.Free;
+  end;
+end;
+
+procedure TMachineOverviewTraceThread.PersistOnsetOwnership(const aMarker: TMachineOverviewOnsetMarker);
+var
+  lStream: TFileStream;
+  lBytes: TBytes;
+  lTemp: string;
+begin
+  lBytes := TEncoding.UTF8.GetBytes('{"instance":"' + aMarker.InstanceName +
+    '","state":"' + aMarker.State + '","createdUtc":"' + DateToISO8601(aMarker.CreatedUtc, True) +
+    '","PreexistingAtStart":' + LowerCase(BoolToStr(aMarker.PreexistingAtStart, True)) +
+    ',"bufferMB":' + UIntToStr(aMarker.BufferMB) + '}');
+  lTemp := OnsetMarker + '.tmp';
+  try
+    lStream := TFileStream.Create(lTemp, fmCreate);
+    try
+      lStream.WriteBuffer(lBytes[0], Length(lBytes));
+      if not FlushFileBuffers(lStream.Handle) then
+        RaiseLastOSError;
+    finally
+      lStream.Free;
+    end;
+    // Replacement preserves the flushed Pending record if an Owned update is interrupted.
+    if not MoveFileEx(PChar(lTemp), PChar(OnsetMarker), MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH) then
+      RaiseLastOSError;
+  finally
+    if TFile.Exists(lTemp) then
+      TFile.Delete(lTemp);
+  end;
+end;
+
+function TMachineOverviewTraceThread.StaleOnsetBufferMB: Cardinal;
+var
+  lMarker: TMachineOverviewOnsetMarker;
+begin
+  Result := 1024;
+  try
+    if ReadOnsetOwnership(lMarker) then
+      Result := lMarker.BufferMB;
+  except
+    // An unreadable/legacy marker must not understate possibly retained memory.
+    Result := 1024;
+  end;
+end;
+
+procedure TMachineOverviewTraceThread.SetOnsetState(const aState: TMachineOverviewOnsetTraceState;
+  const aText: string);
+var
+  lText: string;
+begin
+  lText := aText;
+  if TFile.Exists(OnsetMarker) and (aState <> TMachineOverviewOnsetTraceState.Recording) and
+    (not ContainsText(lText, 'may still hold')) then
+    lText := Format('An onset recording session may still hold up to %d MB; ', [StaleOnsetBufferMB]) + lText;
+  lText := SanitizeMachineOverviewTraceDiagnostic(lText);
+  fServiceState.DiagnosticsLock.Acquire;
+  try
+    fServiceState.OnsetDiagnostics.OnsetState := aState;
+    fServiceState.OnsetDiagnostics.OnsetStateText := lText;
+    if aState = TMachineOverviewOnsetTraceState.Recording then
+      fServiceState.OnsetDiagnostics.RingStartedUtc := TTimeZone.Local.ToUniversalTime(Now);
+  finally
+    fServiceState.DiagnosticsLock.Release;
+  end;
+  if Assigned(fServiceState.Config.StatusText) then
+    fServiceState.Config.StatusText('onset-trace', lText);
+end;
+
+function TMachineOverviewTraceThread.OnsetElevated: Boolean;
+begin
+  if Assigned(fServiceState.Config.IsElevated) then
+    Result := fServiceState.Config.IsElevated()
+  else
+    Result := TraceProcessElevated;
+end;
+
+function TMachineOverviewTraceThread.QueryOnsetRecording: Boolean;
+var
+  lResult: TMachineOverviewProcessResult;
+begin
+  lResult := RunWpr('-status -instancename ActiveAppViewOnset', fServiceState.Config.CommandTimeoutMs);
+  if lResult.Started and (not lResult.TimedOut) and (not lResult.Cancelled) and
+    ContainsText(lResult.OutputText, 'not recording') then
+    Exit(False);
+  if WprSucceeded(lResult) and ContainsText(lResult.OutputText, 'recording') then
+    Exit(True);
+  raise EInvalidOpException.Create('Onset instance status unknown: ' + ProcessFailureText(lResult));
+end;
+
+procedure TMachineOverviewTraceThread.ScheduleOnsetReconcile(const aBackoff: Boolean);
+begin
+  if (not aBackoff) or (fReconcileDelayMs = 0) then
+  begin
+    fReconcileDelayMs := fServiceState.Config.FailureRetryMs;
+    if fReconcileDelayMs < cOnsetReconcileMinimumMs then
+      fReconcileDelayMs := cOnsetReconcileMinimumMs
+    else if fReconcileDelayMs > cOnsetReconcileInitialMs then
+      fReconcileDelayMs := cOnsetReconcileInitialMs;
+  end else if fReconcileDelayMs >= cOnsetReconcileMaximumMs div 2 then
+    fReconcileDelayMs := cOnsetReconcileMaximumMs
+  else
+    Inc(fReconcileDelayMs, fReconcileDelayMs);
+  fNextReconcileMs := GetTickCount64 + fReconcileDelayMs;
+end;
+
+function TMachineOverviewTraceThread.ReconcileOnset(const aCancel: Boolean): Boolean;
+var
+  lMarker: TMachineOverviewOnsetMarker;
+  lResult: TMachineOverviewProcessResult;
+begin
+  Result := not TFile.Exists(OnsetMarker);
+  if Result then
+    Exit;
+  try
+    if not EnsureOnsetAccess then
+      Exit;
+    // Confirm absence before interpreting provenance: an idle stale marker needs no cancellation.
+    if QueryOnsetRecording then
+    begin
+      if not ReadOnsetOwnership(lMarker) then
+        Exit;
+      if lMarker.PreexistingAtStart then
+      begin
+        SetOnsetState(TMachineOverviewOnsetTraceState.Busy, 'Onset instance name in use by another session');
+        ScheduleOnsetReconcile(True);
+        Exit;
+      end;
+      if (not aCancel) and (lMarker.State = 'Owned') then
+      begin
+        ScheduleOnsetReconcile(False);
+        Exit;
+      end;
+      lResult := RunWpr('-cancel -instancename ActiveAppViewOnset', fServiceState.Config.CommandTimeoutMs);
+      if QueryOnsetRecording then
+        raise EInvalidOpException.Create('Onset cleanup did not confirm absence: ' + ProcessFailureText(lResult));
+    end;
+    TFile.Delete(OnsetMarker);
+    fNextReconcileMs := High(UInt64);
+    fReconcileDelayMs := 0;
+    SetOnsetState(TMachineOverviewOnsetTraceState.Off, 'Onset recording off');
+    Result := True;
+  except
+    on lException: Exception do
+    begin
+      SetOnsetState(TMachineOverviewOnsetTraceState.Failed, 'Onset cleanup failed: ' + lException.Message);
+      ScheduleOnsetReconcile(True);
+    end;
+  end;
+end;
+
+function TMachineOverviewTraceThread.EnsureOnsetAccess: Boolean;
+var
+  lMutexResult: Cardinal;
+begin
+  Result := False;
+  if not OnsetElevated then
+  begin
+    SetOnsetState(TMachineOverviewOnsetTraceState.Unavailable,
+      'Onset recording needs administrator; restart ActiveAppView elevated (no elevation is requested)');
+    ScheduleOnsetReconcile(True);
+    Exit;
+  end;
+  if fOnsetMutex = 0 then
+  begin
+    fOnsetMutex := CreateMutex(nil, False, 'Local\ActiveAppView.MachineOverview.OnsetTrace');
+    if fOnsetMutex = 0 then
+      RaiseLastOSError;
+    lMutexResult := WaitForSingleObject(fOnsetMutex, 0);
+    if (lMutexResult <> WAIT_OBJECT_0) and (lMutexResult <> WAIT_ABANDONED) then
+    begin
+      CloseHandle(fOnsetMutex);
+      fOnsetMutex := 0;
+      SetOnsetState(TMachineOverviewOnsetTraceState.Busy, 'Another ActiveAppView owns onset recording');
+      ScheduleOnsetReconcile(True);
+      Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+procedure TMachineOverviewTraceThread.StartOnset;
+var
+  lResult: TMachineOverviewProcessResult;
+  lMarker: TMachineOverviewOnsetMarker;
+  lProfile, lError: string;
+begin
+  fNextStartMs := High(UInt64);
+  try
+    if not EnsureOnsetAccess then
+    begin
+      if (not TFile.Exists(OnsetMarker)) and
+        (fServiceState.OnsetDiagnostics.OnsetState = TMachineOverviewOnsetTraceState.Busy) then
+        fNextStartMs := GetTickCount64 + fServiceState.Config.BusyRecheckMs;
+      Exit;
+    end;
+    if TFile.Exists(OnsetMarker) and (not ReconcileOnset(True)) then
+      Exit;
+    // A matching name alone never establishes ownership.
+    if QueryOnsetRecording then
+    begin
+      fNextStartMs := GetTickCount64 + fServiceState.Config.BusyRecheckMs;
+      SetOnsetState(TMachineOverviewOnsetTraceState.Busy, 'Onset instance name in use by another session');
+      Exit;
+    end;
+    lResult := RunWpr('-status', fServiceState.Config.CommandTimeoutMs);
+    if lResult.TimedOut or lResult.Cancelled or (not lResult.Started) or
+      (not ContainsText(lResult.OutputText, 'not recording')) then
+    begin
+      if WprSucceeded(lResult) and ContainsText(lResult.OutputText, 'recording') then
+      begin
+        fNextStartMs := GetTickCount64 + fServiceState.Config.BusyRecheckMs;
+        SetOnsetState(TMachineOverviewOnsetTraceState.Busy, 'Another WPR recording is active; onset recording waits');
+        Exit;
+      end;
+      raise EInvalidOpException.Create(ProcessFailureText(lResult));
+    end;
+    if fServiceState.StopEvent.WaitFor(0) = wrSignaled then
+      Exit;
+    SetOnsetState(TMachineOverviewOnsetTraceState.Starting, 'Starting onset recording');
+    TDirectory.CreateDirectory(fServiceState.Config.OutputDirectory);
+    lProfile := TPath.Combine(fServiceState.Config.OutputDirectory, 'ActiveAppViewOnset.wprp');
+    TFile.WriteAllText(lProfile, BuildMachineOverviewOnsetProfile(fServiceState.Config.OnsetBufferMB), TEncoding.UTF8);
+    lMarker := Default(TMachineOverviewOnsetMarker);
+    lMarker.InstanceName := 'ActiveAppViewOnset';
+    lMarker.State := 'Pending';
+    lMarker.CreatedUtc := TTimeZone.Local.ToUniversalTime(Now);
+    lMarker.BufferMB := fServiceState.Config.OnsetBufferMB;
+    PersistOnsetOwnership(lMarker);
+    lResult := RunWpr('-start ' + QuoteTraceArgument(lProfile + '!AAVOnset') +
+      ' -instancename ActiveAppViewOnset', fServiceState.Config.CommandTimeoutMs);
+    if not WprSucceeded(lResult) then
+    begin
+      // A definite rejection plus confirmed absence needs no cancellation.
+      if lResult.Started and (not lResult.TimedOut) and (not lResult.Cancelled) then
+      begin
+        try
+          if not QueryOnsetRecording then
+            TFile.Delete(OnsetMarker);
+        except
+          on lException: Exception do
+            lResult.OutputText := lResult.OutputText + '; ' + lException.Message;
+        end;
+      end;
+      raise EInvalidOpException.Create(ProcessFailureText(lResult));
+    end;
+    lMarker.State := 'Owned';
+    PersistOnsetOwnership(lMarker);
+    ScheduleOnsetReconcile(False);
+    SetOnsetState(TMachineOverviewOnsetTraceState.Recording, 'Recording onset CPU trace (memory circular)');
+  except
+    on lException: Exception do
+    begin
+      Inc(fStartAttempts);
+      lError := SanitizeMachineOverviewTraceDiagnostic(lException.Message);
+      if TFile.Exists(OnsetMarker) then
+        ScheduleOnsetReconcile(True);
+      if TraceFailureIsUnavailable(lError) then
+        SetOnsetState(TMachineOverviewOnsetTraceState.Unavailable, lError)
+      else
+      begin
+        if (not TFile.Exists(OnsetMarker)) and (fStartAttempts < 3) then
+          fNextStartMs := GetTickCount64 + fServiceState.Config.FailureRetryMs;
+        SetOnsetState(TMachineOverviewOnsetTraceState.Failed, lError);
+      end;
+    end;
+  end;
+end;
+
+procedure TMachineOverviewTraceThread.CaptureOnset(const aChange: TMachineOverviewIncidentChange);
+var
+  lChange, lPending: TMachineOverviewIncidentChange;
+  lCommand: TMachineOverviewTraceCommand;
+  lResult: TMachineOverviewProcessResult;
+  lInfo: TMachineOverviewEtlInfo;
+  lState: TMachineOverviewOnsetTraceState;
+  lStatus: TMachineOverviewIncidentTraceStatus;
+  lDetail, lFileName, lError: string;
+  lFree: Int64;
+  lAvailable, lTotal, lTotalFree: UInt64;
+  lRemoved: Integer;
+  lSaveStarted: Boolean;
+  lMarker: TMachineOverviewOnsetMarker;
+  lNowMs: UInt64;
+begin
+  lChange := aChange;
+  lFileName := '';
+  lDetail := '';
+  lStatus := TMachineOverviewIncidentTraceStatus.Skipped;
+  lSaveStarted := False;
+  TInterlocked.Increment(fServiceState.Requested);
+  try
+  try
+    fServiceState.DiagnosticsLock.Acquire;
+    try
+      lState := fServiceState.OnsetDiagnostics.OnsetState;
+      lDetail := fServiceState.OnsetDiagnostics.OnsetStateText;
+    finally
+      fServiceState.DiagnosticsLock.Release;
+    end;
+    if (lState <> TMachineOverviewOnsetTraceState.Recording) or
+      (not ReadOnsetOwnership(lMarker)) or lMarker.PreexistingAtStart or
+      (lMarker.State <> 'Owned') then
+    begin
+      if lState = TMachineOverviewOnsetTraceState.Unavailable then
+        lStatus := TMachineOverviewIncidentTraceStatus.Unavailable
+      else if lState = TMachineOverviewOnsetTraceState.Failed then
+        lStatus := TMachineOverviewIncidentTraceStatus.Failed;
+      Exit;
+    end;
+    lNowMs := GetTickCount64;
+    if (aChange.Incident.Origin <> TMachineOverviewIncidentOrigin.UserMarked) and
+      (fLastSaveMs <> 0) and
+      (lNowMs - fLastSaveMs < fServiceState.Config.OnsetCooldownMs) then
+    begin
+      lDetail := 'Onset trace skipped: cooldown until ' + FormatDateTime('hh:nn:ss',
+        Now + ((fServiceState.Config.OnsetCooldownMs - (lNowMs - fLastSaveMs)) / 86400000.0));
+      Exit;
+    end;
+    if Assigned(fServiceState.Config.FreeBytes) then
+      lFree := fServiceState.Config.FreeBytes(fServiceState.Config.OutputDirectory)
+    else
+    begin
+      if not GetDiskFreeSpaceEx(PChar(fServiceState.Config.OutputDirectory), lAvailable, lTotal, @lTotalFree) then
+        RaiseLastOSError;
+      if lAvailable > UInt64(High(Int64)) then
+        lFree := High(Int64)
+      else
+        lFree := Int64(lAvailable);
+    end;
+    if lFree < (Int64(2) * fServiceState.Config.OnsetBufferMB + 1024) * 1024 * 1024 then
+    begin
+      lDetail := 'Onset trace skipped: not enough free space on ' +
+        ExtractFileDrive(fServiceState.Config.OutputDirectory);
+      Exit;
+    end;
+    if not EnforceMachineOverviewTraceRetention(fServiceState.Config, lRemoved, lError) then
+      raise EInvalidOpException.Create(lError);
+    lCommand := BuildMachineOverviewTraceCommand(fServiceState.Config, aChange.Incident, GetCurrentProcessId);
+    lFileName := lCommand.TraceFileName;
+    lSaveStarted := True;
+    lStatus := TMachineOverviewIncidentTraceStatus.Failed;
+    SetOnsetState(TMachineOverviewOnsetTraceState.Saving, 'Saving onset trace; recording was restarting');
+    // Shutdown waits for this bounded stop, then cancels our instance. It must not kill WPR mid-save.
+    lResult := RunWpr('-stop ' + QuoteTraceArgument(lFileName) + ' ' +
+      QuoteTraceArgument('ActiveAppView onset ' + SanitizeTraceName(aChange.Incident.StableId)) +
+      ' -skipPdbGen -instancename ActiveAppViewOnset', fServiceState.Config.StopTimeoutMs);
+    if not WprSucceeded(lResult) then
+      raise EInvalidOpException.Create(ProcessFailureText(lResult));
+    if QueryOnsetRecording then
+      raise EInvalidOpException.Create('Onset save did not confirm session absence');
+    TFile.Delete(OnsetMarker);
+    if (not TFile.Exists(lFileName)) or (TFile.GetSize(lFileName) = 0) then
+      raise EInvalidOpException.Create('WPR completed without a non-empty ETL trace');
+    if Assigned(fServiceState.Config.InspectEtl) then
+      lInfo := fServiceState.Config.InspectEtl(lFileName)
+    else
+      lInfo := ReadMachineOverviewEtlInfo(lFileName);
+    if not lInfo.Readable then
+      raise EInvalidOpException.Create('Cannot inspect onset ETL: ' + lInfo.ErrorText);
+    lDetail := 'Onset trace ' + ExtractFileName(lFileName) + ': events ' +
+      FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"', lInfo.FirstEventUtc) + ' - ' +
+      FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"', lInfo.LastEventUtc) + ', ';
+    if lInfo.FirstEventUtc <= aChange.Incident.StartedAtUtc then
+      lDetail := lDetail + Format('includes onset (%d s before incident start)',
+        [SecondsBetween(lInfo.FirstEventUtc, aChange.Incident.StartedAtUtc)])
+    else
+      lDetail := lDetail + Format('starts %d s after incident start, onset not included',
+        [SecondsBetween(lInfo.FirstEventUtc, aChange.Incident.StartedAtUtc)]);
+    lDetail := lDetail + Format('; events lost %d; buffers lost %d', [lInfo.EventsLost, lInfo.BuffersLost]);
+    lStatus := TMachineOverviewIncidentTraceStatus.Captured;
+  except
+    on lException: Exception do
+    begin
+      lStatus := TMachineOverviewIncidentTraceStatus.Failed;
+      lDetail := SanitizeMachineOverviewTraceDiagnostic(lException.Message);
+      if TraceFailureIsUnavailable(lDetail) then
+        lStatus := TMachineOverviewIncidentTraceStatus.Unavailable;
+    end;
+  end;
+  finally
+    try
+      if lSaveStarted then
+      begin
+        // Even a failed stop/inspection can leave a partial ETL. Always enforce both caps.
+        if not EnforceMachineOverviewTraceRetention(fServiceState.Config, lRemoved, lError) then
+        begin
+          lStatus := TMachineOverviewIncidentTraceStatus.Failed;
+          lDetail := Copy(lDetail, 1, 240) + '; Trace retention failed: ' + Copy(lError, 1, 240);
+        end else if (lStatus = TMachineOverviewIncidentTraceStatus.Captured) and
+          (not TFile.Exists(lFileName)) then
+        begin
+          lStatus := TMachineOverviewIncidentTraceStatus.Failed;
+          lDetail := 'Captured trace exceeded the configured retention cap';
+        end;
+        if lStatus = TMachineOverviewIncidentTraceStatus.Captured then
+        begin
+          fLastSaveMs := GetTickCount64;
+          fServiceState.DiagnosticsLock.Acquire;
+          try
+            Inc(fServiceState.OnsetDiagnostics.OnsetSaved);
+            fServiceState.OnsetDiagnostics.LastEventsLost := lInfo.EventsLost;
+            fServiceState.OnsetDiagnostics.LastBuffersLost := lInfo.BuffersLost;
+          finally
+            fServiceState.DiagnosticsLock.Release;
+          end;
+        end;
+        if TFile.Exists(OnsetMarker) and (not ReconcileOnset(True)) then
+          lDetail := lDetail + '; ' + fServiceState.OnsetDiagnostics.OnsetStateText;
+        while fServiceState.Pipeline.TryTakeDetailedTrace(lPending) do
+        begin
+          PublishOutcome(lPending, TMachineOverviewIncidentTraceStatus.Skipped, 0, '',
+            'Onset trace skipped: recording was restarting');
+          fServiceState.DiagnosticsLock.Acquire;
+          try
+            Inc(fServiceState.OnsetDiagnostics.OnsetSkipped);
+          finally
+            fServiceState.DiagnosticsLock.Release;
+          end;
+        end;
+        if (not TFile.Exists(OnsetMarker)) and (fServiceState.StopEvent.WaitFor(0) <> wrSignaled) then
+          StartOnset;
+      end;
+    finally
+      if lStatus = TMachineOverviewIncidentTraceStatus.Skipped then
+      begin
+        fServiceState.DiagnosticsLock.Acquire;
+        try
+          Inc(fServiceState.OnsetDiagnostics.OnsetSkipped);
+        finally
+          fServiceState.DiagnosticsLock.Release;
+        end;
+      end;
+      if lStatus <> TMachineOverviewIncidentTraceStatus.Captured then
+        lFileName := '';
+      PublishOutcome(lChange, lStatus, 0, lFileName, lDetail);
+    end;
+  end;
+end;
+
 procedure TMachineOverviewTraceThread.Execute;
 var
   lChange: TMachineOverviewIncidentChange;
@@ -443,9 +1007,30 @@ begin
     begin
       if fServiceState.StopEvent.WaitFor(0) = wrSignaled then
         Break;
+      // Cleanup follows durable markers even when recording is disabled.
+      if TFile.Exists(OnsetMarker) and (GetTickCount64 >= fNextReconcileMs) then
+      begin
+        if ReconcileOnset((not fServiceState.Config.OnsetEnabled) or
+          (fServiceState.OnsetDiagnostics.OnsetState <> TMachineOverviewOnsetTraceState.Recording)) and
+          fServiceState.Config.OnsetEnabled then
+        begin
+          if fStartAttempts < 3 then
+            fNextStartMs := GetTickCount64
+          else
+            SetOnsetState(TMachineOverviewOnsetTraceState.Failed,
+              'Onset start failed after three attempts; restart ActiveAppView to retry');
+        end;
+      end;
+      if fServiceState.Config.OnsetEnabled and (not TFile.Exists(OnsetMarker)) and
+        (GetTickCount64 >= fNextStartMs) then
+        StartOnset;
       if fServiceState.Pipeline.TryTakeDetailedTrace(lChange) then
-        CaptureTrace(lChange)
-      else
+      begin
+        if fServiceState.Config.OnsetEnabled then
+          CaptureOnset(lChange)
+        else
+          CaptureTrace(lChange);
+      end else
         fServiceState.StopEvent.WaitFor(20);
     end;
     while fServiceState.Pipeline.TryTakeDetailedTrace(lChange) do
@@ -453,6 +1038,24 @@ begin
         TMachineOverviewIncidentTraceStatus.Failed, 0, '',
         'Trace request cancelled during shutdown');
   finally
+    try
+      if not ReconcileOnset(True) then
+      begin
+        fServiceState.DiagnosticsLock.Acquire;
+        try
+          fServiceState.LastError := fServiceState.OnsetDiagnostics.OnsetStateText;
+        finally
+          fServiceState.DiagnosticsLock.Release;
+        end;
+      end;
+    finally
+      if fOnsetMutex <> 0 then
+      begin
+        ReleaseMutex(fOnsetMutex);
+        CloseHandle(fOnsetMutex);
+        fOnsetMutex := 0;
+      end;
+    end;
     TInterlocked.Decrement(fServiceState.ActiveWorkerCount);
   end;
 end;
@@ -522,6 +1125,13 @@ begin
     lServiceState.Unavailable, 0, 0);
   lServiceState.DiagnosticsLock.Acquire;
   try
+    Result.OnsetState := lServiceState.OnsetDiagnostics.OnsetState;
+    Result.OnsetStateText := lServiceState.OnsetDiagnostics.OnsetStateText;
+    Result.RingStartedUtc := lServiceState.OnsetDiagnostics.RingStartedUtc;
+    Result.OnsetSaved := lServiceState.OnsetDiagnostics.OnsetSaved;
+    Result.OnsetSkipped := lServiceState.OnsetDiagnostics.OnsetSkipped;
+    Result.LastEventsLost := lServiceState.OnsetDiagnostics.LastEventsLost;
+    Result.LastBuffersLost := lServiceState.OnsetDiagnostics.LastBuffersLost;
     Result.LastCaptureDurationMs := lServiceState.LastCaptureDurationMs;
     Result.LastTraceFileName := lServiceState.LastTraceFileName;
     Result.LastError := lServiceState.LastError;
@@ -535,7 +1145,8 @@ var
   lServiceState: TMachineOverviewTraceServiceState;
 begin
   lServiceState := GetTraceServiceState(fState);
-  if not lServiceState.Config.Enabled then
+  if not (lServiceState.Config.Enabled or lServiceState.Config.OnsetEnabled or
+    TFile.Exists(TPath.Combine(lServiceState.Config.OutputDirectory, 'onset-session.active'))) then
     Exit;
   lServiceState.LifecycleLock.Acquire;
   try
@@ -652,6 +1263,12 @@ var
 begin
   Result := Default(TMachineOverviewTraceConfig);
   Result.Enabled := False;
+  Result.OnsetEnabled := False;
+  Result.OnsetBufferMB := 256;
+  Result.OnsetCooldownMs := 15 * 60 * 1000;
+  Result.StopTimeoutMs := 120000;
+  Result.BusyRecheckMs := 60000;
+  Result.FailureRetryMs := 5 * 60 * 1000;
   Result.CaptureDurationMs := cMachineOverviewTraceCaptureDurationMs;
   Result.CommandTimeoutMs := cMachineOverviewTraceCommandTimeoutMs;
   Result.MaximumOutputBytes := cMachineOverviewTraceMaximumOutputBytes;

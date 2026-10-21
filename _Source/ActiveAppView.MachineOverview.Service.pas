@@ -3,7 +3,7 @@ unit ActiveAppView.MachineOverview.Service;
 interface
 
 uses
-  ActiveAppView.MachineOverview.Settings, ActiveAppView.MachineOverview.Types;
+  ActiveAppView.MachineOverview.Settings, ActiveAppView.MachineOverview.Trace, ActiveAppView.MachineOverview.Types;
 
 type
   IMachineOverviewService = interface(IInterface)
@@ -17,7 +17,9 @@ type
   end;
 
 function CreateMachineOverviewService(
-  const aSettings: TMachineOverviewSettings): IMachineOverviewService;
+  const aSettings: TMachineOverviewSettings): IMachineOverviewService; overload;
+function CreateMachineOverviewService(const aSettings: TMachineOverviewSettings;
+  const aTraceConfig: TMachineOverviewTraceConfig): IMachineOverviewService; overload;
 
 implementation
 
@@ -29,8 +31,7 @@ uses
   ActiveAppView.MachineOverview.Pipeline,
   ActiveAppView.MachineOverview.ProcessProvider,
   ActiveAppView.MachineOverview.SystemCollector,
-  ActiveAppView.MachineOverview.TemperatureProvider,
-  ActiveAppView.MachineOverview.Trace;
+  ActiveAppView.MachineOverview.TemperatureProvider;
 
 type
   TMachineOverviewService = class(TInterfacedObject, IMachineOverviewService)
@@ -45,7 +46,7 @@ type
     fTemperatureCollector: TMachineOverviewSystemCollector;
     fTrace: TMachineOverviewTraceService;
   public
-    constructor Create(const aSettings: TMachineOverviewSettings);
+    constructor Create(const aSettings: TMachineOverviewSettings; const aTraceConfig: TMachineOverviewTraceConfig);
     destructor Destroy; override;
     procedure Start;
     function Stop(const aTimeoutMs: Cardinal): TMachineOverviewShutdownResult;
@@ -55,7 +56,8 @@ type
       out aPresentation: TMachineOverviewPresentation): Boolean;
   end;
 
-constructor TMachineOverviewService.Create(const aSettings: TMachineOverviewSettings);
+constructor TMachineOverviewService.Create(const aSettings: TMachineOverviewSettings;
+  const aTraceConfig: TMachineOverviewTraceConfig);
 var
   lHistoryConfig: TMachineOverviewHistoryConfig;
   lProcessIntervalMs: UInt64;
@@ -73,9 +75,18 @@ begin
         aSettings.HistoryDatabaseFileName);
       fHistory := TMachineOverviewHistoryService.Create(fPipeline,
         lHistoryConfig);
-      lTraceConfig := TMachineOverviewTraceConfig.Defaults;
+      lTraceConfig := aTraceConfig;
       lTraceConfig.Enabled := aSettings.DetailedTraceEnabled;
-      fPipeline.SetDetailedTraceEnabled(lTraceConfig.Enabled);
+      lTraceConfig.OnsetEnabled := aSettings.OnsetTraceEnabled;
+      if aSettings.OnsetTraceBufferMB < 64 then
+        lTraceConfig.OnsetBufferMB := 64
+      else if aSettings.OnsetTraceBufferMB > 1024 then
+        lTraceConfig.OnsetBufferMB := 1024
+      else
+        lTraceConfig.OnsetBufferMB := Cardinal(aSettings.OnsetTraceBufferMB);
+      fPipeline.SetDetailedTraceEnabled(lTraceConfig.Enabled or lTraceConfig.OnsetEnabled);
+      fPipeline.SetOnsetTraceEnabled(lTraceConfig.OnsetEnabled);
+      lTraceConfig.StatusText := fHistory.SetStatusText;
       fTrace := TMachineOverviewTraceService.Create(fPipeline, lTraceConfig);
       if aSettings.SystemSampleIntervalMs > 0 then
         lSystemIntervalMs := UInt64(aSettings.SystemSampleIntervalMs)
@@ -302,7 +313,13 @@ end;
 function CreateMachineOverviewService(
   const aSettings: TMachineOverviewSettings): IMachineOverviewService;
 begin
-  Result := TMachineOverviewService.Create(aSettings);
+  Result := TMachineOverviewService.Create(aSettings, TMachineOverviewTraceConfig.Defaults);
+end;
+
+function CreateMachineOverviewService(const aSettings: TMachineOverviewSettings;
+  const aTraceConfig: TMachineOverviewTraceConfig): IMachineOverviewService;
+begin
+  Result := TMachineOverviewService.Create(aSettings, aTraceConfig);
 end;
 
 end.

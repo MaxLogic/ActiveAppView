@@ -142,6 +142,9 @@ resourcestring
   rsEvidenceOngoing = 'Ongoing';
   rsEvidenceExportThreshold = 'Threshold: %s';
   rsEvidenceExportTrace = 'Detailed trace: %s.';
+  rsEvidenceOnsetTrace = 'Onset trace';
+  rsEvidenceTraceKind = 'Trace';
+  rsEvidenceDetailedTrace = 'Detailed trace';
   rsEvidenceTraceOnset = 'Trace starts after detection and does not include the onset.';
   rsEvidenceRawReference = 'Raw evidence: %s, table incident_evidence, incident_key %s';
   rsHealthHeading = 'Recording health: %s; last write %s';
@@ -376,6 +379,7 @@ begin
     TMachineOverviewIncidentTraceStatus.Captured: Result := 'Captured';
     TMachineOverviewIncidentTraceStatus.Failed: Result := 'Failed';
     TMachineOverviewIncidentTraceStatus.Unavailable: Result := 'Unavailable';
+    TMachineOverviewIncidentTraceStatus.Skipped: Result := 'Skipped';
   end;
 end;
 
@@ -416,7 +420,9 @@ begin
   else
     lLines.Add(aEvidenceStateLine);
   lLines.Add(Format(rsEvidenceExportTrace, [IncidentTraceStatusText(aIncident.TraceStatus)]));
-  if aIncident.TraceStatus = TMachineOverviewIncidentTraceStatus.Captured then
+  if not aIncident.TraceDetail.IsEmpty then
+    lLines.Add(aIncident.TraceDetail)
+  else if aIncident.TraceStatus = TMachineOverviewIncidentTraceStatus.Captured then
     lLines.Add(rsEvidenceTraceOnset);
   Result := lLines.Text.TrimRight;
 end;
@@ -772,6 +778,14 @@ begin
     sLineBreak + Format(rsEvidenceRawReference, [fDatabaseFileName, fIncidents[aIndex].StableId]);
 end;
 
+function IncidentTraceName(const aIncident: TMachineOverviewIncident): string;
+begin
+  if aIncident.TraceDetail.StartsWith('Post-detection trace:') then
+    Result := rsEvidenceDetailedTrace
+  else
+    Result := rsEvidenceOnsetTrace;
+end;
+
 procedure TMachineOverviewHistoryFrm.RenderEvidence;
 var
   lRow: TMachineOverviewEvidenceRow;
@@ -811,6 +825,19 @@ begin
           lCaption := MachineOverviewEvidenceStateText(fIncidents[lIndex].Evidence.State);
       end;
       lvEvidence.Items.Add.Caption := lCaption;
+    end;
+    if not fIncidents[lIndex].TraceDetail.IsEmpty then
+    begin
+      lItem := lvEvidence.Items.Add;
+      lItem.Caption := rsEvidenceTraceKind + ' ' + IncidentTraceName(fIncidents[lIndex]);
+      lItem.SubItems.Add(ExtractFileName(fIncidents[lIndex].TraceFile));
+      lItem.SubItems.Add('');
+      lItem.SubItems.Add('');
+      lItem.SubItems.Add('');
+      lItem.SubItems.Add(fIncidents[lIndex].TraceDetail);
+      SetLength(fEvidenceRowNames, Length(fEvidenceRowNames) + 1);
+      fEvidenceRowNames[High(fEvidenceRowNames)] := rsEvidenceTraceKind + ', ' + IncidentTraceName(fIncidents[lIndex]) +
+        ', ' + ExtractFileName(fIncidents[lIndex].TraceFile) + ', ' + fIncidents[lIndex].TraceDetail;
     end;
   finally
     lvEvidence.Items.EndUpdate;

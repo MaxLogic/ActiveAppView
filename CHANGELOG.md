@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- Machine Overview can keep an opt-in, administrator-only 256 MB WPR memory ring and save qualifying incidents with onset coverage and event-loss details. It waits for other WPR recordings and never requests elevation (ACV-069).
 - Memory-pressure incidents now retain private-byte RAM contributors and growth; disk-pressure incidents retain process I/O and busiest-disk measurements. User-marked incidents retain both, using the existing evidence phases and export (ACV-070).
 - `Scripts\x-mouse.ps1` toggles the MouseBeam executable at `F:\projects\MaxLogic\MouseBeam\xMouse.exe`, trying a graceful close before forced termination and ignoring instances at other paths (ACV-076).
 - Machine Overview incident history now shows measured CPU contributors before, during, and after an incident, including exited processes, application groups, sampling gaps, recording health (session start, dropped records, and provider status), and a Copy evidence command (ACV-067, ACV-068).
@@ -27,6 +28,10 @@ All notable changes to this project are documented in this file.
 - `Scripts\Copy-MarkdownAsRichText.ps1` now always converts clipboard markdown to HTML (CF_HTML with the original markdown as text fallback), without a format menu. The library still supports RTF and plain text (ACV-075).
 
 ### Fixed
+- Onset tracing cleans up retained sessions even when disabled, reports retained memory and invalid ownership markers, and documents its reserved WPR instance name (ACV-069).
+- Onset tracing preserves foreign sessions with the same instance name and retries pending-session cleanup from a durable ownership marker (ACV-069).
+- Onset tracing recovers sessions from uncertain starts, captures real user marks once, and applies ETL retention after failed saves while reporting both save and cleanup errors (ACV-069).
+- Later incident updates preserve a captured trace's status, file, and details in memory and history (ACV-069).
 - Disk incident evidence keeps the disk responsible for each peak, labels phases that combine busiest disks, and ignores out-of-window disk names (ACV-070).
 - Incident-view self-tests use an in-memory clipboard adapter for exact-copy and failure checks, leaving the system clipboard untouched (ACV-077).
 - Machine Overview history now deletes its verified migration backup after a successful upgrade and cleanup, including after a resumed migration. Failed migrations retain the backup; deletion failures are reported without stopping recording (ACV-074).

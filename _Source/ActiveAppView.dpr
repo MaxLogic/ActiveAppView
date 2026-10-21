@@ -46,6 +46,7 @@ uses
   ActiveAppView.MachineOverview.SystemCollector in 'ActiveAppView.MachineOverview.SystemCollector.pas',
   ActiveAppView.MachineOverview.TemperatureProvider in 'ActiveAppView.MachineOverview.TemperatureProvider.pas',
   ActiveAppView.MachineOverview.Trace in 'ActiveAppView.MachineOverview.Trace.pas',
+  ActiveAppView.MachineOverview.EtlInfo in 'ActiveAppView.MachineOverview.EtlInfo.pas',
   ActiveAppView.MachineOverview.Trace.SelfTests in 'ActiveAppView.MachineOverview.Trace.SelfTests.pas',
   ActiveAppView.MachineOverview.Types in 'ActiveAppView.MachineOverview.Types.pas',
   ActiveAppView.MachineOverview.View in 'ActiveAppView.MachineOverview.View.pas',

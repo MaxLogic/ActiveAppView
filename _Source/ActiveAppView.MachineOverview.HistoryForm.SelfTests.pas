@@ -1,4 +1,4 @@
-unit ActiveAppView.MachineOverview.HistoryForm.SelfTests;
+﻿unit ActiveAppView.MachineOverview.HistoryForm.SelfTests;
 
 interface
 
@@ -362,6 +362,11 @@ var
   lGap: TMachineOverviewEvidenceGap;
 begin
   Result := CreateIncidentChange(aKey, aUtc, aKey);
+  if aKey = 'latest' then
+  begin
+    Result.Incident.TraceFile := 'onset-view.etl';
+    Result.Incident.TraceDetail := 'Onset trace onset-view.etl: includes onset; events lost 3; buffers lost 2';
+  end;
   Result.HasEvidenceUpdate := True;
   Result.Incident.Evidence.State := TMachineOverviewEvidenceState.Complete;
   Result.Incident.Evidence.LogicalProcessorCount := 32;
@@ -439,7 +444,8 @@ begin
       (not ContainsText(string(lName), 'average ') or
       not ContainsText(string(lName), ' of machine') or
       not ContainsText(string(lName), 'peak ') or ContainsText(string(lName), '; ;')) and
-      not ContainsText(string(lName), 'Gap, ') and not ContainsText(string(lName), 'no measurement') then
+      not ContainsText(string(lName), 'Gap, ') and not ContainsText(string(lName), 'no measurement') and
+      not ContainsText(string(lName), 'Trace, Onset trace, onset-view.etl, Onset trace onset-view.etl: includes onset; events lost 3; buffers lost 2') then
       Exit;
   end;
   Result := aForm.lvEvidence.Items.Count > 0;
@@ -694,6 +700,9 @@ begin
     PumpEvidence(lForm);
     lText := EvidenceListText(lForm);
     if not lLoading or not ContainsText(lText, 'latest.exe') or
+      not ContainsText(lText, 'Trace Onset trace') or not ContainsText(lText, 'onset-view.etl') or
+      not ContainsText(lForm.memDetails.Text, 'includes onset; events lost 3; buffers lost 2') or
+      ContainsText(lForm.memDetails.Text, 'Trace starts after detection') or
       ContainsText(lText, 'first.exe') or not ContainsText(lText, 'PID 1234, started') or
       not ContainsText(lText, '12.5% of machine') or not ContainsText(lText, '2 processes') or
       ContainsText(lText, 'C:\Tools\') or not ContainsText(lText, '2026-10-19') or

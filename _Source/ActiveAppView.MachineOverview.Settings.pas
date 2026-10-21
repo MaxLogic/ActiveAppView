@@ -21,6 +21,8 @@ type
     Rollup1mRetentionDays: Integer;
     MaxDatabaseSizeMB: Integer;
     DetailedTraceEnabled: Boolean;
+    OnsetTraceEnabled: Boolean;
+    OnsetTraceBufferMB: Integer;
     class function Defaults: TMachineOverviewSettings; static;
   end;
 
@@ -80,6 +82,8 @@ begin
   Result.Rollup1mRetentionDays := 365;
   Result.MaxDatabaseSizeMB := 2048;
   Result.DetailedTraceEnabled := False;
+  Result.OnsetTraceEnabled := False;
+  Result.OnsetTraceBufferMB := 256;
 end;
 
 function LoadMachineOverviewSettings(const aIniFile: TCustomIniFile): TMachineOverviewSettings;
@@ -114,6 +118,10 @@ begin
     cMachineOverviewSectionName, 'MaxDatabaseSizeMB', Result.MaxDatabaseSizeMB), 256, 65536);
   Result.DetailedTraceEnabled := aIniFile.ReadBool(
     cMachineOverviewSectionName, 'DetailedTraceEnabled', Result.DetailedTraceEnabled);
+  Result.OnsetTraceEnabled := aIniFile.ReadBool(
+    cMachineOverviewSectionName, 'OnsetTraceEnabled', Result.OnsetTraceEnabled);
+  Result.OnsetTraceBufferMB := EnsureRange(aIniFile.ReadInteger(
+    cMachineOverviewSectionName, 'OnsetTraceBufferMB', Result.OnsetTraceBufferMB), 64, 1024);
 end;
 
 function ScaleMachineOverviewPanelWidth(const aLogicalWidth,

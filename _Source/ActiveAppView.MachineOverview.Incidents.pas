@@ -14,7 +14,7 @@ type
     PipelineOverload, UserMarked);
   TMachineOverviewIncidentOrigin = (Automatic, UserMarked);
   TMachineOverviewIncidentTraceStatus = (NotRequested, Requested, Captured,
-    Failed, Unavailable);
+    Failed, Unavailable, Skipped);
   TMachineOverviewIncidentChangeKind = (Started, Updated, Ended);
 
   TMachineOverviewEvidenceState = (Legacy, Collecting, Complete, Partial, Trimmed, NotRecorded);

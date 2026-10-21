@@ -1,4 +1,4 @@
-﻿unit ActiveAppView.MachineOverview.Pipeline;
+unit ActiveAppView.MachineOverview.Pipeline;
 
 interface
 
@@ -102,6 +102,7 @@ type
     procedure PublishDetailedTraceResult(
       const aChange: TMachineOverviewIncidentChange);
     procedure SetDetailedTraceEnabled(const aEnabled: Boolean);
+    procedure SetOnsetTraceEnabled(const aEnabled: Boolean);
     procedure SetHistoryEnabled(const aEnabled: Boolean);
     procedure ConfigureEvidence(const aProcessMs, aSystemMs: Cardinal);
     procedure MergePersistedIncidents(
@@ -113,6 +114,7 @@ type
     function RawDroppedForProvider(const aProviderId: string): Int64;
     function IsRunning: Boolean;
     function IncidentCount: Integer;
+    function TryGetIncident(const aStableId: string; out aIncident: TMachineOverviewIncident): Boolean;
     procedure UpdateHistoryWriterDiagnostics(const aQueueDepth: Integer;
       const aDropped: Int64; const aLastCommitAvailable: Boolean;
       const aLastCommitDurationMs: UInt64; const aLastError: string);
@@ -144,6 +146,7 @@ type
     AggregatorThreadId: Integer;
     CounterLock: TCriticalSection;
     DetailedTraceEnabled: Integer;
+    OnsetTraceEnabled: Integer;
     HistoryAccepted: Int64;
     HistoryDequeued: Int64;
     HistoryDropped: Int64;
@@ -176,6 +179,8 @@ type
     TraceDequeued: Int64;
     TraceDropped: Int64;
     TraceQueue: TThreadedQueue<TMachineOverviewIncidentChange>;
+    TraceRequestedKeys: TDictionary<string, Boolean>;
+    TraceRequestOrder: TQueue<string>;
     Worker: TThread;
     constructor Create(const aRawQueueCapacity, aHistoryQueueCapacity: Integer);
     destructor Destroy; override;
@@ -263,6 +268,8 @@ begin
   CounterLock := TCriticalSection.Create;
   IncidentLock := TCriticalSection.Create;
   Incidents := TDictionary<string, TMachineOverviewIncident>.Create;
+  TraceRequestedKeys := TDictionary<string, Boolean>.Create;
+  TraceRequestOrder := TQueue<string>.Create;
   EvidenceConfig := TMachineOverviewEvidenceConfig.Defaults;
   LifecycleLock := TCriticalSection.Create;
   MailboxLock := TCriticalSection.Create;
@@ -290,6 +297,8 @@ begin
     IncidentQueue.DoShutDown;
   if Assigned(TraceQueue) then
     TraceQueue.DoShutDown;
+  FreeAndNil(TraceRequestOrder);
+  FreeAndNil(TraceRequestedKeys);
   FreeAndNil(TraceQueue);
   FreeAndNil(IncidentQueue);
   FreeAndNil(HistoryQueue);
@@ -335,13 +344,20 @@ end;
 procedure TMachineOverviewPipelineState.ApplyIncident(
   const aIncident: TMachineOverviewIncident);
 var
-  lHeadline: TMachineOverviewIncident;
+  lHeadline, lStored: TMachineOverviewIncident;
 begin
   if aIncident.StableId.IsEmpty then
     Exit;
   IncidentLock.Acquire;
   try
     lHeadline := aIncident;
+    if (lHeadline.TraceStatus = TMachineOverviewIncidentTraceStatus.NotRequested) and
+      Incidents.TryGetValue(aIncident.StableId, lStored) then
+    begin
+      lHeadline.TraceStatus := lStored.TraceStatus;
+      lHeadline.TraceFile := lStored.TraceFile;
+      lHeadline.TraceDetail := lStored.TraceDetail;
+    end;
     lHeadline.Evidence := Default(TMachineOverviewIncidentEvidence);
     Incidents.AddOrSetValue(aIncident.StableId, lHeadline);
     PruneIncidents(Max(aIncident.StartedAtUtc, Max(aIncident.PeakAtUtc, aIncident.EndedAtUtc)));
@@ -386,21 +402,40 @@ procedure TMachineOverviewPipelineState.RequestDetailedTrace(
   var aChange: TMachineOverviewIncidentChange);
 begin
   if (TInterlocked.CompareExchange(DetailedTraceEnabled, 0, 0) = 0) or
-    (aChange.Kind <> TMachineOverviewIncidentChangeKind.Started) or
+    ((aChange.Kind <> TMachineOverviewIncidentChangeKind.Started) and
+      ((TInterlocked.CompareExchange(OnsetTraceEnabled, 0, 0) = 0) or
+       (aChange.Kind <> TMachineOverviewIncidentChangeKind.Ended) or
+       (aChange.Incident.Category <> TMachineOverviewIncidentCategory.UserMarked) or
+       (aChange.Incident.Origin <> TMachineOverviewIncidentOrigin.UserMarked) or
+       (aChange.Incident.EndedAtUtc <> aChange.Incident.StartedAtUtc))) or
     (aChange.Incident.TraceStatus <>
       TMachineOverviewIncidentTraceStatus.NotRequested) or
-    (not ShouldCaptureMachineOverviewTrace(aChange.Incident)) then
+    ((TInterlocked.CompareExchange(OnsetTraceEnabled, 0, 0) <> 0) and
+      (not ShouldSaveMachineOverviewOnsetTrace(aChange.Incident))) or
+    ((TInterlocked.CompareExchange(OnsetTraceEnabled, 0, 0) = 0) and
+      (not ShouldCaptureMachineOverviewTrace(aChange.Incident))) then
     Exit;
-  aChange.Incident.TraceStatus :=
-    TMachineOverviewIncidentTraceStatus.Requested;
-  if (TInterlocked.CompareExchange(Stopping, 0, 0) = 0) and
-    (TraceQueue.PushItem(aChange) = wrSignaled) then
-  begin
-    TInterlocked.Increment(TraceAccepted);
-    Exit;
+  IncidentLock.Acquire;
+  try
+    // Match the evidence finalized-key FIFO horizon; headline pruning cannot re-admit a replay.
+    if TraceRequestedKeys.ContainsKey(aChange.Incident.StableId) then
+      Exit;
+    TraceRequestedKeys.Add(aChange.Incident.StableId, True);
+    TraceRequestOrder.Enqueue(aChange.Incident.StableId);
+    if TraceRequestOrder.Count > 4096 then
+      TraceRequestedKeys.Remove(TraceRequestOrder.Dequeue);
+    aChange.Incident.TraceStatus := TMachineOverviewIncidentTraceStatus.Requested;
+    if (TInterlocked.CompareExchange(Stopping, 0, 0) = 0) and
+      (TraceQueue.PushItem(aChange) = wrSignaled) then
+    begin
+      TInterlocked.Increment(TraceAccepted);
+      Exit;
+    end;
+    aChange.Incident.TraceStatus := TMachineOverviewIncidentTraceStatus.Failed;
+    TInterlocked.Increment(TraceDropped);
+  finally
+    IncidentLock.Release;
   end;
-  aChange.Incident.TraceStatus := TMachineOverviewIncidentTraceStatus.Failed;
-  TInterlocked.Increment(TraceDropped);
 end;
 
 procedure TMachineOverviewPipelineState.FillIncidentPresentation(
@@ -1276,6 +1311,21 @@ begin
   end;
 end;
 
+function TMachineOverviewPipeline.TryGetIncident(const aStableId: string;
+  out aIncident: TMachineOverviewIncident): Boolean;
+var
+  lState: TMachineOverviewPipelineState;
+begin
+  aIncident := Default(TMachineOverviewIncident);
+  lState := GetPipelineState(fState);
+  lState.IncidentLock.Acquire;
+  try
+    Result := lState.Incidents.TryGetValue(aStableId, aIncident);
+  finally
+    lState.IncidentLock.Release;
+  end;
+end;
+
 procedure TMachineOverviewPipeline.MergePersistedIncidents(
   const aIncidents: TArray<TMachineOverviewIncident>);
 var
@@ -1471,6 +1521,11 @@ procedure TMachineOverviewPipeline.SetDetailedTraceEnabled(
 begin
   TInterlocked.Exchange(GetPipelineState(fState).DetailedTraceEnabled,
     Ord(aEnabled));
+end;
+
+procedure TMachineOverviewPipeline.SetOnsetTraceEnabled(const aEnabled: Boolean);
+begin
+  TInterlocked.Exchange(GetPipelineState(fState).OnsetTraceEnabled, Ord(aEnabled));
 end;
 
 procedure TMachineOverviewPipeline.SetHistoryEnabled(
