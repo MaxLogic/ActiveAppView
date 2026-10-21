@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- `Scripts\x-mouse.ps1` toggles the MouseBeam executable at `F:\projects\MaxLogic\MouseBeam\xMouse.exe`, trying a graceful close before forced termination and ignoring instances at other paths (ACV-076).
 - Machine Overview incident history now shows measured CPU contributors before, during, and after an incident, including exited processes, application groups, sampling gaps, recording health (session start, dropped records, and provider status), and a Copy evidence command (ACV-067, ACV-068).
 - VMware Player and Workstation windows now have a `VM - ` prefix in Applications.
 - Applications (F1) now has All, New messages, and Non-responsive filters, selected with Ctrl+1/2/3 while the list has focus.
