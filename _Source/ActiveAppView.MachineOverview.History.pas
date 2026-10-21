@@ -15,6 +15,18 @@ type
   TMachineOverviewStorageState = (WithinBudget, Trimming, FloorBreached,
     OverBudget, MigrationBlocked);
 
+  TMachineOverviewHistoryHealth = record
+    Available: Boolean;
+    DatabaseFileName, BackupFileName, StorageMessage, ProviderStatus, LastError: string;
+    LastWriteUtc, NewestProcessSampleUtc: TDateTime;
+    OldestIncidentUtc, NewestIncidentUtc, OldestEvidenceUtc, NewestEvidenceUtc: TDateTime;
+    CommitIntervalMs, ProcessIntervalMs, SystemIntervalMs: Cardinal;
+    LogicalProcessorCount: Integer;
+    BudgetBytes, UsedBytes, FileBytes, WalBytes, EvidenceBytes: Int64;
+    EvidenceTrimmedTotal, IncidentsDeletedTotal, SamplesDeletedTotal, SessionDroppedRecords: Int64;
+    StorageState: TMachineOverviewStorageState;
+  end;
+
   TMachineOverviewHistoryConfig = record
     Enabled: Boolean;
     DatabaseFileName: string;
@@ -110,6 +122,10 @@ type
     function Diagnostics: TMachineOverviewHistoryDiagnostics;
   end;
 
+function TryLoadMachineOverviewHistoryHealth(const aDatabaseFileName: string;
+  out aHealth: TMachineOverviewHistoryHealth; out aError: string): Boolean;
+function MachineOverviewRecordingState(const aHealth: TMachineOverviewHistoryHealth;
+  const aNowUtc: TDateTime): string;
 function MachineOverviewHistoryDatabasePath(
   const aInstallDirectory: string): string;
 function PackMachineOverviewLogicalProcessors(
@@ -282,6 +298,10 @@ const
   cMachineOverviewSQLiteDriverId = 'SQLite_MachineOverview';
 
 resourcestring
+  rsHistoryRecording = 'Recording';
+  rsHistoryStale = 'Stale';
+  rsHistoryUnavailable = 'Unavailable';
+  rsHistoryError = 'Error';
   rsHistoryUpgradePending = 'History upgrade pending';
   rsHistoryWithinBudget = 'History is within the storage budget.';
   rsHistoryTrimming = 'History trimming will continue after the next batch.';
@@ -2965,6 +2985,125 @@ begin
   finally
     lQuery.Free;
     lConnection.Free;
+  end;
+end;
+
+function MachineOverviewRecordingState(const aHealth: TMachineOverviewHistoryHealth;
+  const aNowUtc: TDateTime): string;
+begin
+  if not aHealth.LastError.IsEmpty then
+    Exit(rsHistoryError);
+  if not aHealth.Available or (aHealth.LastWriteUtc <= 0) or (aHealth.CommitIntervalMs = 0) then
+    Exit(rsHistoryUnavailable);
+  if HistoryUtcMilliseconds(aNowUtc) - HistoryUtcMilliseconds(aHealth.LastWriteUtc) <=
+    Int64(aHealth.CommitIntervalMs) * 3 then
+    Result := rsHistoryRecording
+  else
+    Result := rsHistoryStale;
+end;
+
+function TryLoadMachineOverviewHistoryHealth(const aDatabaseFileName: string;
+  out aHealth: TMachineOverviewHistoryHealth; out aError: string): Boolean;
+var
+  g: TGarbos;
+  lConnection: TFDConnection;
+  lDriverLink: TFDPhysSQLiteDriverLink;
+  lQuery: TFDQuery;
+  lVersion, lState: Integer;
+begin
+  g := Default(TGarbos);
+  aHealth := Default(TMachineOverviewHistoryHealth);
+  aHealth.DatabaseFileName := aDatabaseFileName;
+  aError := '';
+  Result := True;
+  if aDatabaseFileName.Trim.IsEmpty or not TFile.Exists(aDatabaseFileName) then
+    Exit;
+  try
+    GC(lConnection, TFDConnection.Create(nil), g);
+    lDriverLink := TFDPhysSQLiteDriverLink.Create(lConnection);
+    lDriverLink.DriverID := cMachineOverviewSQLiteDriverId;
+    lDriverLink.EngineLinkage := slDynamic;
+    lDriverLink.VendorLib := TPath.Combine(ExtractFilePath(ParamStr(0)), 'sqlite3.dll');
+    lConnection.LoginPrompt := False;
+    lConnection.ResourceOptions.SilentMode := True;
+    lConnection.Params.Values['DriverID'] := cMachineOverviewSQLiteDriverId;
+    lConnection.Params.Values['Database'] := aDatabaseFileName;
+    lConnection.Params.Values['OpenMode'] := 'ReadOnly';
+    lConnection.Params.Values['JournalMode'] := HistoryJournalMode(aDatabaseFileName);
+    lConnection.Params.Values['LockingMode'] := 'Normal';
+    lConnection.Params.Values['SharedCache'] := 'False';
+    lConnection.Params.Values['BusyTimeout'] := '100';
+    lConnection.Connected := True;
+    lConnection.ExecSQL('PRAGMA query_only=ON');
+    GC(lQuery, TFDQuery.Create(nil), g);
+    lQuery.Connection := lConnection;
+    lQuery.Open('PRAGMA user_version');
+    lVersion := lQuery.Fields[0].AsInteger;
+    lQuery.Close;
+    if lVersion = 2 then
+    begin
+      aError := rsHistoryUpgradePending;
+      Exit;
+    end;
+    if lVersion <> cMachineOverviewHistorySchemaVersion then
+      raise EInvalidOperation.CreateFmt('Unsupported history reader schema %d', [lVersion]);
+    // SQLite INTEGER metadata can resolve to ftInteger. Cast persisted 64-bit
+    // counters and timestamps to text before conversion, as in our headline reader.
+    lQuery.Open('SELECT *, CAST(updated_utc_ms AS TEXT) AS write_ms, ' +
+      'CAST(budget_bytes AS TEXT) AS budget64, CAST(used_bytes AS TEXT) AS used64, ' +
+      'CAST(file_bytes AS TEXT) AS file64, CAST(wal_bytes AS TEXT) AS wal64, ' +
+      'CAST(evidence_bytes AS TEXT) AS evidence64, CAST(evidence_trimmed_total AS TEXT) AS trimmed64, ' +
+      'CAST(incidents_deleted_total AS TEXT) AS incidents64, CAST(samples_deleted_total AS TEXT) AS samples64, ' +
+      'CAST(session_dropped_records AS TEXT) AS dropped64 FROM history_status WHERE id=1');
+    if lQuery.Eof then
+      Exit;
+    aHealth.LastWriteUtc := HistoryDateTimeFromMilliseconds(StrToInt64(lQuery.FieldByName('write_ms').AsWideString));
+    aHealth.CommitIntervalMs := lQuery.FieldByName('commit_interval_ms').AsLongWord;
+    aHealth.ProcessIntervalMs := lQuery.FieldByName('process_interval_ms').AsLongWord;
+    aHealth.SystemIntervalMs := lQuery.FieldByName('system_interval_ms').AsLongWord;
+    aHealth.LogicalProcessorCount := lQuery.FieldByName('logical_processor_count').AsInteger;
+    aHealth.BudgetBytes := StrToInt64(lQuery.FieldByName('budget64').AsWideString);
+    aHealth.UsedBytes := StrToInt64(lQuery.FieldByName('used64').AsWideString);
+    aHealth.FileBytes := StrToInt64(lQuery.FieldByName('file64').AsWideString);
+    aHealth.WalBytes := StrToInt64(lQuery.FieldByName('wal64').AsWideString);
+    aHealth.EvidenceBytes := StrToInt64(lQuery.FieldByName('evidence64').AsWideString);
+    aHealth.StorageMessage := lQuery.FieldByName('storage_message').AsWideString;
+    aHealth.ProviderStatus := lQuery.FieldByName('provider_status_text').AsWideString;
+    aHealth.LastError := lQuery.FieldByName('last_error').AsWideString;
+    aHealth.BackupFileName := lQuery.FieldByName('migration_backup_path').AsWideString;
+    aHealth.EvidenceTrimmedTotal := StrToInt64(lQuery.FieldByName('trimmed64').AsWideString);
+    aHealth.IncidentsDeletedTotal := StrToInt64(lQuery.FieldByName('incidents64').AsWideString);
+    aHealth.SamplesDeletedTotal := StrToInt64(lQuery.FieldByName('samples64').AsWideString);
+    aHealth.SessionDroppedRecords := StrToInt64(lQuery.FieldByName('dropped64').AsWideString);
+    lState := lQuery.FieldByName('storage_state').AsInteger;
+    if (lState < Ord(Low(TMachineOverviewStorageState))) or
+      (lState > Ord(High(TMachineOverviewStorageState))) then
+      raise EConvertError.Create('Invalid history storage state');
+    aHealth.StorageState := TMachineOverviewStorageState(lState);
+    lQuery.Close;
+    lQuery.Open('SELECT CAST((SELECT MIN(started_utc_ms) FROM incident) AS TEXT) AS oldest_incident, ' +
+      'CAST((SELECT MAX(started_utc_ms) FROM incident) AS TEXT) AS newest_incident, ' +
+      'CAST((SELECT MIN(started_utc_ms) FROM incident_evidence) AS TEXT) AS oldest_evidence, ' +
+      'CAST((SELECT MAX(started_utc_ms) FROM incident_evidence) AS TEXT) AS newest_evidence, ' +
+      'CAST((SELECT MAX(utc_ms) FROM process_top_sample) AS TEXT) AS newest_process');
+    if not lQuery.FieldByName('oldest_incident').IsNull then
+      aHealth.OldestIncidentUtc := HistoryDateTimeFromMilliseconds(StrToInt64(lQuery.FieldByName('oldest_incident').AsWideString));
+    if not lQuery.FieldByName('newest_incident').IsNull then
+      aHealth.NewestIncidentUtc := HistoryDateTimeFromMilliseconds(StrToInt64(lQuery.FieldByName('newest_incident').AsWideString));
+    if not lQuery.FieldByName('oldest_evidence').IsNull then
+      aHealth.OldestEvidenceUtc := HistoryDateTimeFromMilliseconds(StrToInt64(lQuery.FieldByName('oldest_evidence').AsWideString));
+    if not lQuery.FieldByName('newest_evidence').IsNull then
+      aHealth.NewestEvidenceUtc := HistoryDateTimeFromMilliseconds(StrToInt64(lQuery.FieldByName('newest_evidence').AsWideString));
+    if not lQuery.FieldByName('newest_process').IsNull then
+      aHealth.NewestProcessSampleUtc := HistoryDateTimeFromMilliseconds(StrToInt64(lQuery.FieldByName('newest_process').AsWideString));
+    aHealth.Available := True;
+  except
+    on lException: Exception do
+    begin
+      aError := 'History is temporarily unavailable: ' + lException.Message;
+      aHealth.LastError := aError;
+      Result := False;
+    end;
   end;
 end;
 

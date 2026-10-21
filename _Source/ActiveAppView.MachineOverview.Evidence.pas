@@ -3,9 +3,14 @@ unit ActiveAppView.MachineOverview.Evidence;
 interface
 
 uses
+  System.SysUtils,
   ActiveAppView.MachineOverview.Incidents, ActiveAppView.MachineOverview.Providers;
 
 type
+  TMachineOverviewEvidenceRow = record
+    Phase, Kind, Name, Identity, Average, Peak, PeakTime, Measured, AccessibleText: string;
+  end;
+
   TMachineOverviewEvidenceConfig = record
     PreWindowMs, PostWindowMs, RingRetentionMs: UInt64;
     ProcessIntervalMs, SystemIntervalMs: Cardinal;
@@ -30,13 +35,22 @@ type
   end;
 
 function MachineOverviewEvidenceToJson(const aEvidence: TMachineOverviewIncidentEvidence): string;
+function MachineOverviewEvidenceRows(const aEvidence: TMachineOverviewIncidentEvidence):
+  TArray<TMachineOverviewEvidenceRow>;
+function MachineOverviewEvidenceText(const aEvidence: TMachineOverviewIncidentEvidence): string; overload;
+function MachineOverviewEvidenceText(const aEvidence: TMachineOverviewIncidentEvidence;
+  const aUtcToLocal: TFunc<TDateTime, TDateTime>): string; overload;
+function MachineOverviewEvidenceStateText(const aState: TMachineOverviewEvidenceState): string;
+function MachineOverviewEvidenceTimeText(const aUtc: TDateTime): string; overload;
+function MachineOverviewEvidenceTimeText(const aUtc: TDateTime;
+  const aUtcToLocal: TFunc<TDateTime, TDateTime>): string; overload;
 function TryMachineOverviewEvidenceFromJson(const aText: string;
   out aEvidence: TMachineOverviewIncidentEvidence; out aError: string): Boolean;
 
 implementation
 
 uses
-  System.DateUtils, System.Generics.Collections, System.JSON, System.Math, System.StrUtils, System.SysUtils,
+  System.Classes, System.DateUtils, System.Generics.Collections, System.JSON, System.Math, System.StrUtils,
   AutoFree, maxLogic.StrUtils,
   ActiveAppView.MachineOverview.Types;
 
@@ -47,6 +61,9 @@ const
   cPhaseNames: array[TMachineOverviewEvidencePhaseKind] of string = ('before', 'during', 'after');
   cGapNames: array[TMachineOverviewEvidenceGapReason] of string = ('process-missing', 'system-missing',
     'provider-unavailable', 'started-late', 'stopped', 'truncated');
+  cEvidenceDisplayPhases: array[0..2] of TMachineOverviewEvidencePhaseKind =
+    (TMachineOverviewEvidencePhaseKind.During, TMachineOverviewEvidencePhaseKind.Before,
+    TMachineOverviewEvidencePhaseKind.After);
 
 type
   TEvidenceSample = record
@@ -115,6 +132,315 @@ type
     procedure EvictOldest;
     procedure RememberFinalized(const aStableId: string);
   end;
+
+resourcestring
+  rsEvidenceComplete = 'complete';
+  rsEvidenceCollecting = 'collecting';
+  rsEvidencePartial = 'incomplete (ActiveAppView stopped before the after-window ended)';
+  rsEvidenceTrimmed = 'removed by the storage budget';
+  rsEvidenceLegacy = 'not recorded (incident predates measured evidence; see pre-migration backup)';
+  rsEvidenceUnavailable = 'Unavailable';
+  rsEvidenceHeading = 'Evidence: %s';
+  rsEvidenceMeasurement = 'Measurement: CPU %% is the share of the whole machine (100%% = %d logical processors; ' +
+    'one fully busy logical processor = %s%%). Process CPU is kernel+user time per sampling interval ' +
+    '(processes %d ms, system %d ms). CPU of processes that exit or start and end between samples, ' +
+    'of inaccessible processes, and DPC/interrupt time is shown as not attributed. ' +
+    'Process lists are measurements, not proof of cause.';
+  rsEvidenceNoMeasurement = 'Measurement: not recorded. Sampling intervals and logical processor count are unavailable.';
+  rsEvidenceOneCore = '%s%% of machine (= %s logical processors busy)';
+  rsEvidenceShare = '%s%% of machine';
+  rsEvidenceNoMeasurementRow = 'no measurement';
+  rsEvidenceProcessListIdentity = 'PID %d, started %s';
+  rsEvidenceProcessIdentity = 'PID %d, started %s; last seen %s; %s';
+  rsEvidenceApplicationIdentity = '%d processes (same executable name, from the 5 busiest per sample)';
+  rsEvidenceSampleCount = '%d of %d samples';
+  rsEvidencePhaseHeading = '%s %s - %s, %d of %d process samples, %d of %d system samples:';
+  rsEvidenceFact = '  %s %s; %s: average %s; peak %s at %s; %s';
+  rsEvidenceGaps = 'Gaps:';
+  rsEvidenceNoGaps = 'Gaps: none recorded';
+  rsEvidenceLimits = 'Coverage: inaccessible processes up to %d; %s; additional gaps omitted %d.';
+  rsEvidenceListsComplete = 'lists complete';
+  rsEvidenceListsShortened = 'lists shortened';
+  rsEvidenceAccessibleFact = '%s, %s %s%s: average %s, peak %s at %s, %s';
+  rsEvidenceAccessibleUnmeasured = '%s, %s %s: no measurement, %s';
+  rsEvidenceUnmeasuredFact = '  %s %s: no measurement; %s';
+  rsEvidenceAccessibleGap = 'Gap, %s, %s';
+  rsEvidenceBefore = 'Before';
+  rsEvidenceDuring = 'During';
+  rsEvidenceAfter = 'After';
+  rsEvidenceSystem = 'System';
+  rsEvidenceProcess = 'Process';
+  rsEvidenceApplication = 'Application';
+  rsEvidenceGap = 'Gap';
+  rsEvidenceCpu = 'CPU';
+  rsEvidenceDpc = 'DPC';
+  rsEvidenceInterrupt = 'Interrupt';
+  rsEvidenceMeasured = 'Measured processes';
+  rsEvidenceUnattributed = 'Not attributed';
+  rsEvidenceProcessMissing = 'process samples missing';
+  rsEvidenceSystemMissing = 'system samples missing';
+  rsEvidenceProviderUnavailable = 'provider unavailable';
+  rsEvidenceStartedLate = 'collection started late';
+  rsEvidenceStopped = 'collection stopped';
+  rsEvidenceTruncated = 'truncated';
+
+function MachineOverviewEvidenceStateText(const aState: TMachineOverviewEvidenceState): string;
+begin
+  case aState of
+    TMachineOverviewEvidenceState.Collecting: Result := rsEvidenceCollecting;
+    TMachineOverviewEvidenceState.Complete: Result := rsEvidenceComplete;
+    TMachineOverviewEvidenceState.Partial: Result := rsEvidencePartial;
+    TMachineOverviewEvidenceState.Trimmed: Result := rsEvidenceTrimmed;
+  else
+    Result := rsEvidenceLegacy;
+  end;
+end;
+
+function MachineOverviewEvidenceTimeText(const aUtc: TDateTime): string;
+begin
+  Result := MachineOverviewEvidenceTimeText(aUtc, nil);
+end;
+
+function MachineOverviewEvidenceTimeText(const aUtc: TDateTime;
+  const aUtcToLocal: TFunc<TDateTime, TDateTime>): string;
+var
+  lLocal: TDateTime;
+  lOffsetMinutes: Int64;
+  lSign: string;
+begin
+  if aUtc <= 0 then
+    Exit(rsEvidenceUnavailable);
+  if Assigned(aUtcToLocal) then
+    lLocal := aUtcToLocal(aUtc)
+  else
+    lLocal := TTimeZone.Local.ToLocalTime(aUtc);
+  lOffsetMinutes := Round((lLocal - aUtc) * MinsPerDay);
+  lSign := '+';
+  if lOffsetMinutes < 0 then
+    lSign := '-';
+  lOffsetMinutes := Abs(lOffsetMinutes);
+  Result := FormatDateTime('yyyy-mm-dd hh:nn:ss', lLocal, TFormatSettings.Invariant) +
+    Format(' %s%.2d:%.2d', [lSign, lOffsetMinutes div 60, lOffsetMinutes mod 60]) +
+    ' (' + FormatDateTime('yyyy-mm-dd hh:nn:ss.zzz"Z"', aUtc, TFormatSettings.Invariant) + ')';
+end;
+
+function EvidenceNumber(const aValue: Double): string;
+begin
+  Result := FormatFloat('0.###', aValue, TFormatSettings.Invariant);
+end;
+
+function EvidenceRowTime(const aUtc: TDateTime; const aExport: Boolean;
+  const aUtcToLocal: TFunc<TDateTime, TDateTime>): string;
+begin
+  if aExport or (aUtc <= 0) then
+    Exit(MachineOverviewEvidenceTimeText(aUtc, aUtcToLocal));
+  Result := FormatDateTime('hh:nn:ss', TTimeZone.Local.ToLocalTime(aUtc), TFormatSettings.Invariant);
+end;
+
+function EvidencePhaseText(const aKind: TMachineOverviewEvidencePhaseKind): string;
+begin
+  case aKind of
+    TMachineOverviewEvidencePhaseKind.Before: Result := rsEvidenceBefore;
+    TMachineOverviewEvidencePhaseKind.During: Result := rsEvidenceDuring;
+    TMachineOverviewEvidencePhaseKind.After: Result := rsEvidenceAfter;
+  end;
+end;
+
+function EvidenceGapText(const aReason: TMachineOverviewEvidenceGapReason): string;
+begin
+  case aReason of
+    TMachineOverviewEvidenceGapReason.ProcessSamplesMissing: Result := rsEvidenceProcessMissing;
+    TMachineOverviewEvidenceGapReason.SystemSamplesMissing: Result := rsEvidenceSystemMissing;
+    TMachineOverviewEvidenceGapReason.ProviderUnavailable: Result := rsEvidenceProviderUnavailable;
+    TMachineOverviewEvidenceGapReason.CollectionStartedLate: Result := rsEvidenceStartedLate;
+    TMachineOverviewEvidenceGapReason.CollectionStopped: Result := rsEvidenceStopped;
+    TMachineOverviewEvidenceGapReason.Truncated: Result := rsEvidenceTruncated;
+  end;
+end;
+
+function EvidenceStatisticRow(const aPhase: TMachineOverviewEvidencePhase; const aName: string;
+  const aValue: TMachineOverviewEvidenceStatistic; const aProcess, aExport: Boolean;
+  const aUtcToLocal: TFunc<TDateTime, TDateTime>): TMachineOverviewEvidenceRow;
+begin
+  Result := Default(TMachineOverviewEvidenceRow);
+  Result.Phase := EvidencePhaseText(aPhase.Kind);
+  Result.Kind := rsEvidenceSystem;
+  Result.Name := aName;
+  Result.Average := rsEvidenceNoMeasurementRow;
+  if aValue.Available then
+  begin
+    Result.Average := Format(rsEvidenceShare, [EvidenceNumber(aValue.Average)]);
+    Result.Peak := Format(rsEvidenceShare, [EvidenceNumber(aValue.Peak)]);
+    Result.PeakTime := EvidenceRowTime(aValue.PeakAtUtc, aExport, aUtcToLocal);
+  end;
+  if aProcess then
+    Result.Measured := Format(rsEvidenceSampleCount, [aPhase.ProcessSampleCount, aPhase.ExpectedProcessSampleCount])
+  else
+    Result.Measured := Format(rsEvidenceSampleCount, [aPhase.SystemSampleCount, aPhase.ExpectedSystemSampleCount]);
+end;
+
+function BuildEvidenceRows(const aEvidence: TMachineOverviewIncidentEvidence; const aExport: Boolean;
+  const aUtcToLocal: TFunc<TDateTime, TDateTime>):
+  TArray<TMachineOverviewEvidenceRow>;
+var
+  g: TGarbos;
+  lRows: TList<TMachineOverviewEvidenceRow>;
+  lKind: TMachineOverviewEvidencePhaseKind;
+  lPhase: TMachineOverviewEvidencePhase;
+  lProcess: TMachineOverviewProcessContribution;
+  lApplication: TMachineOverviewApplicationContribution;
+  lGap: TMachineOverviewEvidenceGap;
+  lRow: TMachineOverviewEvidenceRow;
+  i: Integer;
+  lIdentity: string;
+begin
+  g := Default(TGarbos);
+  GC(lRows, TList<TMachineOverviewEvidenceRow>.Create, g);
+  if aEvidence.State in [TMachineOverviewEvidenceState.Collecting, TMachineOverviewEvidenceState.Complete,
+    TMachineOverviewEvidenceState.Partial] then
+  begin
+    for lKind in cEvidenceDisplayPhases do
+    begin
+      lPhase := aEvidence.Phases[lKind];
+      lPhase.Kind := lKind;
+      if lPhase.StartUtc <= 0 then
+        Continue;
+      lRows.Add(EvidenceStatisticRow(lPhase, rsEvidenceCpu, lPhase.SystemCpu, False, aExport, aUtcToLocal));
+      lRows.Add(EvidenceStatisticRow(lPhase, rsEvidenceDpc, lPhase.Dpc, False, aExport, aUtcToLocal));
+      lRows.Add(EvidenceStatisticRow(lPhase, rsEvidenceInterrupt, lPhase.Interrupt, False, aExport, aUtcToLocal));
+      lRows.Add(EvidenceStatisticRow(lPhase, rsEvidenceMeasured, lPhase.MeasuredProcessCpu, True, aExport, aUtcToLocal));
+      lRows.Add(EvidenceStatisticRow(lPhase, rsEvidenceUnattributed, lPhase.UnattributedCpu, True, aExport, aUtcToLocal));
+      for lProcess in lPhase.Processes do
+      begin
+        lRow := Default(TMachineOverviewEvidenceRow);
+        lRow.Phase := EvidencePhaseText(lKind);
+        lRow.Kind := rsEvidenceProcess;
+        lRow.Name := lProcess.DisplayName;
+        if aExport then
+          lRow.Identity := Format(rsEvidenceProcessIdentity, [lProcess.ProcessId,
+            EvidenceRowTime(EncodeDate(1601, 1, 1) + lProcess.CreationTime100ns / 864000000000.0, True, aUtcToLocal),
+            EvidenceRowTime(lProcess.LastSeenUtc, True, aUtcToLocal), lProcess.ImagePath])
+        else
+          lRow.Identity := Format(rsEvidenceProcessListIdentity, [lProcess.ProcessId,
+            EvidenceRowTime(EncodeDate(1601, 1, 1) + lProcess.CreationTime100ns / 864000000000.0, False, aUtcToLocal)]);
+        lRow.Average := Format(rsEvidenceOneCore, [EvidenceNumber(lProcess.AverageCpuPercent),
+          EvidenceNumber(lProcess.AverageCpuPercent * aEvidence.LogicalProcessorCount / 100)]);
+        lRow.Peak := Format(rsEvidenceOneCore, [EvidenceNumber(lProcess.PeakCpuPercent),
+          EvidenceNumber(lProcess.PeakCpuPercent * aEvidence.LogicalProcessorCount / 100)]);
+        lRow.PeakTime := EvidenceRowTime(lProcess.PeakAtUtc, aExport, aUtcToLocal);
+        lRow.Measured := Format(rsEvidenceSampleCount, [lProcess.SampleCount, lPhase.ExpectedProcessSampleCount]);
+        lRows.Add(lRow);
+      end;
+      for lApplication in lPhase.Applications do
+      begin
+        lRow := Default(TMachineOverviewEvidenceRow);
+        lRow.Phase := EvidencePhaseText(lKind);
+        lRow.Kind := rsEvidenceApplication;
+        lRow.Name := lApplication.DisplayName;
+        lRow.Identity := Format(rsEvidenceApplicationIdentity, [lApplication.ProcessCount]);
+        lRow.Average := Format(rsEvidenceShare, [EvidenceNumber(lApplication.AverageCpuPercent)]);
+        lRow.Peak := Format(rsEvidenceShare, [EvidenceNumber(lApplication.PeakCpuPercent)]);
+        lRow.PeakTime := EvidenceRowTime(lApplication.PeakAtUtc, aExport, aUtcToLocal);
+        lRow.Measured := Format(rsEvidenceSampleCount, [lPhase.ProcessSampleCount, lPhase.ExpectedProcessSampleCount]);
+        lRows.Add(lRow);
+      end;
+    end;
+    for lGap in aEvidence.Gaps do
+    begin
+      lRow := Default(TMachineOverviewEvidenceRow);
+      lRow.Kind := rsEvidenceGap;
+      lRow.Name := EvidenceGapText(lGap.Reason);
+      lRow.Identity := EvidenceRowTime(lGap.StartUtc, aExport, aUtcToLocal) + ' - ' +
+        EvidenceRowTime(lGap.EndUtc, aExport, aUtcToLocal);
+      lRows.Add(lRow);
+    end;
+  end;
+  Result := lRows.ToArray;
+  for i := 0 to High(Result) do
+  begin
+    lRow := Result[i];
+    lIdentity := '';
+    if not lRow.Identity.IsEmpty then
+      lIdentity := ', ' + lRow.Identity;
+    if lRow.Kind = rsEvidenceGap then
+      Result[i].AccessibleText := Format(rsEvidenceAccessibleGap, [lRow.Name, lRow.Identity])
+    else if lRow.Average = rsEvidenceNoMeasurementRow then
+      Result[i].AccessibleText := Format(rsEvidenceAccessibleUnmeasured,
+        [lRow.Phase, LowerCase(lRow.Kind), lRow.Name, lRow.Measured])
+    else
+      Result[i].AccessibleText := Format(rsEvidenceAccessibleFact, [lRow.Phase, LowerCase(lRow.Kind),
+        lRow.Name, lIdentity, lRow.Average, lRow.Peak, lRow.PeakTime, lRow.Measured]);
+  end;
+end;
+
+function MachineOverviewEvidenceRows(const aEvidence: TMachineOverviewIncidentEvidence):
+  TArray<TMachineOverviewEvidenceRow>;
+begin
+  Result := BuildEvidenceRows(aEvidence, False, nil);
+end;
+
+function MachineOverviewEvidenceText(const aEvidence: TMachineOverviewIncidentEvidence): string;
+begin
+  Result := MachineOverviewEvidenceText(aEvidence, nil);
+end;
+
+function MachineOverviewEvidenceText(const aEvidence: TMachineOverviewIncidentEvidence;
+  const aUtcToLocal: TFunc<TDateTime, TDateTime>): string;
+var
+  g: TGarbos;
+  lLines: TStringList;
+  lRows: TArray<TMachineOverviewEvidenceRow>;
+  lRow: TMachineOverviewEvidenceRow;
+  lKind: TMachineOverviewEvidencePhaseKind;
+  lPhase: TMachineOverviewEvidencePhase;
+  lCoverage: string;
+begin
+  g := Default(TGarbos);
+  GC(lLines, TStringList.Create, g);
+  lLines.Add(Format(rsEvidenceHeading, [MachineOverviewEvidenceStateText(aEvidence.State)]));
+  if not (aEvidence.State in [TMachineOverviewEvidenceState.Collecting, TMachineOverviewEvidenceState.Complete,
+    TMachineOverviewEvidenceState.Partial]) then
+    Exit(lLines.Text.TrimRight);
+  if aEvidence.LogicalProcessorCount > 0 then
+    lLines.Add(Format(rsEvidenceMeasurement, [aEvidence.LogicalProcessorCount,
+      EvidenceNumber(100 / aEvidence.LogicalProcessorCount), aEvidence.ProcessIntervalMs, aEvidence.SystemIntervalMs]))
+  else
+    lLines.Add(rsEvidenceNoMeasurement);
+  lRows := BuildEvidenceRows(aEvidence, True, aUtcToLocal);
+  for lKind in cEvidenceDisplayPhases do
+  begin
+    lPhase := aEvidence.Phases[lKind];
+    if (lPhase.StartUtc <= 0) or (Length(lRows) = 0) then
+      Continue;
+    lLines.Add(Format(rsEvidencePhaseHeading, [EvidencePhaseText(lKind),
+      MachineOverviewEvidenceTimeText(lPhase.StartUtc, aUtcToLocal),
+      MachineOverviewEvidenceTimeText(lPhase.EndUtc, aUtcToLocal),
+      lPhase.ProcessSampleCount, lPhase.ExpectedProcessSampleCount, lPhase.SystemSampleCount, lPhase.ExpectedSystemSampleCount]));
+    for lRow in lRows do
+      if lRow.Phase = EvidencePhaseText(lKind) then
+      begin
+        if lRow.Average = rsEvidenceNoMeasurementRow then
+          lLines.Add(Format(rsEvidenceUnmeasuredFact, [lRow.Kind, lRow.Name, lRow.Measured]))
+        else
+          lLines.Add(Format(rsEvidenceFact, [lRow.Kind, lRow.Name, lRow.Identity,
+            lRow.Average, lRow.Peak, lRow.PeakTime, lRow.Measured]));
+      end;
+  end;
+  if Length(aEvidence.Gaps) = 0 then
+    lLines.Add(rsEvidenceNoGaps)
+  else
+  begin
+    lLines.Add(rsEvidenceGaps);
+    for lRow in lRows do
+      if lRow.Kind = rsEvidenceGap then
+        lLines.Add('  ' + lRow.Identity + ': ' + lRow.Name);
+  end;
+  lCoverage := rsEvidenceListsComplete;
+  if aEvidence.Truncated then
+    lCoverage := rsEvidenceListsShortened;
+  lLines.Add(Format(rsEvidenceLimits, [aEvidence.InaccessibleProcessCountMax, lCoverage, aEvidence.GapsOmitted]));
+  Result := lLines.Text.TrimRight;
+end;
 
 function EvidenceTextPrefix(const aText: string; const aMaximumUnits: Integer): string;
 var

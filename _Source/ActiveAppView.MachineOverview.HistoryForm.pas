@@ -3,25 +3,29 @@ unit ActiveAppView.MachineOverview.HistoryForm;
 interface
 
 uses
-  System.Classes,
+  System.Classes, System.SysUtils, System.Types,
   Winapi.Messages,
   Vcl.ComCtrls, Vcl.Controls, Vcl.ExtCtrls, Vcl.Forms, Vcl.StdCtrls,
-  ActiveAppView.MachineOverview.Incidents;
+  ActiveAppView.MachineOverview.History, ActiveAppView.MachineOverview.Incidents;
 
 type
   TMachineOverviewIncidentHistoryFilter = (Last24Hours, Last7Days, All);
 
   TMachineOverviewHistoryFrm = class(TForm)
     btnClose: TButton;
+    btnCopyEvidence: TButton;
     btnRefresh: TButton;
     cbFilter: TComboBox;
     labFilter: TStaticText;
     labStatus: TStaticText;
+    labEvidence: TStaticText;
+    lvEvidence: TListView;
     lvIncidents: TListView;
     memDetails: TMemo;
     pnlButtons: TPanel;
     pnlFilter: TPanel;
-    splDetails: TSplitter;
+    gridDetails: TGridPanel;
+    procedure btnCopyEvidenceClick(aSender: TObject);
     procedure btnRefreshClick(aSender: TObject);
     procedure cbFilterChange(aSender: TObject);
     procedure FormDestroy(aSender: TObject);
@@ -40,6 +44,22 @@ type
     fReferenceUtc: TDateTime;
     fRefreshPending: Boolean;
     fWorker: TThread;
+    fEvidenceWorker: TThread;
+    fEvidenceRequest: Cardinal;
+    fRequestedEvidenceKey: string;
+    fHealth: TMachineOverviewHistoryHealth;
+    fLastEvidenceQueryThreadId: Cardinal;
+    fEvidenceNamedCount, fIncidentNamedCount: Integer;
+    fEvidenceRowNames: TArray<string>;
+    procedure ApplyEvidenceResult;
+    procedure BeginEvidenceRefresh;
+    procedure StartEvidenceWorker;
+    procedure RenderEvidence;
+    procedure SetEvidenceCaption(const aState: string);
+    procedure RefreshAccessibleNames;
+    procedure RenderDetails(const aIndex: Integer; const aEvidenceStateLine: string = '');
+    procedure WMHistoryEvidenceComplete(var aMessage: TMessage);
+      message WM_APP + 147;
     procedure ApplyQueryResult;
     procedure BeginRefresh(const aInitialOpen: Boolean);
     procedure CloseWorker;
@@ -51,7 +71,14 @@ type
     function TopIncidentId: string;
     procedure WMHistoryQueryComplete(var aMessage: TMessage);
       message WM_APP + 146;
+  protected
+    procedure CMShowingChanged(var aMessage: TMessage); message CM_SHOWINGCHANGED;
+    function InitialWorkArea: TRect; virtual;
+    procedure DoAfterMonitorDpiChanged(aOldDpi, aNewDpi: Integer); override;
   public
+    destructor Destroy; override;
+    procedure ScaleForPPI(aNewPpi: Integer); override;
+    function LastEvidenceQueryThreadId: Cardinal;
     procedure Configure(const aDatabaseFileName: string;
       const aReferenceUtc: TDateTime = 0);
     function IncidentAt(const aIndex: Integer): TMachineOverviewIncident;
@@ -66,7 +93,11 @@ type
   end;
 
 function FormatMachineOverviewIncidentDetails(
-  const aIncident: TMachineOverviewIncident): string;
+  const aIncident: TMachineOverviewIncident): string; overload;
+function FormatMachineOverviewIncidentDetails(const aIncident: TMachineOverviewIncident;
+  const aTimeZoneName: string; const aUtcToLocal: TFunc<TDateTime, TDateTime>): string; overload;
+function FormatMachineOverviewHistoryHealth(const aHealth: TMachineOverviewHistoryHealth;
+  const aNowUtc: TDateTime): string;
 function MachineOverviewIncidentHistoryEarliestUtc(
   const aFilter: TMachineOverviewIncidentHistoryFilter;
   const aNowUtc: TDateTime): TDateTime;
@@ -77,10 +108,11 @@ procedure ShowMachineOverviewIncidentHistory(const aOwner: TComponent;
 implementation
 
 uses
-  System.DateUtils, System.SysUtils,
-  Winapi.CommCtrl, Winapi.Windows,
+  System.DateUtils, System.Math, System.Win.ComObj,
+  Winapi.CommCtrl, Winapi.oleacc, Winapi.Windows,
+  Vcl.Clipbrd,
   AutoFree,
-  ActiveAppView.MachineOverview.History,
+  ActiveAppView.MachineOverview.Evidence,
   ActiveAppView.MachineOverview.Types;
 
 {$R *.dfm}
@@ -90,8 +122,68 @@ resourcestring
   rsIncidentHistoryEmpty = 'No incidents in this period.';
   rsIncidentHistoryLoading = 'Loading incident history...';
   rsIncidentHistoryUnavailable = 'Incident history is temporarily unavailable: %s';
+  rsEvidenceLoading = 'Loading evidence...';
+  rsEvidenceLoadFailed = 'Evidence could not be read (recorded data unavailable: %s)';
+  rsEvidenceLoadingText = 'Evidence: loading...';
+  rsEvidenceCopied = 'Evidence copied to the clipboard.';
+  rsEvidenceCopyFailed = 'Could not copy evidence to the clipboard: %s';
+  rsEvidenceNoSelection = 'no incident selected';
+  rsEvidenceListsShortened = 'lists shortened';
+  rsEvidenceDetailsName = 'Incident details and evidence export';
+  rsFilterName = 'Show incidents';
+  rsEvidenceExportHeader = 'ActiveAppView incident evidence. Times are local with their UTC offset; Z times are authoritative.';
+  rsEvidenceExportIncident = 'Incident: %s | %s | %s | %s | key %s';
+  rsEvidenceExportTimes = 'Started %s; peak %s value %s; %s';
+  rsEvidenceEnded = 'Ended: %s';
+  rsEvidenceEndedUnknown = 'Ended: not recorded (collection stopped)';
+  rsEvidenceOngoing = 'Ongoing';
+  rsEvidenceExportThreshold = 'Threshold: %s';
+  rsEvidenceExportTrace = 'Detailed trace: %s.';
+  rsEvidenceTraceOnset = 'Trace starts after detection and does not include the onset.';
+  rsEvidenceRawReference = 'Raw evidence: %s, table incident_evidence, incident_key %s';
+  rsHealthHeading = 'Recording health: %s; last write %s';
+  rsHealthStorage = 'Storage: %s of %s MB used; WAL %s MB not counted; file %s MB; evidence %s MB; %s. %s';
+  rsHealthNever = 'never';
+  rsHealthSecondsAgo = '%d s ago';
+  rsHealthMinutesAgo = '%d min ago';
+  rsHealthRange = '%s: oldest %s; newest %s';
+  rsHealthIncidents = 'Incidents';
+  rsHealthEvidence = 'Evidence';
+  rsHealthProcess = 'Newest process sample: %s';
+  rsHealthCounts = 'Totals: evidence trimmed %d; incidents deleted %d; samples deleted %d; records dropped this session %d';
+  rsHealthSampling = 'Sampling: processes %d ms; system %d ms; commit %d ms; %d logical processors; provider status: %s';
+  rsHealthPaths = 'Database: %s'#13#10'Pre-migration backup: %s';
+  rsHealthError = 'Error: %s';
+  rsStorageWithinBudget = 'Within budget';
+  rsStorageTrimming = 'Trimming';
+  rsStorageFloorBreached = 'Minimum retention exceeds the storage budget';
+  rsStorageOverBudget = 'Over budget';
+  rsStorageMigrationBlocked = 'Migration blocked';
+  rsIncidentListName = 'Recorded incidents';
+  rsEvidenceListName = 'Measured incident evidence';
 
 type
+  // As in our overview adapter, use the native HWND ABI on Win64. The Delphi
+  // oleacc import incorrectly declares HWND as a 32-bit remotable record.
+  IHistoryAccPropServices = interface(IUnknown)
+    ['{6E26E776-04F0-495D-80E4-3330352E3169}']
+    function SetPropValue(var aId: Byte; aLength: LongWord; aProperty: TGUID;
+      aValue: OleVariant): HResult; stdcall;
+    function SetPropServer(var aId: Byte; aLength: LongWord; var aProperties: TGUID;
+      aCount: NativeInt; const aServer: IAccPropServer; aScope: AnnoScope): HResult; stdcall;
+    function ClearProps(var aId: Byte; aLength: LongWord; var aProperties: TGUID;
+      aCount: NativeInt): HResult; stdcall;
+    function SetHwndProp(aWindow: HWND; aObjectId, aChildId: LongWord;
+      aProperty: TGUID; aValue: OleVariant): HResult; stdcall;
+    function SetHwndPropStr(aWindow: HWND; aObjectId, aChildId: LongWord;
+      aProperty: TGUID; aValue: PWideChar): HResult; stdcall;
+    function SetHwndPropServer(aWindow: HWND; aObjectId, aChildId: LongWord;
+      var aProperties: TGUID; aCount: NativeInt; const aServer: IAccPropServer;
+      aScope: AnnoScope): HResult; stdcall;
+    function ClearHwndProps(aWindow: HWND; aObjectId, aChildId: LongWord;
+      var aProperties: TGUID; aCount: NativeInt): HResult; stdcall;
+  end;
+
   TMachineOverviewIncidentHistoryWorker = class(TThread)
   private
     fDatabaseFileName: string;
@@ -104,6 +196,8 @@ type
     fSucceeded: Boolean;
     fTargetWindow: HWND;
     fQueryThreadId: Cardinal;
+    fHealth: TMachineOverviewHistoryHealth;
+    fCompleted: Boolean;
   protected
     procedure Execute; override;
   public
@@ -112,6 +206,74 @@ type
       const aPreviousSelectedId, aPreviousTopId: string;
       const aSelectNewest: Boolean);
   end;
+
+  TMachineOverviewIncidentEvidenceWorker = class(TThread)
+  public
+    DatabaseFileName, IncidentKey, Error: string;
+    Evidence: TMachineOverviewIncidentEvidence;
+    Request, QueryThreadId: Cardinal;
+    TargetWindow: HWND;
+    Succeeded, Completed: Boolean;
+    constructor Create(const aTarget: HWND; const aDatabase, aKey: string; const aRequest: Cardinal);
+    procedure Execute; override;
+  end;
+
+procedure SetHistoryAccessibleName(const aControl: TWinControl; const aName: string);
+var
+  lServices: IHistoryAccPropServices;
+begin
+  lServices := CreateComObject(CLSID_AccPropServices) as IHistoryAccPropServices;
+  OleCheck(lServices.SetHwndPropStr(aControl.Handle, Cardinal(OBJID_CLIENT), CHILDID_SELF,
+    PROPID_ACC_NAME, PWideChar(aName)));
+end;
+
+procedure UpdateHistoryAccessibleRows(const aList: TListView; const aName: string;
+  var aPreviousCount: Integer; const aRowNames: TArray<string> = nil);
+var
+  lServices: IHistoryAccPropServices;
+  lProperty: TGUID;
+  lText: string;
+  i: Integer;
+begin
+  lServices := CreateComObject(CLSID_AccPropServices) as IHistoryAccPropServices;
+  OleCheck(lServices.SetHwndPropStr(aList.Handle, Cardinal(OBJID_CLIENT), CHILDID_SELF,
+    PROPID_ACC_NAME, PWideChar(aName)));
+  for i := 0 to aList.Items.Count - 1 do
+  begin
+    lText := aList.Items[i].Caption + '; ' +
+      StringReplace(aList.Items[i].SubItems.Text.TrimRight, sLineBreak, '; ', [rfReplaceAll]);
+    if i < Length(aRowNames) then
+      lText := aRowNames[i]
+    else if aList.Items[i].SubItems.Count = 0 then
+      lText := aList.Items[i].Caption;
+    OleCheck(lServices.SetHwndPropStr(aList.Handle, Cardinal(OBJID_CLIENT), i + 1,
+      PROPID_ACC_NAME, PWideChar(lText)));
+  end;
+  lProperty := PROPID_ACC_NAME;
+  for i := aList.Items.Count to aPreviousCount - 1 do
+    OleCheck(lServices.ClearHwndProps(aList.Handle, Cardinal(OBJID_CLIENT), i + 1, lProperty, 1));
+  aPreviousCount := aList.Items.Count;
+end;
+
+constructor TMachineOverviewIncidentEvidenceWorker.Create(const aTarget: HWND;
+  const aDatabase, aKey: string; const aRequest: Cardinal);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  TargetWindow := aTarget;
+  DatabaseFileName := aDatabase;
+  IncidentKey := aKey;
+  Request := aRequest;
+end;
+
+procedure TMachineOverviewIncidentEvidenceWorker.Execute;
+begin
+  QueryThreadId := GetCurrentThreadId;
+  Succeeded := TryLoadMachineOverviewIncidentEvidence(DatabaseFileName, IncidentKey, Evidence, Error);
+  Completed := True;
+  if not Terminated then
+    PostMessage(TargetWindow, WM_APP + 147, 0, 0);
+end;
 
 constructor TMachineOverviewIncidentHistoryWorker.Create(
   const aTargetWindow: HWND; const aDatabaseFileName: string;
@@ -129,10 +291,19 @@ begin
 end;
 
 procedure TMachineOverviewIncidentHistoryWorker.Execute;
+var
+  lHealthError: string;
 begin
   fQueryThreadId := GetCurrentThreadId;
   fSucceeded := TryLoadMachineOverviewIncidents(fDatabaseFileName,
     fEarliestUtc, 0, fIncidents, fError);
+  if not TryLoadMachineOverviewHistoryHealth(fDatabaseFileName, fHealth, lHealthError) then
+  begin
+    if not fError.IsEmpty then
+      fError := fError + '. ';
+    fError := fError + lHealthError;
+  end;
+  fCompleted := True;
   if not Terminated then
     PostMessage(fTargetWindow, WM_APP + 146, 0, 0);
 end;
@@ -207,49 +378,100 @@ begin
     TFormatSettings.Invariant);
 end;
 
-procedure AddIncidentStrings(const aLines: TStrings; const aHeading: string;
-  const aValues: TArray<string>);
+function FormatIncidentDetails(const aIncident: TMachineOverviewIncident;
+  const aEvidenceStateLine: string; const aUtcToLocal: TFunc<TDateTime, TDateTime>): string;
 var
-  lValue: string;
+  g: TGarbos;
+  lLines: TStringList;
+  lEnded: string;
 begin
-  aLines.Add(aHeading + ':');
-  if Length(aValues) = 0 then
+  g := Default(TGarbos);
+  GC(lLines, TStringList.Create, g);
+  lLines.Add(rsEvidenceExportHeader);
+  lLines.Add(Format(rsEvidenceExportIncident, [aIncident.Summary, IncidentCategoryText(aIncident.Category),
+    IncidentSeverityText(aIncident.Severity), IncidentOriginText(aIncident.Origin), aIncident.StableId]));
+  lEnded := Format(rsEvidenceEnded, [MachineOverviewEvidenceTimeText(aIncident.EndedAtUtc, aUtcToLocal)]);
+  if aIncident.EndedAtUtc <= 0 then
   begin
-    aLines.Add('  None');
-    Exit;
+    if aIncident.Evidence.State = TMachineOverviewEvidenceState.Partial then
+      lEnded := rsEvidenceEndedUnknown
+    else
+      lEnded := Format(rsEvidenceEnded, [rsEvidenceOngoing]);
   end;
-  for lValue in aValues do
-    aLines.Add('  ' + lValue);
+  lLines.Add(Format(rsEvidenceExportTimes, [MachineOverviewEvidenceTimeText(aIncident.StartedAtUtc, aUtcToLocal),
+    MachineOverviewEvidenceTimeText(aIncident.PeakAtUtc, aUtcToLocal),
+    FormatFloat('0.###', aIncident.PeakValue, TFormatSettings.Invariant), lEnded]));
+  lLines.Add(Format(rsEvidenceExportThreshold, [aIncident.ThresholdText]));
+  if aEvidenceStateLine.IsEmpty then
+    lLines.Add(MachineOverviewEvidenceText(aIncident.Evidence, aUtcToLocal))
+  else
+    lLines.Add(aEvidenceStateLine);
+  lLines.Add(Format(rsEvidenceExportTrace, [IncidentTraceStatusText(aIncident.TraceStatus)]));
+  if aIncident.TraceStatus = TMachineOverviewIncidentTraceStatus.Captured then
+    lLines.Add(rsEvidenceTraceOnset);
+  Result := lLines.Text.TrimRight;
 end;
 
 function FormatMachineOverviewIncidentDetails(
   const aIncident: TMachineOverviewIncident): string;
+begin
+  Result := FormatIncidentDetails(aIncident, '', nil);
+end;
+
+function FormatMachineOverviewIncidentDetails(const aIncident: TMachineOverviewIncident;
+  const aTimeZoneName: string; const aUtcToLocal: TFunc<TDateTime, TDateTime>): string;
+begin
+  // Keep the existing signature; per-timestamp offsets replace the zone name.
+  Result := FormatIncidentDetails(aIncident, '', aUtcToLocal);
+end;
+
+function FormatMachineOverviewHistoryHealth(const aHealth: TMachineOverviewHistoryHealth;
+  const aNowUtc: TDateTime): string;
 var
   g: TGarbos;
   lLines: TStringList;
+  lStorage, lAge: string;
+  lSeconds: Int64;
 begin
   g := Default(TGarbos);
   GC(lLines, TStringList.Create, g);
-  lLines.Add('Summary: ' + aIncident.Summary);
-  lLines.Add('Category: ' + IncidentCategoryText(aIncident.Category));
-  lLines.Add('Severity: ' + IncidentSeverityText(aIncident.Severity));
-  lLines.Add('Origin: ' + IncidentOriginText(aIncident.Origin));
-  lLines.Add('Local time: ' + aIncident.LocalDisplayTime);
-  lLines.Add('Started UTC: ' + IncidentUtcText(aIncident.StartedAtUtc));
-  lLines.Add('Peak UTC: ' + IncidentUtcText(aIncident.PeakAtUtc));
-  lLines.Add('Ended UTC: ' + IncidentUtcText(aIncident.EndedAtUtc));
-  lLines.Add('Explanation: ' + aIncident.Explanation);
-  lLines.Add('Threshold: ' + aIncident.ThresholdText);
-  lLines.Add('Peak value: ' + FormatFloat('0.###', aIncident.PeakValue,
-    TFormatSettings.Invariant));
-  lLines.Add('Provider: ' + aIncident.ProviderId);
-  lLines.Add('Provider freshness: ' +
-    UIntToStr(aIncident.ProviderFreshnessMs) + ' ms');
-  lLines.Add('Trace: ' + IncidentTraceStatusText(aIncident.TraceStatus));
-  AddIncidentStrings(lLines, 'Related entities',
-    aIncident.RelatedEntityIds);
-  AddIncidentStrings(lLines, 'Related executable paths',
-    aIncident.RelatedExecutablePaths);
+  lAge := rsHealthNever;
+  if aHealth.LastWriteUtc > 0 then
+  begin
+    lSeconds := 0;
+    if aNowUtc > aHealth.LastWriteUtc then
+      lSeconds := Round((aNowUtc - aHealth.LastWriteUtc) * SecsPerDay);
+    if lSeconds < 60 then
+      lAge := Format(rsHealthSecondsAgo, [lSeconds])
+    else
+      lAge := Format(rsHealthMinutesAgo, [lSeconds div 60]);
+  end;
+  lLines.Add(Format(rsHealthHeading, [MachineOverviewRecordingState(aHealth, aNowUtc), lAge]));
+  case aHealth.StorageState of
+    TMachineOverviewStorageState.WithinBudget: lStorage := rsStorageWithinBudget;
+    TMachineOverviewStorageState.Trimming: lStorage := rsStorageTrimming;
+    TMachineOverviewStorageState.FloorBreached: lStorage := rsStorageFloorBreached;
+    TMachineOverviewStorageState.OverBudget: lStorage := rsStorageOverBudget;
+    TMachineOverviewStorageState.MigrationBlocked: lStorage := rsStorageMigrationBlocked;
+  end;
+  lLines.Add(Format(rsHealthStorage, [FormatFloat('0.###', aHealth.UsedBytes / 1048576, TFormatSettings.Invariant),
+    FormatFloat('0.###', aHealth.BudgetBytes / 1048576, TFormatSettings.Invariant),
+    FormatFloat('0.###', aHealth.WalBytes / 1048576, TFormatSettings.Invariant),
+    FormatFloat('0.###', aHealth.FileBytes / 1048576, TFormatSettings.Invariant),
+    FormatFloat('0.###', aHealth.EvidenceBytes / 1048576, TFormatSettings.Invariant),
+    lStorage, aHealth.StorageMessage]));
+  lLines.Add(Format(rsHealthRange, [rsHealthIncidents, MachineOverviewEvidenceTimeText(aHealth.OldestIncidentUtc),
+    MachineOverviewEvidenceTimeText(aHealth.NewestIncidentUtc)]));
+  lLines.Add(Format(rsHealthRange, [rsHealthEvidence, MachineOverviewEvidenceTimeText(aHealth.OldestEvidenceUtc),
+    MachineOverviewEvidenceTimeText(aHealth.NewestEvidenceUtc)]));
+  lLines.Add(Format(rsHealthProcess, [MachineOverviewEvidenceTimeText(aHealth.NewestProcessSampleUtc)]));
+  lLines.Add(Format(rsHealthCounts, [aHealth.EvidenceTrimmedTotal, aHealth.IncidentsDeletedTotal,
+    aHealth.SamplesDeletedTotal, aHealth.SessionDroppedRecords]));
+  lLines.Add(Format(rsHealthSampling, [aHealth.ProcessIntervalMs, aHealth.SystemIntervalMs,
+    aHealth.CommitIntervalMs, aHealth.LogicalProcessorCount, aHealth.ProviderStatus]));
+  lLines.Add(Format(rsHealthPaths, [aHealth.DatabaseFileName, aHealth.BackupFileName]));
+  if not aHealth.LastError.IsEmpty then
+    lLines.Add(Format(rsHealthError, [aHealth.LastError]));
   Result := lLines.Text.TrimRight;
 end;
 
@@ -287,14 +509,19 @@ begin
   if not Assigned(fWorker) then
     Exit;
   lWorker := fWorker as TMachineOverviewIncidentHistoryWorker;
+  if not lWorker.fCompleted then
+    Exit;
   lWorker.WaitFor;
   lError := lWorker.fError;
   lIncidents := Copy(lWorker.fIncidents);
-  lPreviousSelectedId := lWorker.fPreviousSelectedId;
-  lPreviousTopId := lWorker.fPreviousTopId;
+  // The user may select or scroll while the query runs. Preserve that current
+  // context rather than restoring the selection captured when refresh began.
+  lPreviousSelectedId := SelectedIncidentId;
+  lPreviousTopId := TopIncidentId;
   lSelectNewest := lWorker.fSelectNewest;
   lSucceeded := lWorker.fSucceeded;
   fLastQueryThreadId := lWorker.fQueryThreadId;
+  fHealth := lWorker.fHealth;
   FreeAndNil(fWorker);
   fLastApplyThreadId := GetCurrentThreadId;
   fLastRefreshSucceeded := lSucceeded;
@@ -309,6 +536,8 @@ begin
   if not lSucceeded then
   begin
     labStatus.Caption := Format(rsIncidentHistoryUnavailable, [lError]);
+    if SelectedIncidentId.IsEmpty then
+      memDetails.Text := FormatMachineOverviewHistoryHealth(fHealth, CurrentReferenceUtc);
     Exit;
   end;
   fIncidents := lIncidents;
@@ -361,12 +590,215 @@ begin
 end;
 
 procedure TMachineOverviewHistoryFrm.CloseWorker;
+var
+  lMessage: TMsg;
 begin
-  if not Assigned(fWorker) then
+  if Assigned(fWorker) then
+    fWorker.Terminate;
+  if Assigned(fEvidenceWorker) then
+    fEvidenceWorker.Terminate;
+  if Assigned(fWorker) then
+  begin
+    fWorker.WaitFor;
+    FreeAndNil(fWorker);
+  end;
+  if Assigned(fEvidenceWorker) then
+  begin
+    fEvidenceWorker.WaitFor;
+    FreeAndNil(fEvidenceWorker);
+  end;
+  if HandleAllocated then
+    // Completion messages carry no owned payload. Both workers have stopped.
+    while PeekMessage(lMessage, Handle, WM_APP + 146, WM_APP + 147, PM_REMOVE) do
+      Continue;
+end;
+
+destructor TMachineOverviewHistoryFrm.Destroy;
+begin
+  fClosing := True;
+  // Join while our target HWND still exists, before TCustomForm destroys it.
+  CloseWorker;
+  inherited;
+end;
+
+function TMachineOverviewHistoryFrm.LastEvidenceQueryThreadId: Cardinal;
+begin
+  Result := fLastEvidenceQueryThreadId;
+end;
+
+procedure TMachineOverviewHistoryFrm.btnCopyEvidenceClick(aSender: TObject);
+begin
+  try
+    Clipboard.AsText := memDetails.Text;
+    labStatus.Caption := rsEvidenceCopied;
+  except
+    on lException: Exception do
+      labStatus.Caption := Format(rsEvidenceCopyFailed, [lException.Message]);
+  end;
+end;
+
+procedure TMachineOverviewHistoryFrm.SetEvidenceCaption(const aState: string);
+begin
+  labEvidence.Caption := rsEvidenceListName + ': ' + aState;
+  SetHistoryAccessibleName(lvEvidence, labEvidence.Caption);
+end;
+
+procedure TMachineOverviewHistoryFrm.RefreshAccessibleNames;
+begin
+  // Scaling can recreate native child HWNDs, which discards their annotations.
+  if fClosing or not Assigned(cbFilter) or not Assigned(memDetails) or
+    not Assigned(lvIncidents) or not Assigned(lvEvidence) or not Assigned(labEvidence) then
     Exit;
-  fWorker.Terminate;
-  fWorker.WaitFor;
-  FreeAndNil(fWorker);
+  SetHistoryAccessibleName(memDetails, rsEvidenceDetailsName);
+  SetHistoryAccessibleName(cbFilter, rsFilterName);
+  UpdateHistoryAccessibleRows(lvIncidents, rsIncidentListName, fIncidentNamedCount);
+  UpdateHistoryAccessibleRows(lvEvidence, labEvidence.Caption, fEvidenceNamedCount, fEvidenceRowNames);
+end;
+
+procedure TMachineOverviewHistoryFrm.ScaleForPPI(aNewPpi: Integer);
+begin
+  inherited;
+  RefreshAccessibleNames;
+end;
+
+procedure TMachineOverviewHistoryFrm.DoAfterMonitorDpiChanged(aOldDpi, aNewDpi: Integer);
+begin
+  inherited;
+  RefreshAccessibleNames;
+end;
+
+procedure TMachineOverviewHistoryFrm.BeginEvidenceRefresh;
+var
+  lIndex: Integer;
+begin
+  if fClosing then
+    Exit;
+  Inc(fEvidenceRequest);
+  fRequestedEvidenceKey := SelectedIncidentId;
+  fEvidenceRowNames := nil;
+  lvEvidence.Items.Clear;
+  btnCopyEvidence.Enabled := False;
+  lIndex := FindIncidentIndex(fRequestedEvidenceKey);
+  if lIndex < 0 then
+  begin
+    SetEvidenceCaption(rsEvidenceNoSelection);
+    UpdateHistoryAccessibleRows(lvEvidence, labEvidence.Caption, fEvidenceNamedCount);
+    memDetails.Text := FormatMachineOverviewHistoryHealth(fHealth, CurrentReferenceUtc);
+    Exit;
+  end;
+  RenderDetails(lIndex, rsEvidenceLoadingText);
+  btnCopyEvidence.Enabled := True;
+  lvEvidence.Items.Add.Caption := rsEvidenceLoading;
+  SetEvidenceCaption(rsEvidenceLoading);
+  UpdateHistoryAccessibleRows(lvEvidence, labEvidence.Caption, fEvidenceNamedCount);
+  StartEvidenceWorker;
+end;
+
+procedure TMachineOverviewHistoryFrm.StartEvidenceWorker;
+begin
+  if fClosing or Assigned(fEvidenceWorker) or fRequestedEvidenceKey.IsEmpty then
+    Exit;
+  fEvidenceWorker := TMachineOverviewIncidentEvidenceWorker.Create(Handle,
+    fDatabaseFileName, fRequestedEvidenceKey, fEvidenceRequest);
+  fEvidenceWorker.Start;
+end;
+
+procedure TMachineOverviewHistoryFrm.ApplyEvidenceResult;
+var
+  lWorker: TMachineOverviewIncidentEvidenceWorker;
+  lIndex: Integer;
+  lCurrent: Boolean;
+  lError, lFailureText: string;
+  lSucceeded: Boolean;
+begin
+  if fClosing or not Assigned(fEvidenceWorker) then
+    Exit;
+  lWorker := fEvidenceWorker as TMachineOverviewIncidentEvidenceWorker;
+  if not lWorker.Completed then
+    Exit;
+  lWorker.WaitFor;
+  lCurrent := (lWorker.Request = fEvidenceRequest) and (lWorker.IncidentKey = SelectedIncidentId);
+  lIndex := FindIncidentIndex(lWorker.IncidentKey);
+  lSucceeded := lWorker.Succeeded;
+  lError := lWorker.Error;
+  fLastEvidenceQueryThreadId := lWorker.QueryThreadId;
+  if lCurrent and (lIndex >= 0) and lSucceeded then
+    fIncidents[lIndex].Evidence := lWorker.Evidence;
+  FreeAndNil(fEvidenceWorker);
+  if not lCurrent then
+  begin
+    StartEvidenceWorker;
+    Exit;
+  end;
+  if (lIndex < 0) then
+    Exit;
+  if not lSucceeded then
+  begin
+    lFailureText := Format(rsEvidenceLoadFailed, [lError]);
+    lvEvidence.Items.Clear;
+    lvEvidence.Items.Add.Caption := lFailureText;
+    SetEvidenceCaption(lFailureText);
+    UpdateHistoryAccessibleRows(lvEvidence, labEvidence.Caption, fEvidenceNamedCount);
+    RenderDetails(lIndex, lFailureText);
+    btnCopyEvidence.Enabled := True;
+    Exit;
+  end;
+  RenderEvidence;
+  RenderDetails(lIndex);
+  if not lError.IsEmpty then
+    memDetails.Lines.Add(lError);
+  btnCopyEvidence.Enabled := True;
+end;
+
+procedure TMachineOverviewHistoryFrm.RenderDetails(const aIndex: Integer; const aEvidenceStateLine: string);
+begin
+  memDetails.Text := FormatIncidentDetails(fIncidents[aIndex], aEvidenceStateLine, nil) +
+    sLineBreak + FormatMachineOverviewHistoryHealth(fHealth, CurrentReferenceUtc) +
+    sLineBreak + Format(rsEvidenceRawReference, [fDatabaseFileName, fIncidents[aIndex].StableId]);
+end;
+
+procedure TMachineOverviewHistoryFrm.RenderEvidence;
+var
+  lRow: TMachineOverviewEvidenceRow;
+  lItem: TListItem;
+  lIndex: Integer;
+  lCaption: string;
+begin
+  lIndex := FindIncidentIndex(SelectedIncidentId);
+  if lIndex < 0 then
+    Exit;
+  lvEvidence.Items.BeginUpdate;
+  try
+    lvEvidence.Items.Clear;
+    fEvidenceRowNames := nil;
+    for lRow in MachineOverviewEvidenceRows(fIncidents[lIndex].Evidence) do
+    begin
+      lItem := lvEvidence.Items.Add;
+      lItem.Caption := Trim(lRow.Phase + ' ' + lRow.Kind + ' ' + lRow.Name);
+      lItem.SubItems.Add(lRow.Identity);
+      lItem.SubItems.Add(lRow.Average);
+      lItem.SubItems.Add(lRow.Peak);
+      lItem.SubItems.Add(lRow.PeakTime);
+      lItem.SubItems.Add(lRow.Measured);
+      SetLength(fEvidenceRowNames, Length(fEvidenceRowNames) + 1);
+      fEvidenceRowNames[High(fEvidenceRowNames)] := lRow.AccessibleText;
+    end;
+    if lvEvidence.Items.Count = 0 then
+      lvEvidence.Items.Add.Caption := MachineOverviewEvidenceStateText(fIncidents[lIndex].Evidence.State);
+  finally
+    lvEvidence.Items.EndUpdate;
+  end;
+  lCaption := MachineOverviewEvidenceStateText(fIncidents[lIndex].Evidence.State);
+  if fIncidents[lIndex].Evidence.Truncated then
+    lCaption := lCaption + ', ' + rsEvidenceListsShortened;
+  SetEvidenceCaption(lCaption);
+  UpdateHistoryAccessibleRows(lvEvidence, labEvidence.Caption, fEvidenceNamedCount, fEvidenceRowNames);
+end;
+
+procedure TMachineOverviewHistoryFrm.WMHistoryEvidenceComplete(var aMessage: TMessage);
+begin
+  ApplyEvidenceResult;
+  aMessage.Result := 0;
 end;
 
 procedure TMachineOverviewHistoryFrm.Configure(const aDatabaseFileName: string;
@@ -374,6 +806,7 @@ procedure TMachineOverviewHistoryFrm.Configure(const aDatabaseFileName: string;
 begin
   fDatabaseFileName := aDatabaseFileName;
   fReferenceUtc := aReferenceUtc;
+  RefreshAccessibleNames;
 end;
 
 function TMachineOverviewHistoryFrm.CurrentReferenceUtc: TDateTime;
@@ -403,11 +836,40 @@ begin
   CloseWorker;
 end;
 
+procedure TMachineOverviewHistoryFrm.CMShowingChanged(var aMessage: TMessage);
+var
+  lWorkArea: TRect;
+  lWidth, lHeight: Integer;
+begin
+  inherited;
+  if not Showing or fClosing or (csDesigning in ComponentState) then
+    Exit;
+  // Bounds and monitor work area are physical pixels after VCL DPI scaling.
+  // VCL owner-centering happens after OnShow; constrain the resulting bounds.
+  lWorkArea := InitialWorkArea;
+  lWidth := Max(Constraints.MinWidth, Min(Width, lWorkArea.Width));
+  lHeight := Max(Constraints.MinHeight, Min(Height, lWorkArea.Height));
+  if (lWidth > lWorkArea.Width) or (lHeight > lWorkArea.Height) then
+  begin
+    // Keep the title bar reachable when the fixed minimum cannot fit.
+    SetBounds(lWorkArea.Left, lWorkArea.Top, lWidth, lHeight);
+    Exit;
+  end;
+  SetBounds(EnsureRange(Left, lWorkArea.Left, lWorkArea.Right - lWidth),
+    EnsureRange(Top, lWorkArea.Top, lWorkArea.Bottom - lHeight), lWidth, lHeight);
+end;
+
 procedure TMachineOverviewHistoryFrm.FormShow(aSender: TObject);
 begin
+  RefreshAccessibleNames;
   BeginRefresh(True);
   if lvIncidents.CanFocus then
     lvIncidents.SetFocus;
+end;
+
+function TMachineOverviewHistoryFrm.InitialWorkArea: TRect;
+begin
+  Result := Monitor.WorkareaRect;
 end;
 
 function TMachineOverviewHistoryFrm.IncidentAt(
@@ -438,12 +900,8 @@ procedure TMachineOverviewHistoryFrm.lvIncidentsSelectItem(aSender: TObject;
 begin
   if fApplyingResults then
     Exit;
-  if aSelected and Assigned(aItem) and (aItem.Index >= 0) and
-    (aItem.Index <= High(fIncidents)) then
-    memDetails.Text := FormatMachineOverviewIncidentDetails(
-      fIncidents[aItem.Index])
-  else if not Assigned(lvIncidents.Selected) then
-    memDetails.Clear;
+  if aSelected or not Assigned(lvIncidents.Selected) then
+    BeginEvidenceRefresh;
 end;
 
 function TMachineOverviewHistoryFrm.RefreshAndWaitForTest(
@@ -493,11 +951,8 @@ begin
     fApplyingResults := False;
   end;
   RestoreTopIncident(aTopId);
-  if Assigned(lvIncidents.Selected) then
-    memDetails.Text := FormatMachineOverviewIncidentDetails(
-      fIncidents[lvIncidents.Selected.Index])
-  else
-    memDetails.Clear;
+  UpdateHistoryAccessibleRows(lvIncidents, rsIncidentListName, fIncidentNamedCount);
+  BeginEvidenceRefresh;
 end;
 
 procedure TMachineOverviewHistoryFrm.RestoreTopIncident(
