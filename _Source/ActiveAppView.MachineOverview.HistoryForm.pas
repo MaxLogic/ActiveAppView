@@ -105,6 +105,9 @@ function ShouldOpenMachineOverviewIncidentHistory(const aRowId: string): Boolean
 procedure ShowMachineOverviewIncidentHistory(const aOwner: TComponent;
   const aDatabaseFileName: string);
 
+var
+  MachineOverviewEvidenceClipboardWriter: TProc<string>; //PALOFF Our incident-view tests replace this production adapter before form actions.
+
 implementation
 
 uses
@@ -640,7 +643,7 @@ end;
 procedure TMachineOverviewHistoryFrm.btnCopyEvidenceClick(aSender: TObject);
 begin
   try
-    Clipboard.AsText := memDetails.Text;
+    MachineOverviewEvidenceClipboardWriter(memDetails.Text);
     labStatus.Caption := rsEvidenceCopied;
   except
     on lException: Exception do
@@ -1042,5 +1045,17 @@ begin
   ApplyQueryResult;
   aMessage.Result := 0;
 end;
+
+procedure WriteEvidenceToSystemClipboard(const aText: string);
+begin
+  Clipboard.AsText := aText;
+end;
+
+initialization
+  MachineOverviewEvidenceClipboardWriter :=
+    procedure(aText: string)
+    begin
+      WriteEvidenceToSystemClipboard(aText);
+    end;
 
 end.

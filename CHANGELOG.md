@@ -26,6 +26,7 @@ All notable changes to this project are documented in this file.
 - `Scripts\Copy-MarkdownAsRichText.ps1` now always converts clipboard markdown to HTML (CF_HTML with the original markdown as text fallback), without a format menu. The library still supports RTF and plain text (ACV-075).
 
 ### Fixed
+- Incident-view self-tests use an in-memory clipboard adapter for exact-copy and failure checks, leaving the system clipboard untouched (ACV-077).
 - Machine Overview history now deletes its verified migration backup after a successful upgrade and cleanup, including after a resumed migration. Failed migrations retain the backup; deletion failures are reported without stopping recording (ACV-074).
 - Incident evidence rows now include the process start date when it differs from the incident's local day. Shorter Average/Peak cells and state rows fit at 100% scaling while retaining the machine-share units and full details (ACV-073).
 - Machine Overview history now applies one storage budget to samples, incident evidence, and headlines, retaining incidents for up to 365 days and 50,000 entries. Older databases are backed up before migration; obsolete context is removed and startup can reclaim its disk space (ACV-067).

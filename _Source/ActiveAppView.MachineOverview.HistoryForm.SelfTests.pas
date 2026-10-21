@@ -10,7 +10,7 @@ implementation
 uses
   System.DateUtils, System.Diagnostics, System.IOUtils, System.StrUtils, System.SysUtils, System.Types, System.Win.ComObj,
   Winapi.ActiveX, Winapi.Messages, Winapi.oleacc, Winapi.Windows,
-  Vcl.Clipbrd, Vcl.ComCtrls, Vcl.Controls, Vcl.Forms, Vcl.StdCtrls,
+  Vcl.ComCtrls, Vcl.Controls, Vcl.Forms, Vcl.StdCtrls,
   AutoFree, FireDAC.Comp.Client, FireDAC.Phys.SQLite,
   FireDAC.Phys.SQLiteDef, FireDAC.Phys.SQLiteWrapper.Stat,
   ActiveAppView.MachineOverview.Evidence, ActiveAppView.MachineOverview.History,
@@ -977,71 +977,55 @@ begin
   end;
 end;
 
-procedure CheckEvidenceClipboard(const aForm: TMachineOverviewHistoryFrm);
-type
-  TClipboardCopy = record
-    Format: Cardinal;
-    Handle: THandle;
-  end;
-var
-  lCopies: TArray<TClipboardCopy>;
-  lFormat: Cardinal;
-  lHandle: THandle;
-  lChanged: Boolean;
-  i: Integer;
+procedure RejectUnexpectedEvidenceCopy(const aText: string);
 begin
-  lChanged := False;
-  Clipboard.Open;
-  try
-    lFormat := EnumClipboardFormats(0);
-    while lFormat <> 0 do
+  raise Exception.Create('Unexpected copy outside the clipboard fake assertion');
+end;
+
+procedure FailEvidenceCopy(const aText: string);
+begin
+  raise Exception.Create('in-memory clipboard failure');
+end;
+
+procedure CheckEvidenceClipboard(const aForm: TMachineOverviewHistoryFrm);
+var
+  lCopiedText: string;
+  lCalls: Integer;
+begin
+  lCalls := 0;
+  MachineOverviewEvidenceClipboardWriter :=
+    procedure(aText: string)
     begin
-      if lFormat > High(Word) then
-        raise Exception.Create('Clipboard format is outside the native OLE range; clipboard not changed');
-      lHandle := OleDuplicateData(Clipboard.GetAsHandle(lFormat), Word(lFormat), 0);
-      if lHandle = 0 then
-        raise Exception.Create('Cannot preserve an existing clipboard format; clipboard not changed');
-      SetLength(lCopies, Length(lCopies) + 1);
-      lCopies[High(lCopies)].Format := lFormat;
-      lCopies[High(lCopies)].Handle := lHandle;
-      lFormat := EnumClipboardFormats(lFormat);
+      Inc(lCalls);
+      lCopiedText := aText;
     end;
-    lChanged := True;
+  try
     if GetEnvironmentVariable('ACV_S5_UI_STATE') = 'keyboard' then
       HoldEvidenceFormForUiProof(aForm, 'keyboard')
     else
       aForm.btnCopyEvidence.Click;
-    if (not ContainsText(Clipboard.AsText, 'Session started ')) or
-      ContainsText(Clipboard.AsText, 'Session started unknown') then
+    if (lCalls <> 1) or (lCopiedText <> aForm.memDetails.Text) then
+      raise Exception.Create('Copy evidence must call the fake once with the exact full memo');
+    if (not ContainsText(lCopiedText, 'Session started ')) or
+      ContainsText(lCopiedText, 'Session started unknown') then
       raise Exception.Create('Copy evidence omitted the persisted session start');
-    if Clipboard.AsText <> aForm.memDetails.Text then
-      raise Exception.Create('Copy evidence does not match the full memo text');
     if aForm.StatusText <> 'Evidence copied to the clipboard.' then
       raise Exception.Create('Copy evidence does not report success');
-  finally
-    if lChanged then
-    begin
-      Clipboard.Clear;
-      for i := 0 to High(lCopies) do
+    MachineOverviewEvidenceClipboardWriter :=
+      procedure(aText: string)
       begin
-        Clipboard.SetAsHandle(lCopies[i].Format, lCopies[i].Handle);
-        lCopies[i].Handle := 0;
+        FailEvidenceCopy(aText);
       end;
-    end;
-    for i := 0 to High(lCopies) do
-      if lCopies[i].Handle <> 0 then
-        case lCopies[i].Format of
-          CF_BITMAP, CF_PALETTE: DeleteObject(lCopies[i].Handle);
-          CF_ENHMETAFILE: DeleteEnhMetaFile(lCopies[i].Handle);
-        else
-          GlobalFree(lCopies[i].Handle);
-        end;
-    Clipboard.Close;
+    aForm.btnCopyEvidence.Click;
+    if aForm.StatusText <> 'Could not copy evidence to the clipboard: in-memory clipboard failure' then
+      raise Exception.Create('Copy evidence must surface the adapter failure');
+  finally
+    MachineOverviewEvidenceClipboardWriter :=
+      procedure(aText: string)
+      begin
+        RejectUnexpectedEvidenceCopy(aText);
+      end;
   end;
-  if GetEnvironmentVariable('ACV_S5_UI_STATE') = 'keyboard' then
-    TFile.WriteAllText(TPath.Combine(GetEnvironmentVariable('ACV_S5_UI_PROOF'), 'clipboard-proof.json'),
-      Format('{"copyMatchesMemo":true,"statusMatches":true,"restored":true,"nativeFormats":%d}',
-        [Length(lCopies)]), TEncoding.UTF8);
 end;
 
 function RunIncidentEvidenceExportSelfTest: Integer;
@@ -1212,25 +1196,39 @@ end;
 
 function RunMachineOverviewIncidentHistorySelfTests(
   const aArg: string): Integer;
+var
+  lProductionWriter: TProc<string>;
 begin
   Result := -1;
   if not SameText(aArg, cMachineOverviewIncidentHistorySelfTestArg) then
     Exit;
-  try
-    Result := RunIncidentEvidenceViewSelfTest;
-    Result := Result + RunIncidentLegacyEvidenceViewSelfTest;
-    Result := Result + RunIncidentHealthViewSelfTest;
-    Result := Result + RunIncidentEvidenceExportSelfTest;
-    Result := Result + RunIncidentHistoryFormSelfTest;
-    Result := Result + RunIncidentWorkAreaSelfTest;
-    Writeln(Format('Incident view: 6 tests, %d failed', [Result]));
-  except
-    on lException: Exception do
+  lProductionWriter := MachineOverviewEvidenceClipboardWriter;
+  if not Assigned(lProductionWriter) then
+    raise Exception.Create('The production clipboard adapter must be configured');
+  MachineOverviewEvidenceClipboardWriter :=
+    procedure(aText: string)
     begin
-      Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName,
-        lException.Message]));
-      Result := 1;
+      RejectUnexpectedEvidenceCopy(aText);
     end;
+  try
+    try
+      Result := RunIncidentEvidenceViewSelfTest;
+      Result := Result + RunIncidentLegacyEvidenceViewSelfTest;
+      Result := Result + RunIncidentHealthViewSelfTest;
+      Result := Result + RunIncidentEvidenceExportSelfTest;
+      Result := Result + RunIncidentHistoryFormSelfTest;
+      Result := Result + RunIncidentWorkAreaSelfTest;
+      Writeln(Format('Incident view: 6 tests, %d failed', [Result]));
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName,
+          lException.Message]));
+        Result := 1;
+      end;
+    end;
+  finally
+    MachineOverviewEvidenceClipboardWriter := lProductionWriter;
   end;
 end;
 
