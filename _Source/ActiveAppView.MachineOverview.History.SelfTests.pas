@@ -722,6 +722,24 @@ begin
     lConfig.Rollup1mRetentionDays := 365;
     lConfig.MaxDatabaseSizeBytes := 32 * 1024 * 1024;
     lConfig.BusyTimeoutMs := 100;
+    lConfig.MigrationObserver :=
+      procedure(aStage: string)
+      begin
+        if aStage <> 'BackupVerified' then
+          Exit;
+        lBackupFileName := TDirectory.GetFiles(lDirectory,
+          ExtractFileName(lDatabaseFileName) + '.pre-migration-*.bak')[0];
+        lConnection.Params.Values['Database'] := lBackupFileName;
+        lConnection.Params.Values['OpenMode'] := 'ReadOnly';
+        lConnection.Connected := True;
+        try
+          if QueryHistoryInt64(lConnection,
+            'SELECT COUNT(*) FROM legacy_sentinel WHERE value=''preserve-me''') <> 1 then
+            raise Exception.Create('Migration backup did not preserve the prior database');
+        finally
+          lConnection.Connected := False;
+        end;
+      end;
     lService := TMachineOverviewHistoryService.Create(nil, lConfig);
     lService.Start;
     if (not lService.WaitUntilInitialized(5000)) or
@@ -731,31 +749,19 @@ begin
       Writeln('SELFTEST FAILED: schema-v0 history migration did not complete');
       Exit;
     end;
-    lBackupFileName := TDirectory.GetFiles(lDirectory,
-      ExtractFileName(lDatabaseFileName) + '.pre-migration-*.bak')[0];
-    if not TFile.Exists(lBackupFileName) then
+    if TFile.Exists(lBackupFileName) then
     begin
-      Writeln('SELFTEST FAILED: schema-v0 history migration made no prior-file backup');
+      Writeln('SELFTEST FAILED: schema-v0 successful migration retained its backup');
       Exit;
     end;
-    lConnection.Connected := False;
-    lConnection.Params.Values['Database'] := lBackupFileName;
-    lConnection.Params.Values['OpenMode'] := 'ReadWrite';
-    lConnection.Connected := True;
-    if QueryHistoryInt64(lConnection,
-      'SELECT COUNT(*) FROM legacy_sentinel WHERE value=''preserve-me''') <> 1 then
-    begin
-      Writeln('SELFTEST FAILED: migration backup does not preserve the prior database');
-      Exit;
-    end;
-    lConnection.Connected := False;
     lConnection.Params.Values['Database'] := lDatabaseFileName;
+    lConnection.Params.Values['OpenMode'] := 'ReadWrite';
     lConnection.Connected := True;
     if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 3) or
       (QueryHistoryInt64(lConnection,
         'SELECT COUNT(*) FROM legacy_sentinel WHERE value=''preserve-me''') <> 1) then
     begin
-      Writeln('SELFTEST FAILED: migration lost legacy data or did not set schema v2');
+      Writeln('SELFTEST FAILED: migration lost legacy data or did not set schema v3');
       Exit;
     end;
     Result := 0;
@@ -949,27 +955,37 @@ begin
     lConnection.Connected := False;
     lConfig := CreateHistoryReliabilityConfig(lDatabaseFileName, 16,
       32 * 1024 * 1024);
+    lConfig.MigrationObserver :=
+      procedure(aStage: string)
+      begin
+        if aStage <> 'BackupVerified' then
+          Exit;
+        lBackupFileName := TDirectory.GetFiles(lDirectory,
+          ExtractFileName(lDatabaseFileName) + '.pre-migration-*.bak')[0];
+        lConnection.Params.Values['Database'] := lBackupFileName;
+        lConnection.Params.Values['OpenMode'] := 'ReadOnly';
+        lConnection.Connected := True;
+        try
+          if QueryHistoryInt64(lConnection,
+            'SELECT COUNT(*) FROM incident WHERE incident_key=''legacy-v1''') <> 1 then
+            raise Exception.Create('Schema-v1 migration backup lost its incident');
+        finally
+          lConnection.Connected := False;
+        end;
+      end;
     lService := TMachineOverviewHistoryService.Create(nil, lConfig);
     lService.Start;
     if (not lService.WaitUntilInitialized(5000)) or
       (not lService.Diagnostics.Available) or
       (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
       Exit;
-    lBackupFileName := TDirectory.GetFiles(lDirectory,
-      ExtractFileName(lDatabaseFileName) + '.pre-migration-*.bak')[0];
-    if not TFile.Exists(lBackupFileName) then
+    if TFile.Exists(lBackupFileName) then
     begin
-      Writeln('SELFTEST FAILED: schema-v1 migration made no prior-file backup');
+      Writeln('SELFTEST FAILED: schema-v1 successful migration retained its backup');
       Exit;
     end;
-    lConnection.Params.Values['Database'] := lBackupFileName;
-    lConnection.Params.Values['OpenMode'] := 'ReadWrite';
-    lConnection.Connected := True;
-    if QueryHistoryInt64(lConnection,
-      'SELECT COUNT(*) FROM incident WHERE incident_key=''legacy-v1''') <> 1 then
-      Exit;
-    lConnection.Connected := False;
     lConnection.Params.Values['Database'] := lDatabaseFileName;
+    lConnection.Params.Values['OpenMode'] := 'ReadWrite';
     lConnection.Connected := True;
     if (QueryHistoryInt64(lConnection, 'PRAGMA user_version') <> 3) or
       (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM ' +
@@ -1450,6 +1466,10 @@ begin
       (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE evidence_state=5') <> 200) or
       (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE evidence_state=0') <> 250) then
       raise Exception.Create('Migration chunk was not durable and bounded at 200 rows');
+    if (Length(TDirectory.GetFiles(ExtractFilePath(lFileName),
+      ExtractFileName(lFileName) + '.pre-migration-*.bak')) <> 1) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_status WHERE migration_backup_path<>''''') <> 1) then
+      raise Exception.Create('Interrupted migration must retain its recorded backup');
     lConnection.Connected := False;
     lConfig.MigrationObserver := nil;
     lService := TMachineOverviewHistoryService.Create(nil, lConfig);
@@ -1461,17 +1481,187 @@ begin
     if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident WHERE evidence_state=5 ' +
       'AND summary=''headline-''||id AND context_text='''' AND trace_status=2') <> 450) or
       (Length(TDirectory.GetFiles(ExtractFilePath(lFileName),
-        ExtractFileName(lFileName) + '.pre-migration-*.bak')) <> 1) or
-      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_status WHERE migration_backup_path<>''''') <> 1) then
-      raise Exception.Create('Migration resume lost headlines/backup path or made a second backup');
+        ExtractFileName(lFileName) + '.pre-migration-*.bak')) <> 0) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_status WHERE migration_backup_path<>''''') <> 0) then
+      raise Exception.Create('Successful migration resume must delete its backup and clear the recorded path');
     lConnection.Connected := False;
-    Writeln('PASS RunHistoryMigrationResumeSelfTest: verified source unchanged, 200+250 rows, one backup');
+    Writeln('PASS RunHistoryMigrationResumeSelfTest: backup retained after interruption, deleted after 200+250 rows');
     Result := 0;
   finally
     if Assigned(lConnection) then
       lConnection.Connected := False;
     lService.Free;
     DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryBackupLifetimeSelfTest(const aFailBeforeSchema, aLockDelete: Boolean): Integer;
+var
+  lConfig: TMachineOverviewHistoryConfig;
+  lFileName, lBackup, lSentinel, lError: string;
+  lHealth: TMachineOverviewHistoryHealth;
+  lService: TMachineOverviewHistoryService;
+  lLock: THandle;
+  lVerified: Boolean;
+begin
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('backup-lifetime');
+  lSentinel := lFileName + '.pre-migration-v2-20000101000000.bak';
+  lService := nil;
+  lLock := INVALID_HANDLE_VALUE;
+  lVerified := False;
+  lError := '';
+  try
+    CreateHistoryV2Fixture(lFileName, 3);
+    TFile.WriteAllText(lSentinel, 'unowned backup must survive');
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 16, 32 * 1024 * 1024);
+    lConfig.MigrationObserver :=
+      procedure(aStage: string)
+      var
+        fn: string;
+      begin
+        if aStage = 'BeforeBackupDeletion' then
+        begin
+          // Deterministic sidecars at the filesystem boundary: backup verification
+          // usually checkpoints its WAL away on these small fixtures.
+          TFile.WriteAllText(lBackup + '-wal', 'owned backup WAL test seam');
+          TFile.WriteAllText(lBackup + '-shm', 'owned backup SHM test seam');
+          Exit;
+        end;
+        if aStage <> 'BackupVerified' then
+          Exit;
+        AssertHistoryBackupSourceUnchanged(lFileName, 3);
+        for fn in TDirectory.GetFiles(ExtractFilePath(lFileName),
+          ExtractFileName(lFileName) + '.pre-migration-*.bak') do
+          if fn <> lSentinel then
+            lBackup := fn;
+        if lBackup.IsEmpty or not TFile.Exists(lBackup) then
+          raise Exception.Create('Verified backup must exist during migration');
+        lVerified := True;
+        if aFailBeforeSchema then
+          raise Exception.Create('injected failure before schema upgrade');
+        if aLockDelete then
+        begin
+          lLock := CreateFile(PChar(lBackup), GENERIC_READ, FILE_SHARE_READ or FILE_SHARE_WRITE,
+            nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+          if lLock = INVALID_HANDLE_VALUE then
+            RaiseLastOSError;
+        end;
+      end;
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if not lService.WaitUntilInitialized(10000) then
+      raise Exception.Create('Backup lifetime initialization timed out');
+    if not lVerified then
+      raise Exception.Create('Migration never verified its backup');
+    if aFailBeforeSchema then
+    begin
+      if lService.Diagnostics.Available or not TFile.Exists(lBackup) or
+        not ContainsText(lService.Diagnostics.LastError, 'injected failure before schema') then
+        raise Exception.Create('Failed migration must retain its verified backup');
+      AssertHistoryBackupSourceUnchanged(lFileName, 3);
+    end else begin
+      if not lService.Diagnostics.Available then
+        raise Exception.Create('Backup cleanup must not disable history: ' + lService.Diagnostics.LastError);
+      if (not TryLoadMachineOverviewHistoryHealth(lFileName, lHealth, lError)) or not lHealth.Available then
+        raise Exception.Create('Backup lifetime health unavailable: ' + lError);
+      if aLockDelete then
+      begin
+        if not TFile.Exists(lBackup) or (lHealth.BackupFileName <> lBackup) or
+          not ContainsText(lHealth.LastError, 'backup deletion failed') or
+          not ContainsText(lService.Diagnostics.LastError, 'backup deletion failed') then
+          raise Exception.Create('Locked backup deletion failure must reach health and diagnostics');
+      end else if TFile.Exists(lBackup) or TFile.Exists(lBackup + '-wal') or
+        TFile.Exists(lBackup + '-shm') or not lHealth.BackupFileName.IsEmpty then
+        raise Exception.Create('Successful migration must delete its backup and clear the recorded path');
+    end;
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Backup lifetime writer did not stop');
+    FreeAndNil(lService);
+    if lLock <> INVALID_HANDLE_VALUE then
+    begin
+      CloseHandle(lLock);
+      lLock := INVALID_HANDLE_VALUE;
+    end;
+    if aFailBeforeSchema or aLockDelete then
+    begin
+      lConfig.MigrationObserver := nil;
+      lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+      lService.Start;
+      if (not lService.WaitUntilInitialized(10000)) or not lService.Diagnostics.Available or
+        (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+        raise Exception.Create('Backup lifetime retry failed: ' + lService.Diagnostics.LastError);
+      if (not TryLoadMachineOverviewHistoryHealth(lFileName, lHealth, lError)) or
+        TFile.Exists(lBackup) or not lHealth.BackupFileName.IsEmpty or
+        ContainsText(lHealth.LastError, 'backup deletion failed') then
+        raise Exception.Create('Later successful completion must delete the original recorded backup');
+    end;
+    if TFile.ReadAllText(lSentinel) <> 'unowned backup must survive' then
+      raise Exception.Create('Migration deleted an unowned backup');
+    Writeln(Format('PASS RunHistoryBackupLifetimeSelfTest: failed=%s locked=%s; verified during migration, owned cleanup only',
+      [BoolToStr(aFailBeforeSchema, True), BoolToStr(aLockDelete, True)]));
+    Result := 0;
+  finally
+    if lLock <> INVALID_HANDLE_VALUE then
+      CloseHandle(lLock);
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
+function RunHistoryBackupPathSafetySelfTest: Integer;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lService: TMachineOverviewHistoryService;
+  lFileName, lOtherBackup, lInvalidName, fn: string;
+  lPaths: TArray<string>;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('backup-path-safety');
+  lOtherBackup := lFileName + '.other-db.pre-migration-v2-20000101000000.bak';
+  lInvalidName := lFileName + '.pre-migration-v2-not-a-timestamp.bak';
+  lService := nil;
+  lConnection := nil;
+  try
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 16, 32 * 1024 * 1024);
+    lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(5000)) or not lService.Diagnostics.Available or
+      (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) then
+      raise Exception.Create('Backup path safety fixture failed');
+    FreeAndNil(lService);
+    TFile.WriteAllText(lOtherBackup, 'other database backup');
+    TFile.WriteAllText(lInvalidName, 'unowned malformed backup');
+    GC(lConnection, TFDConnection.Create(nil), g);
+    lPaths := [lFileName, lOtherBackup, lInvalidName];
+    for fn in lPaths do
+    begin
+      ConfigureHistoryTestConnection(lFileName, lConnection);
+      lConnection.ExecSQL('UPDATE history_status SET migration_backup_path=? WHERE id=1', [fn]);
+      lConnection.Connected := False;
+      lService := TMachineOverviewHistoryService.Create(nil, lConfig);
+      lService.Start;
+      if (not lService.WaitUntilInitialized(5000)) or not lService.Diagnostics.Available or
+        not ContainsText(lService.Diagnostics.LastError, 'does not match this database') or
+        (lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped) or not TFile.Exists(fn) then
+        raise Exception.Create('Unsafe recorded backup path was deleted or not diagnosed: ' + fn);
+      FreeAndNil(lService);
+    end;
+    if (TFile.ReadAllText(lOtherBackup) <> 'other database backup') or
+      (TFile.ReadAllText(lInvalidName) <> 'unowned malformed backup') then
+      raise Exception.Create('Backup path safety sentinel changed');
+    Writeln('PASS RunHistoryBackupPathSafetySelfTest: main DB, other DB backup, malformed name refused nonfatally');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    DeleteHistoryReliabilityFiles(lFileName);
+    if TFile.Exists(lOtherBackup) then
+      TFile.Delete(lOtherBackup);
   end;
 end;
 
@@ -1640,6 +1830,29 @@ begin
     lConnection.Connected := False;
     lConfig.MaxDatabaseSizeBytes := 4 * 1024 * 1024;
     lConfig.CompactionMinimumFreeBytes := 1024 * 1024;
+    lConfig.MigrationObserver :=
+      procedure(aStage: string)
+      begin
+        if aStage <> 'BackupVerified' then
+          Exit;
+        lBackupFiles := TDirectory.GetFiles(lDirectory,
+          ExtractFileName(lDatabaseFileName) + '.pre-migration-v2-*.bak');
+        if Length(lBackupFiles) <> 1 then
+          raise Exception.Create('Heavy legacy verified backup missing during migration');
+        lConnection.Params.Values['Database'] := lBackupFiles[0];
+        lConnection.Params.Values['OpenMode'] := 'ReadOnly';
+        lConnection.Connected := True;
+        try
+          if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident') <> 40) or
+            (QueryHistoryInt64(lConnection,
+              'SELECT COUNT(*) FROM incident WHERE length(context_text)>100000') <> 40) then
+            raise Exception.Create('Heavy legacy backup did not preserve context');
+        finally
+          lConnection.Connected := False;
+          lConnection.Params.Values['Database'] := lDatabaseFileName;
+          lConnection.Params.Values['OpenMode'] := 'ReadWrite';
+        end;
+      end;
     lService := TMachineOverviewHistoryService.Create(nil, lConfig);
     lService.Start;
     if (not lService.WaitUntilInitialized(10000)) or
@@ -1677,16 +1890,8 @@ begin
     lConnection.Connected := False;
     lBackupFiles := TDirectory.GetFiles(lDirectory,
       ExtractFileName(lDatabaseFileName) + '.pre-migration-v2-*.bak');
-    if Length(lBackupFiles) <> 1 then
-      raise Exception.Create('heavy legacy verified backup missing');
-    lConnection.Params.Values['Database'] := lBackupFiles[0];
-    lConnection.Params.Values['OpenMode'] := 'ReadOnly';
-    lConnection.Connected := True;
-    if (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM incident') <> 40) or
-      (QueryHistoryInt64(lConnection,
-        'SELECT COUNT(*) FROM incident WHERE length(context_text)>100000') <> 40) then
-      raise Exception.Create('heavy legacy backup did not preserve context');
-    lConnection.Connected := False;
+    if Length(lBackupFiles) <> 0 then
+      raise Exception.Create('Heavy legacy successful migration retained its backup');
     if TFile.GetSize(lDatabaseFileName) >= lFileBytes then
       raise Exception.Create('heavy legacy startup compaction did not shrink file');
     lService := TMachineOverviewHistoryService.Create(nil, lConfig);
@@ -2865,6 +3070,15 @@ begin
   if not SameText(aArg, cMachineOverviewHistorySelfTestArg) then
     Exit;
   try
+    Result := RunHistoryBackupLifetimeSelfTest(False, False);
+    if Result = 0 then
+      Result := RunHistoryBackupLifetimeSelfTest(True, False);
+    if Result = 0 then
+      Result := RunHistoryBackupLifetimeSelfTest(False, True);
+    if Result = 0 then
+      Result := RunHistoryBackupPathSafetySelfTest;
+    if Result <> 0 then
+      Exit;
     Result := RunHistorySessionHealthSelfTest;
     if Result <> 0 then
       Exit;

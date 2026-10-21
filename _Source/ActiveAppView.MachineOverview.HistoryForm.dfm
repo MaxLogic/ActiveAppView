@@ -143,19 +143,19 @@ object MachineOverviewHistoryFrm: TMachineOverviewHistoryFrm
       Columns = <
         item
           Caption = 'Phase / contributor'
-          Width = 195
-        end
-        item
-          Caption = 'Identity'
           Width = 165
         end
         item
-          Caption = 'Average (% of machine)'
-          Width = 145
+          Caption = 'Identity'
+          Width = 245
         end
         item
-          Caption = 'Peak (% of machine)'
-          Width = 140
+          Caption = 'Average'
+          Width = 125
+        end
+        item
+          Caption = 'Peak'
+          Width = 125
         end
         item
           Caption = 'Peak time'
@@ -163,7 +163,7 @@ object MachineOverviewHistoryFrm: TMachineOverviewHistoryFrm
         end
         item
           Caption = 'Measured'
-          Width = 123
+          Width = 108
         end>
       ColumnClick = False
       HideSelection = False

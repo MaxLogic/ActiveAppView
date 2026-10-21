@@ -1,4 +1,4 @@
-unit ActiveAppView.MachineOverview.History;
+﻿unit ActiveAppView.MachineOverview.History;
 
 interface
 
@@ -226,6 +226,10 @@ type
     procedure ObserveTestHook(const aStage: string);
     function FreeBytes(const aPath: string): UInt64;
     procedure BackupDatabase(const aVersion: Integer);
+    procedure EnsureHistoryStatus;
+    procedure ReadMigrationBackupPath;
+    function IsMigrationBackupPath(const aPath: string): Boolean;
+    procedure DeleteMigrationBackup;
     procedure CopyBackupFile(const aSource, aDestination: string);
     procedure RecoverLegacyIncidents;
     procedure RecoverCollectingEvidence;
@@ -538,6 +542,7 @@ begin
     CreateOrMigrateSchema;
     RecoverLegacyIncidents;
     CompactAtStartup;
+    DeleteMigrationBackup;
     fEvidenceBytes := Scalar('SELECT COALESCE(SUM(byte_count),0) FROM incident_evidence');
     GC(lQuery, TFDQuery.Create(nil), g);
     lQuery.Connection := fConnection;
@@ -831,8 +836,83 @@ begin
     raise;
   end;
   fBackupPath := lPath;
-  Observe('BackupVerified');
   fConnection.Connected := True;
+  // Persist ownership before any cancellable schema/cleanup work. A rolled-back
+  // schema transaction must not orphan the verified safety copy (ACV-074).
+  EnsureHistoryStatus;
+  fConnection.ExecSQL('UPDATE history_status SET migration_backup_path=? WHERE id=1', [fBackupPath]);
+  Observe('BackupVerified');
+end;
+
+procedure TMachineOverviewHistoryStore.ReadMigrationBackupPath;
+var
+  g: TGarbos;
+  lQuery: TFDQuery;
+begin
+  if Scalar('SELECT COUNT(*) FROM sqlite_master WHERE type=''table'' AND name=''history_status''') = 0 then
+    Exit;
+  g := Default(TGarbos);
+  GC(lQuery, TFDQuery.Create(nil), g);
+  lQuery.Connection := fConnection;
+  lQuery.Open('SELECT migration_backup_path FROM history_status WHERE id=1');
+  if not lQuery.Eof then
+    fBackupPath := lQuery.Fields[0].AsWideString;
+end;
+
+function TMachineOverviewHistoryStore.IsMigrationBackupPath(const aPath: string): Boolean;
+var
+  lPrefix, lSuffix: string;
+  i: Integer;
+begin
+  Result := False;
+  if aPath.IsEmpty then
+    Exit;
+  lPrefix := TPath.GetFullPath(fConfig.DatabaseFileName) + '.pre-migration-v';
+  lSuffix := TPath.GetFullPath(aPath);
+  if not StartsText(lPrefix, lSuffix) then
+    Exit;
+  Delete(lSuffix, 1, Length(lPrefix));
+  if (Length(lSuffix) <> 20) or not CharInSet(lSuffix[1], ['0', '1', '2']) or
+    (lSuffix[2] <> '-') or (Copy(lSuffix, 17, 4) <> '.bak') then
+    Exit;
+  for i := 3 to 16 do
+    if not CharInSet(lSuffix[i], ['0'..'9']) then
+      Exit;
+  Result := True;
+end;
+
+procedure TMachineOverviewHistoryStore.DeleteMigrationBackup;
+var
+  lPath, lSuffix: string;
+begin
+  if fBackupPath.IsEmpty then
+    Exit;
+  Observe('BeforeBackupDeletion');
+  try
+    if not IsMigrationBackupPath(fBackupPath) then
+      raise EInvalidOperation.Create('recorded path does not match this database migration backup name');
+    lPath := TPath.GetFullPath(fBackupPath);
+    // SQLite verification can create these sidecars next to our exact backup.
+    // Never enumerate matching files: other backups may belong to the user.
+    for lSuffix in ['-wal', '-shm', ''] do
+      if TFile.Exists(lPath + lSuffix) then
+        TFile.Delete(lPath + lSuffix);
+    fConnection.ExecSQL('UPDATE history_status SET migration_backup_path='''', last_error=? WHERE id=1',
+      [fStartupError]);
+    fBackupPath := '';
+  except
+    on lException: Exception do
+    begin
+      fStartupError := Trim(fStartupError + ' History backup deletion failed: ' +
+        fBackupPath + ': ' + lException.Message);
+      try
+        fConnection.ExecSQL('UPDATE history_status SET last_error=? WHERE id=1', [fStartupError]);
+      except
+        on lStatusError: Exception do
+          fStartupError := fStartupError + '; recording backup deletion status failed: ' + lStatusError.Message;
+      end;
+    end;
+  end;
 end;
 
 procedure TMachineOverviewHistoryStore.RecoverLegacyIncidents;
@@ -1021,8 +1101,18 @@ begin
     raise EInvalidOperation.CreateFmt(
       'Machine Overview history schema %d is newer than supported schema %d',
       [lVersion, cMachineOverviewHistorySchemaVersion]);
+  ReadMigrationBackupPath;
   if fDatabaseExisted and (lVersion < cMachineOverviewHistorySchemaVersion) then
-    BackupDatabase(lVersion)
+  begin
+    if IsMigrationBackupPath(fBackupPath) and TFile.Exists(fBackupPath) then
+    begin
+      fConnection.Connected := False;
+      fConnection.Params.Values['OpenMode'] := 'ReadWrite';
+      fConnection.Connected := True;
+      Observe('BackupVerified');
+    end else
+      BackupDatabase(lVersion);
+  end
   else if fDatabaseExisted then
   begin
     fConnection.Connected := False;
@@ -1118,21 +1208,7 @@ begin
       'evidence_json TEXT NOT NULL)');
     fConnection.ExecSQL('CREATE INDEX IF NOT EXISTS idx_incident_evidence_started ' +
       'ON incident_evidence(started_utc_ms, byte_count)');
-    fConnection.ExecSQL('CREATE TABLE IF NOT EXISTS history_status (' +
-      'id INTEGER PRIMARY KEY CHECK (id = 1), updated_utc_ms INTEGER NOT NULL, ' +
-      'maintenance_utc_ms INTEGER NOT NULL, commit_interval_ms INTEGER NOT NULL, ' +
-      'budget_bytes INTEGER NOT NULL, used_bytes INTEGER NOT NULL, file_bytes INTEGER NOT NULL, ' +
-      'wal_bytes INTEGER NOT NULL, evidence_bytes INTEGER NOT NULL, storage_state INTEGER NOT NULL, ' +
-      'storage_message TEXT NOT NULL, last_floor_breach_utc_ms INTEGER NOT NULL, ' +
-      'evidence_trimmed_total INTEGER NOT NULL, incidents_deleted_total INTEGER NOT NULL, ' +
-      'samples_deleted_total INTEGER NOT NULL, session_started_utc_ms INTEGER NOT NULL, ' +
-      'session_dropped_records INTEGER NOT NULL, process_interval_ms INTEGER NOT NULL, ' +
-      'system_interval_ms INTEGER NOT NULL, logical_processor_count INTEGER NOT NULL, ' +
-      'provider_status_text TEXT NOT NULL, last_error TEXT NOT NULL, ' +
-      'migration_backup_path TEXT NOT NULL, last_compaction_utc_ms INTEGER NOT NULL, ' +
-      'last_compaction_reclaimed_bytes INTEGER NOT NULL)');
-    fConnection.ExecSQL('INSERT OR IGNORE INTO history_status VALUES ' +
-      '(1,0,0,0,0,0,0,0,0,0,'''',0,0,0,0,0,0,0,0,0,'''','''',?,0,0)', [fBackupPath]);
+    EnsureHistoryStatus;
     fConnection.ExecSQL('DELETE FROM incident WHERE id NOT IN (' +
       'SELECT MAX(id) FROM incident GROUP BY incident_key)');
     fConnection.ExecSQL('CREATE UNIQUE INDEX IF NOT EXISTS ' +
@@ -1154,6 +1230,25 @@ begin
       fConnection.Rollback;
     raise;
   end;
+end;
+
+procedure TMachineOverviewHistoryStore.EnsureHistoryStatus;
+begin
+  fConnection.ExecSQL('CREATE TABLE IF NOT EXISTS history_status (' +
+    'id INTEGER PRIMARY KEY CHECK (id = 1), updated_utc_ms INTEGER NOT NULL, ' +
+    'maintenance_utc_ms INTEGER NOT NULL, commit_interval_ms INTEGER NOT NULL, ' +
+    'budget_bytes INTEGER NOT NULL, used_bytes INTEGER NOT NULL, file_bytes INTEGER NOT NULL, ' +
+    'wal_bytes INTEGER NOT NULL, evidence_bytes INTEGER NOT NULL, storage_state INTEGER NOT NULL, ' +
+    'storage_message TEXT NOT NULL, last_floor_breach_utc_ms INTEGER NOT NULL, ' +
+    'evidence_trimmed_total INTEGER NOT NULL, incidents_deleted_total INTEGER NOT NULL, ' +
+    'samples_deleted_total INTEGER NOT NULL, session_started_utc_ms INTEGER NOT NULL, ' +
+    'session_dropped_records INTEGER NOT NULL, process_interval_ms INTEGER NOT NULL, ' +
+    'system_interval_ms INTEGER NOT NULL, logical_processor_count INTEGER NOT NULL, ' +
+    'provider_status_text TEXT NOT NULL, last_error TEXT NOT NULL, ' +
+    'migration_backup_path TEXT NOT NULL, last_compaction_utc_ms INTEGER NOT NULL, ' +
+    'last_compaction_reclaimed_bytes INTEGER NOT NULL)');
+  fConnection.ExecSQL('INSERT OR IGNORE INTO history_status VALUES ' +
+    '(1,0,0,0,0,0,0,0,0,0,'''',0,0,0,0,0,0,0,0,0,'''','''',?,0,0)', [fBackupPath]);
 end;
 
 procedure TMachineOverviewHistoryStore.PrepareStatements;

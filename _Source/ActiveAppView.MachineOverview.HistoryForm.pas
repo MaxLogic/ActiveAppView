@@ -163,6 +163,10 @@ resourcestring
   rsStorageMigrationBlocked = 'Migration blocked';
   rsIncidentListName = 'Recorded incidents';
   rsEvidenceListName = 'Measured incident evidence';
+  rsEvidenceNotRecordedRow = 'Not recorded';
+  rsEvidenceTrimmedRow = 'Removed by budget';
+  rsEvidencePartialRow = 'Incomplete';
+  rsEvidenceUnavailableRow = 'Evidence unavailable';
 
 type
   // As in our overview adapter, use the native HWND ABI on Win64. The Delphi
@@ -743,9 +747,10 @@ begin
   begin
     lFailureText := Format(rsEvidenceLoadFailed, [lError]);
     lvEvidence.Items.Clear;
-    lvEvidence.Items.Add.Caption := lFailureText;
+    lvEvidence.Items.Add.Caption := rsEvidenceUnavailableRow;
+    fEvidenceRowNames := [lFailureText];
     SetEvidenceCaption(lFailureText);
-    UpdateHistoryAccessibleRows(lvEvidence, labEvidence.Caption, fEvidenceNamedCount);
+    UpdateHistoryAccessibleRows(lvEvidence, labEvidence.Caption, fEvidenceNamedCount, fEvidenceRowNames);
     RenderDetails(lIndex, lFailureText);
     btnCopyEvidence.Enabled := True;
     Exit;
@@ -791,7 +796,19 @@ begin
       fEvidenceRowNames[High(fEvidenceRowNames)] := lRow.AccessibleText;
     end;
     if lvEvidence.Items.Count = 0 then
-      lvEvidence.Items.Add.Caption := MachineOverviewEvidenceStateText(fIncidents[lIndex].Evidence.State);
+    begin
+      lCaption := MachineOverviewEvidenceStateText(fIncidents[lIndex].Evidence.State);
+      fEvidenceRowNames := [lCaption];
+      case fIncidents[lIndex].Evidence.State of
+        TMachineOverviewEvidenceState.Legacy, TMachineOverviewEvidenceState.NotRecorded:
+          lCaption := rsEvidenceNotRecordedRow;
+        TMachineOverviewEvidenceState.Trimmed: lCaption := rsEvidenceTrimmedRow;
+        TMachineOverviewEvidenceState.Partial: lCaption := rsEvidencePartialRow;
+        TMachineOverviewEvidenceState.Collecting, TMachineOverviewEvidenceState.Complete:
+          lCaption := MachineOverviewEvidenceStateText(fIncidents[lIndex].Evidence.State);
+      end;
+      lvEvidence.Items.Add.Caption := lCaption;
+    end;
   finally
     lvEvidence.Items.EndUpdate;
   end;

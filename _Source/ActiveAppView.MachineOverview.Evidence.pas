@@ -138,7 +138,7 @@ resourcestring
   rsEvidenceCollecting = 'collecting';
   rsEvidencePartial = 'incomplete (ActiveAppView stopped before the after-window ended)';
   rsEvidenceTrimmed = 'removed by the storage budget';
-  rsEvidenceLegacy = 'not recorded (incident predates measured evidence; see pre-migration backup)';
+  rsEvidenceLegacy = 'not recorded (incident predates measured evidence)';
   rsEvidenceUnavailable = 'Unavailable';
   rsEvidenceHeading = 'Evidence: %s';
   rsEvidenceMeasurement = 'Measurement: CPU %% is the share of the whole machine (100%% = %d logical processors; ' +
@@ -293,6 +293,7 @@ var
   lRow: TMachineOverviewEvidenceRow;
   i: Integer;
   lIdentity: string;
+  lProcessStartUtc, lIncidentStartUtc: TDateTime;
 begin
   g := Default(TGarbos);
   GC(lRows, TList<TMachineOverviewEvidenceRow>.Create, g);
@@ -321,12 +322,28 @@ begin
             EvidenceRowTime(EncodeDate(1601, 1, 1) + lProcess.CreationTime100ns / 864000000000.0, True, aUtcToLocal),
             EvidenceRowTime(lProcess.LastSeenUtc, True, aUtcToLocal), lProcess.ImagePath])
         else
-          lRow.Identity := Format(rsEvidenceProcessListIdentity, [lProcess.ProcessId,
-            EvidenceRowTime(EncodeDate(1601, 1, 1) + lProcess.CreationTime100ns / 864000000000.0, False, aUtcToLocal)]);
-        lRow.Average := Format(rsEvidenceOneCore, [EvidenceNumber(lProcess.AverageCpuPercent),
-          EvidenceNumber(lProcess.AverageCpuPercent * aEvidence.LogicalProcessorCount / 100)]);
-        lRow.Peak := Format(rsEvidenceOneCore, [EvidenceNumber(lProcess.PeakCpuPercent),
-          EvidenceNumber(lProcess.PeakCpuPercent * aEvidence.LogicalProcessorCount / 100)]);
+        begin
+          lProcessStartUtc := EncodeDate(1601, 1, 1) + lProcess.CreationTime100ns / 864000000000.0;
+          lIncidentStartUtc := aEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].StartUtc;
+          if lIncidentStartUtc <= 0 then
+            lIncidentStartUtc := lPhase.StartUtc;
+          lIdentity := EvidenceRowTime(lProcessStartUtc, False, aUtcToLocal);
+          if Trunc(TTimeZone.Local.ToLocalTime(lProcessStartUtc)) <>
+            Trunc(TTimeZone.Local.ToLocalTime(lIncidentStartUtc)) then
+            lIdentity := FormatDateTime('yyyy-mm-dd', TTimeZone.Local.ToLocalTime(lProcessStartUtc),
+              TFormatSettings.Invariant) + ' ' + lIdentity;
+          lRow.Identity := Format(rsEvidenceProcessListIdentity, [lProcess.ProcessId, lIdentity]);
+        end;
+        if aExport then
+        begin
+          lRow.Average := Format(rsEvidenceOneCore, [EvidenceNumber(lProcess.AverageCpuPercent),
+            EvidenceNumber(lProcess.AverageCpuPercent * aEvidence.LogicalProcessorCount / 100)]);
+          lRow.Peak := Format(rsEvidenceOneCore, [EvidenceNumber(lProcess.PeakCpuPercent),
+            EvidenceNumber(lProcess.PeakCpuPercent * aEvidence.LogicalProcessorCount / 100)]);
+        end else begin
+          lRow.Average := Format(rsEvidenceShare, [EvidenceNumber(lProcess.AverageCpuPercent)]);
+          lRow.Peak := Format(rsEvidenceShare, [EvidenceNumber(lProcess.PeakCpuPercent)]);
+        end;
         lRow.PeakTime := EvidenceRowTime(lProcess.PeakAtUtc, aExport, aUtcToLocal);
         lRow.Measured := Format(rsEvidenceSampleCount, [lProcess.SampleCount, lPhase.ExpectedProcessSampleCount]);
         lRows.Add(lRow);

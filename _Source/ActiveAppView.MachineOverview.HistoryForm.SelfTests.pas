@@ -382,7 +382,7 @@ begin
   lProcess := Default(TMachineOverviewProcessContribution);
   lProcess.DisplayName := aKey + '.exe';
   lProcess.ProcessId := 1234;
-  lProcess.CreationTime100ns := UInt64(DateTimeToUnix(aUtc, True) + 11644473600) * UInt64(10000000);
+  lProcess.CreationTime100ns := UInt64(DateTimeToUnix(IncDay(aUtc, -1), True) + 11644473600) * UInt64(10000000);
   lProcess.AverageCpuPercent := 12.5;
   lProcess.PeakCpuPercent := 25;
   lProcess.PeakAtUtc := IncSecond(aUtc, 5);
@@ -564,6 +564,37 @@ begin
   Result := string(lName);
 end;
 
+procedure CheckEvidenceStartDates;
+var
+  lIncident: TMachineOverviewIncident;
+  lRow: TMachineOverviewEvidenceRow;
+  lUtc, lStartUtc: TDateTime;
+  i: Int64;
+  lFound: Integer;
+begin
+  lUtc := TTimeZone.Local.ToUniversalTime(EncodeDate(2026, 10, 20) + EncodeTime(0, 1, 0, 0));
+  lIncident := EvidenceFixture('local-midnight', lUtc).Incident;
+  for i := 0 to 1 do
+  begin
+    lStartUtc := IncMinute(lUtc, -2 * i);
+    lIncident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes[0].CreationTime100ns :=
+      UInt64(DateTimeToUnix(lStartUtc, True) + 11644473600) * UInt64(10000000);
+    lFound := 0;
+    for lRow in MachineOverviewEvidenceRows(lIncident.Evidence) do
+      if lRow.Kind = 'Process' then
+      begin
+        Inc(lFound);
+        if ((i = 0) and ContainsText(lRow.Identity, '2026-')) or
+          ((i = 1) and (not ContainsText(lRow.Identity, '2026-10-19 23:59:00') or
+            not ContainsText(lRow.AccessibleText, '2026-10-19 23:59:00'))) then
+          raise Exception.Create('Process start dates must follow the incident local day, including local midnight');
+      end;
+    if lFound <> 1 then
+      raise Exception.Create('Local-day process fixture did not yield one process row');
+  end;
+  Writeln('PASS CheckEvidenceStartDates: same local day time-only; previous local day dated in identity and accessible name');
+end;
+
 procedure CheckEvidencePresentation(const aForm: TMachineOverviewHistoryFrm);
 var
   i, lWidth, lOldHeight, lListHeight: Integer;
@@ -587,15 +618,25 @@ begin
   OleCheck(lAccessible.Get_accName(lChild, lName));
   if not string(lName).StartsWith('During, process latest.exe, PID 1234, started ') or
     not ContainsText(string(lName), ': average 12.5%') or not ContainsText(string(lName), 'peak 25%') or
-    not ContainsText(string(lName), '2 of 2 samples') or ContainsText(string(lName), '2026-') then
-    raise Exception.Create('Evidence process row needs concise labelled values');
+    not ContainsText(string(lName), '2 of 2 samples') or not ContainsText(string(lName), '2026-10-19') then
+    raise Exception.Create('Evidence process row must include its cross-day start date');
   lWidth := 0;
   for i := 0 to aForm.lvEvidence.Columns.Count - 1 do
     Inc(lWidth, aForm.lvEvidence.Columns[i].Width);
   if (lWidth > aForm.lvEvidence.ClientWidth) or
-    (aForm.lvEvidence.Columns[2].Caption <> 'Average (% of machine)') or
-    (aForm.lvEvidence.Columns[3].Caption <> 'Peak (% of machine)') then
+    (aForm.lvEvidence.Columns[2].Caption <> 'Average') or
+    (aForm.lvEvidence.Columns[3].Caption <> 'Peak') then
     raise Exception.Create('Evidence peak time and measured columns do not fit the default width');
+  aForm.Canvas.Font.Assign(aForm.lvEvidence.Font);
+  for i := 2 to 3 do
+    if (aForm.Canvas.TextWidth(aForm.lvEvidence.Columns[i].Caption) + 16 > aForm.lvEvidence.Columns[i].Width) or
+      (aForm.Canvas.TextWidth(aForm.lvEvidence.Items[5].SubItems[i - 1]) + 16 >
+        aForm.lvEvidence.Columns[i].Width) or
+      not ContainsText(aForm.lvEvidence.Items[5].SubItems[i - 1], 'of machine') then
+      raise Exception.CreateFmt('Evidence Average/Peak must fit at 100%%: column=%d width=%d text=%d value=%s',
+        [i, aForm.lvEvidence.Columns[i].Width,
+        aForm.Canvas.TextWidth(aForm.lvEvidence.Items[5].SubItems[i - 1]) + 16,
+        aForm.lvEvidence.Items[5].SubItems[i - 1]]);
   lOldHeight := aForm.Height;
   lListHeight := aForm.lvEvidence.Height;
   try
@@ -624,6 +665,7 @@ begin
   lForm := nil;
   lConnection := nil;
   try
+    CheckEvidenceStartDates;
     if not PersistIncidents(lDatabase, [EvidenceFixture('first', lNow),
       EvidenceFixture('latest', IncMinute(lNow, 1))]) then
       Exit;
@@ -653,8 +695,8 @@ begin
     lText := EvidenceListText(lForm);
     if not lLoading or not ContainsText(lText, 'latest.exe') or
       ContainsText(lText, 'first.exe') or not ContainsText(lText, 'PID 1234, started') or
-      not ContainsText(lText, '= 4 logical processors busy') or not ContainsText(lText, '2 processes') or
-      ContainsText(lText, 'C:\Tools\') or ContainsText(lText, '2026-10-20') or
+      not ContainsText(lText, '12.5% of machine') or not ContainsText(lText, '2 processes') or
+      ContainsText(lText, 'C:\Tools\') or not ContainsText(lText, '2026-10-19') or
       not ContainsText(lText, 'Gap') or (lForm.ActiveControl <> lForm.cbFilter) or
       (lForm.SelectedIncidentId <> 'latest') or
       (lForm.LastEvidenceQueryThreadId = GetCurrentThreadId) or
@@ -781,12 +823,19 @@ begin
       lForm.lvIncidents.Selected := lForm.lvIncidents.Items[lIndex];
       PumpEvidence(lForm);
       lText := lForm.memDetails.Text;
+      if (lKey = 'legacy') or (lKey = 'trimmed') then
+      begin
+        lForm.Canvas.Font.Assign(lForm.lvEvidence.Font);
+        if (lForm.lvEvidence.Items.Count <> 1) or
+          (lForm.Canvas.TextWidth(lForm.lvEvidence.Items[0].Caption) + 16 > lForm.lvEvidence.Columns[0].Width) then
+          raise Exception.Create('Single evidence state row must fit at 100%');
+      end;
       if ((lKey = 'legacy') and not ContainsText(lText, 'not recorded (incident predates measured evidence')) or
         ((lKey = 'trimmed') and not ContainsText(lText, 'removed by the storage budget')) or
         ((lKey = 'partial') and not ContainsText(lText, 'Ended: not recorded')) or
         ((lKey = 'failed') and (not ContainsText(lText, 'Evidence could not be read (recorded data unavailable:') or
-          (lForm.labEvidence.Caption <> 'Measured incident evidence: ' + lForm.lvEvidence.Items[0].Caption) or
-          not ContainsText(lText, lForm.lvEvidence.Items[0].Caption) or
+          not ContainsText(lForm.labEvidence.Caption, 'Evidence could not be read') or
+          (lForm.lvEvidence.Items[0].Caption <> 'Evidence unavailable') or
           ContainsText(lText, 'Measurement:') or ContainsText(lText, 'Coverage:') or ContainsText(lText, 'Gaps:'))) or
         ContainsText(lForm.labEvidence.Caption, 'legacy:') or ContainsText(lForm.labEvidence.Caption, 'trimmed:') or
         not ContainsText(lText, 'Incident: ' + lKey) or not ContainsText(lText, 'Threshold:') or
@@ -1034,7 +1083,7 @@ begin
       ContainsText(lRow.AccessibleText, 'peak Unavailable') or
       ((lRow.Average = 'Unavailable') and not ContainsText(lRow.AccessibleText, 'no measurement')) or
       ((lRow.Kind = 'Process') and not ContainsText(lRow.AccessibleText,
-        '12.5% of machine (= 4 logical processors busy)')) or
+        '12.5% of machine')) or
       ContainsText(lRow.Phase + ' ' + lRow.Kind + ' ' + lRow.Name, 'System System')) then
     begin
       Writeln('SELFTEST FAILED: S5 measured and unmeasured row wording: ' + lRow.AccessibleText);
