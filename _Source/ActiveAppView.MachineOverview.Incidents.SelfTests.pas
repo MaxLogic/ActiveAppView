@@ -1287,6 +1287,386 @@ begin
   Writeln('SELFTEST PASS: evidence JSON');
 end;
 
+procedure RunEvidenceResourceSelfTest;
+var
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lChange: TMachineOverviewIncidentChange;
+  lSample: TMachineOverviewProviderSample;
+  lPhase: TMachineOverviewEvidencePhase;
+  lUtc: TDateTime;
+  lCategory: TMachineOverviewIncidentCategory;
+  i: Integer;
+begin
+  lUtc := EncodeDate(2026, 10, 21);
+  for lCategory in [TMachineOverviewIncidentCategory.MemoryPressure,
+    TMachineOverviewIncidentCategory.DiskPressure, TMachineOverviewIncidentCategory.HighCpu,
+    TMachineOverviewIncidentCategory.UserMarked] do
+  begin
+    lRecorder := TMachineOverviewEvidenceRecorder.Create(TMachineOverviewEvidenceConfig.Defaults);
+    try
+      lChange := EvidenceChange(lUtc, 'resource');
+      lChange.Incident.Category := lCategory;
+      ApplyEvidence(lRecorder, lChange);
+      for i := 0 to 1 do
+      begin
+        lSample := EvidenceSample(EvidenceSecond(lUtc, 1 + i * 5), True);
+        AddEvidenceMeasurement(lSample, 'process_ram_process:1', (1 + i * 2) * 1073741824.0, '100:1', 'grow.exe');
+        if i = 0 then
+          AddEvidenceMeasurement(lSample, 'process_ram_process:2', 2147483648.0, '200:2', 'exited.exe');
+        AddEvidenceMeasurement(lSample, 'process_io_process:1', 209715200, '300:3', 'io.exe');
+        AddEvidenceMeasurement(lSample, 'process_io_measured_total_bytes_per_second', 209715200);
+        lRecorder.ObserveSample(lSample);
+        lSample := EvidenceSample(EvidenceSecond(lUtc, 1 + i * 5), False);
+        AddEvidenceMeasurement(lSample, 'physical_used_percent', 96);
+        AddEvidenceMeasurement(lSample, 'commit_percent', 92);
+        AddEvidenceMeasurement(lSample, 'paging_bytes_per_sec', 157286400);
+        lRecorder.ObserveSample(lSample);
+        lSample.State.ProviderId := 'disks';
+        lSample.Measurements := nil;
+        AddEvidenceMeasurement(lSample, 'disk_worst', 1, 'disk:1', 'Disk 1 C:');
+        AddEvidenceMeasurement(lSample, 'disk_latency_ms', 85 + i * 325, 'disk:1');
+        AddEvidenceMeasurement(lSample, 'disk_active_percent', 99, 'disk:1');
+        AddEvidenceMeasurement(lSample, 'disk_queue_length', 4, 'disk:1');
+        AddEvidenceMeasurement(lSample, 'disk_read_mb_per_sec', 150, 'disk:1');
+        AddEvidenceMeasurement(lSample, 'disk_write_mb_per_sec', 50, 'disk:1');
+        AddEvidenceMeasurement(lSample, 'disk_latency_ms', 999, 'disk:other');
+        lRecorder.ObserveSample(lSample);
+      end;
+      lChange.Kind := TMachineOverviewIncidentChangeKind.Updated;
+      // Category changes must not change the resources chosen on admission.
+      lChange.Incident.Category := TMachineOverviewIncidentCategory.ProviderHealth;
+      ApplyEvidence(lRecorder, lChange);
+      lPhase := lChange.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During];
+      if lCategory in [TMachineOverviewIncidentCategory.MemoryPressure, TMachineOverviewIncidentCategory.UserMarked] then
+      begin
+        EvidenceCheck(TMachineOverviewResourceKind.Ram in lChange.Incident.Evidence.Resources, 'RAM resource admission');
+        EvidenceCheck((Length(lPhase.RamProcesses) = 2) and (lPhase.RamProcesses[0].ProcessId = 100), 'RAM ordering');
+        EvidenceCheck((lPhase.RamProcesses[0].PeakValue = 3221225472.0) and
+          (lPhase.RamProcesses[0].AverageValue = 2147483648.0) and
+          (lPhase.RamProcesses[0].LastValue - lPhase.RamProcesses[0].FirstValue = 2147483648.0) and
+          (lPhase.RamProcesses[1].SampleCount = 1) and
+          (lPhase.RamProcesses[1].LastSeenUtc = EvidenceSecond(lUtc, 1)), 'RAM peak, growth and exited coverage');
+        EvidenceCheck((lPhase.PhysicalUsed.Average = 96) and (lPhase.Commit.Peak = 92) and
+          (lPhase.Paging.Average = 150), 'memory system statistics and binary MB/s');
+      end;
+      if lCategory in [TMachineOverviewIncidentCategory.DiskPressure, TMachineOverviewIncidentCategory.UserMarked] then
+      begin
+        EvidenceCheck(TMachineOverviewResourceKind.Io in lChange.Incident.Evidence.Resources, 'I/O resource admission');
+        EvidenceCheck((Length(lPhase.IoProcesses) = 1) and (lPhase.IoProcesses[0].AverageValue = 209715200) and
+          (lPhase.IoProcesses[0].TotalBytes = 2097152000.0), 'I/O rate and integrated bytes');
+        EvidenceCheck((lPhase.DiskLatency.Peak = 410) and (lPhase.DiskLatency.Average = 247.5) and
+          (lPhase.DiskThroughput.Peak = 200) and (lPhase.MeasuredProcessIo.Average = 200) and
+          (lChange.Incident.Evidence.DiskName = 'Disk 1 C:'), 'selected worst disk and measured total');
+      end;
+      if lCategory = TMachineOverviewIncidentCategory.HighCpu then
+        EvidenceCheck((lChange.Incident.Evidence.Resources = []) and
+          ContainsText(MachineOverviewEvidenceToJson(lChange.Incident.Evidence), '"v":1'), 'CPU remains v1');
+      AssertEvidencePayloadValid(lChange.Incident.Evidence);
+    finally
+      lRecorder.Free;
+    end;
+  end;
+  Writeln('SELFTEST PASS: resource evidence RAM growth, exited identity, disk, immutable selection, CPU v1');
+end;
+
+function ReviewDiskSample(const aUtc: TDateTime; const aIdentity, aName: string;
+  const aLatency, aActive: Double): TMachineOverviewProviderSample;
+begin
+  Result := Default(TMachineOverviewProviderSample);
+  Result.State.ProviderId := 'disks';
+  Result.State.Status := TMachineOverviewProviderStatus.Available;
+  Result.State.CapturedAtUtc := aUtc;
+  AddEvidenceMeasurement(Result, 'disk_worst', 1, aIdentity, aName);
+  AddEvidenceMeasurement(Result, 'disk_latency_ms', aLatency, aIdentity);
+  AddEvidenceMeasurement(Result, 'disk_active_percent', aActive, aIdentity);
+  AddEvidenceMeasurement(Result, 'disk_queue_length', aActive / 10, aIdentity);
+  AddEvidenceMeasurement(Result, 'disk_read_mb_per_sec', aActive, aIdentity);
+  AddEvidenceMeasurement(Result, 'disk_write_mb_per_sec', 1, aIdentity);
+end;
+
+function ReviewDiskRow(const aEvidence: TMachineOverviewIncidentEvidence;
+  const aPhase, aStatistic: string): TMachineOverviewEvidenceRow;
+var
+  lRow: TMachineOverviewEvidenceRow;
+begin
+  for lRow in MachineOverviewEvidenceRows(aEvidence) do
+    if (lRow.Phase = aPhase) and (lRow.Kind = 'Disk') and ContainsText(lRow.Name, aStatistic) then
+      Exit(lRow);
+  raise Exception.Create('Missing review fixture disk row: ' + aPhase + ' ' + aStatistic);
+end;
+
+procedure RunEvidenceDiskSwitchReviewSelfTest;
+var
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lConfig: TMachineOverviewEvidenceConfig;
+  lChange: TMachineOverviewIncidentChange;
+  lCompleted: TArray<TMachineOverviewIncidentChange>;
+  lEvidence, lDecoded: TMachineOverviewIncidentEvidence;
+  lLatency, lActive, lAfter: TMachineOverviewEvidenceRow;
+  lUtc: TDateTime;
+  lText, lError: string;
+begin
+  lUtc := EncodeDate(2026, 10, 21);
+  lConfig := TMachineOverviewEvidenceConfig.Defaults;
+  lConfig.PostWindowMs := 10000;
+  lRecorder := TMachineOverviewEvidenceRecorder.Create(lConfig);
+  try
+    lChange := EvidenceChange(lUtc, 'disk-switch-review');
+    lChange.Incident.Category := TMachineOverviewIncidentCategory.DiskPressure;
+    ApplyEvidence(lRecorder, lChange);
+    lRecorder.ObserveSample(ReviewDiskSample(EvidenceSecond(lUtc, 1), 'disk:a', 'Disk A', 410, 10));
+    lRecorder.ObserveSample(ReviewDiskSample(EvidenceSecond(lUtc, 2), 'disk:b', 'Disk B', 2, 99));
+    lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+    lChange.Incident.EndedAtUtc := EvidenceSecond(lUtc, 10);
+    ApplyEvidence(lRecorder, lChange);
+    lRecorder.ObserveSample(ReviewDiskSample(EvidenceSecond(lUtc, 11), 'disk:c', 'Disk C', 1, 1));
+    lCompleted := CompleteEvidence(lRecorder, EvidenceSecond(lUtc, 20));
+    EvidenceCheck(Length(lCompleted) = 1, 'disk switch fixture completes');
+    lEvidence := lCompleted[0].Incident.Evidence;
+    lLatency := ReviewDiskRow(lEvidence, 'During', 'Latency');
+    lActive := ReviewDiskRow(lEvidence, 'During', 'Active');
+    lAfter := ReviewDiskRow(lEvidence, 'After', 'Latency');
+    EvidenceCheck(ContainsText(lLatency.Name, 'Multiple busiest disks') and
+      ContainsText(lLatency.Peak, '410.0 ms') and ContainsText(lLatency.Peak, 'Disk A') and
+      ContainsText(lActive.Peak, 'Disk B') and ContainsText(lAfter.Name, 'Disk C'),
+      'disk switching: mixed During average must be explicit, each peak keeps its own disk, After stays separate');
+    EvidenceCheck(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].DiskLatency.Average = 206,
+      'disk switching preserves the selected-per-sample average');
+    lText := MachineOverviewEvidenceToJson(lEvidence);
+    EvidenceCheck(TryMachineOverviewEvidenceFromJson(lText, lDecoded, lError), 'disk attribution JSON: ' + lError);
+    lDecoded.State := lEvidence.State; // Our history reader restores this separately persisted state before rendering.
+    EvidenceCheck((ReviewDiskRow(lDecoded, 'During', 'Latency').Peak = lLatency.Peak) and
+      (ReviewDiskRow(lDecoded, 'During', 'Latency').Name = lLatency.Name) and
+      (ReviewDiskRow(lDecoded, 'After', 'Latency').Name = lAfter.Name) and
+      (MachineOverviewEvidenceToJson(lDecoded) = lText), 'disk attribution survives stable v2 round trip');
+    EvidenceCheck(ContainsText(MachineOverviewEvidenceText(lDecoded), '410.0 ms (Disk A)'),
+      'disk peak source is retained in export');
+  finally
+    lRecorder.Free;
+  end;
+  Writeln('SELFTEST PASS: disk switching keeps per-peak source, explicit mixed phase and separate After; JSON/export retained');
+end;
+
+procedure RunEvidenceDiskWindowReviewSelfTest;
+var
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lConfig: TMachineOverviewEvidenceConfig;
+  lChange: TMachineOverviewIncidentChange;
+  lCompleted: TArray<TMachineOverviewIncidentChange>;
+  lUtc: TDateTime;
+  lExpectedJson, lExpectedText: string;
+  lWithExcluded: Boolean;
+begin
+  lUtc := EncodeDate(2026, 10, 21);
+  lConfig := TMachineOverviewEvidenceConfig.Defaults;
+  lConfig.PostWindowMs := 10000;
+  lExpectedJson := '';
+  lExpectedText := '';
+  for lWithExcluded := False to True do
+  begin
+    lRecorder := TMachineOverviewEvidenceRecorder.Create(lConfig);
+    try
+      lChange := EvidenceChange(lUtc, 'disk-window-review');
+      lChange.Incident.Category := TMachineOverviewIncidentCategory.DiskPressure;
+      ApplyEvidence(lRecorder, lChange);
+      lRecorder.ObserveSample(ReviewDiskSample(EvidenceSecond(lUtc, 1), 'disk:a', 'Disk A', 410, 99));
+      lChange.Kind := TMachineOverviewIncidentChangeKind.Ended;
+      lChange.Incident.EndedAtUtc := EvidenceSecond(lUtc, 10);
+      ApplyEvidence(lRecorder, lChange);
+      // Our exact post-window boundary is admitted; the next second must change nothing.
+      lRecorder.ObserveSample(ReviewDiskSample(EvidenceSecond(lUtc, 20), 'disk:a', 'Disk A', 2, 1));
+      if lWithExcluded then
+        lRecorder.ObserveSample(ReviewDiskSample(EvidenceSecond(lUtc, 21), 'disk:b', 'Disk B', 999, 100));
+      lCompleted := CompleteEvidence(lRecorder, EvidenceSecond(lUtc, 21));
+      EvidenceCheck(Length(lCompleted) = 1, 'disk post-window fixture completes');
+      if not lWithExcluded then
+      begin
+        lExpectedJson := MachineOverviewEvidenceToJson(lCompleted[0].Incident.Evidence);
+        lExpectedText := MachineOverviewEvidenceText(lCompleted[0].Incident.Evidence);
+      end else
+        EvidenceCheck((MachineOverviewEvidenceToJson(lCompleted[0].Incident.Evidence) = lExpectedJson) and
+          (MachineOverviewEvidenceText(lCompleted[0].Incident.Evidence) = lExpectedText),
+          'post-window disk sample must not mutate any finalized JSON or export text');
+    finally
+      lRecorder.Free;
+    end;
+  end;
+  Writeln('SELFTEST PASS: excluded post-window disk sample leaves finalized JSON and export byte-identical');
+end;
+
+function RunEvidenceDiskReviewSelfTests: Integer;
+begin
+  Result := 0;
+  try
+    RunEvidenceDiskSwitchReviewSelfTest;
+  except
+    on lException: Exception do
+    begin
+      Writeln('SELFTEST FAILED: disk-switch review: ', lException.Message);
+      Inc(Result);
+    end;
+  end;
+  try
+    RunEvidenceDiskWindowReviewSelfTest;
+  except
+    on lException: Exception do
+    begin
+      Writeln('SELFTEST FAILED: disk-window review: ', lException.Message);
+      Inc(Result);
+    end;
+  end;
+end;
+
+procedure RunEvidenceResourceBoundsSelfTest;
+var
+  lRecorder: TMachineOverviewEvidenceRecorder;
+  lChange: TMachineOverviewIncidentChange;
+  lSample: TMachineOverviewProviderSample;
+  lEvidence: TMachineOverviewIncidentEvidence;
+  lDecoded: TMachineOverviewIncidentEvidence;
+  lPhase: TMachineOverviewEvidencePhase;
+  lText, lError: string;
+  lUtc: TDateTime;
+  i: Integer;
+begin
+  lUtc := EncodeDate(2026, 10, 21);
+  lRecorder := TMachineOverviewEvidenceRecorder.Create(TMachineOverviewEvidenceConfig.Defaults);
+  try
+    lChange := EvidenceChange(lUtc, 'resource-bounds');
+    lChange.Incident.Category := TMachineOverviewIncidentCategory.UserMarked;
+    ApplyEvidence(lRecorder, lChange);
+    for i := 1 to 70 do
+    begin
+      lSample := EvidenceSample(EvidenceSecond(lUtc, i * 5), True);
+      AddEvidenceMeasurement(lSample, 'process_ram_process:1', i * 1073741824.0, IntToStr(i) + ':1', 'ram.exe');
+      AddEvidenceMeasurement(lSample, 'process_io_process:1', i * 1048576.0, IntToStr(i) + ':1', 'io.exe');
+      AddEvidenceMeasurement(lSample, 'process_io_measured_total_bytes_per_second', i * 1048576.0);
+      lRecorder.ObserveSample(lSample);
+    end;
+    lChange.Kind := TMachineOverviewIncidentChangeKind.Updated;
+    ApplyEvidence(lRecorder, lChange);
+    lPhase := lChange.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During];
+    EvidenceCheck(lChange.Incident.Evidence.Truncated and (Length(lPhase.RamProcesses) = 10) and
+      (Length(lPhase.IoProcesses) = 10) and (lPhase.RamProcesses[0].ProcessId = 70) and
+      (lPhase.IoProcesses[0].ProcessId = 70), '64-identity admission, eviction and output bounds');
+    lEvidence := lChange.Incident.Evidence;
+    lText := MachineOverviewEvidenceToJson(lEvidence);
+    EvidenceCheck(TryMachineOverviewEvidenceFromJson(lText, lDecoded, lError), 'bounded resources decode');
+    lSample := EvidenceSample(EvidenceSecond(lUtc, 355), True);
+    AddEvidenceMeasurement(lSample, 'process_io_measured_total_bytes_per_second', 0);
+    lRecorder.ObserveSample(lSample);
+    ApplyEvidence(lRecorder, lChange);
+    lPhase := lChange.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During];
+    EvidenceCheck(Abs(lPhase.IoProcesses[0].AverageValue - 70 * 1048576.0 / 71) < 0.01,
+      'absent I/O counts zero over measured phase time');
+  finally
+    lRecorder.Free;
+  end;
+  lRecorder := TMachineOverviewEvidenceRecorder.Create(TMachineOverviewEvidenceConfig.Defaults);
+  try
+    lChange := EvidenceChange(lUtc, 'resource-pid-reuse');
+    lChange.Incident.Category := TMachineOverviewIncidentCategory.MemoryPressure;
+    ApplyEvidence(lRecorder, lChange);
+    for i := 1 to 2 do
+    begin
+      lSample := EvidenceSample(EvidenceSecond(lUtc, i * 5), True);
+      AddEvidenceMeasurement(lSample, 'process_ram_process:1', i * 1073741824.0, '42:' + IntToStr(i), 'same.exe');
+      lRecorder.ObserveSample(lSample);
+    end;
+    ApplyEvidence(lRecorder, lChange);
+    lPhase := lChange.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During];
+    EvidenceCheck((Length(lPhase.RamProcesses) = 2) and
+      (lPhase.RamProcesses[0].CreationTime100ns = 2) and (lPhase.RamProcesses[1].SampleCount = 1),
+      'PID reuse keeps creation identities separate');
+  finally
+    lRecorder.Free;
+  end;
+  Writeln('SELFTEST PASS: resource 64-identity eviction, top ten, absent I/O zero, PID reuse');
+end;
+
+procedure RunEvidenceJsonV2CompatSelfTest;
+const
+  // Captured from our unmodified 595387f recorder/serializer; proof retains the generator and SHA256.
+  cPopulatedV1 = '{"v":1,"lp":32,"pms":5000,"sms":1000,"den":0,"tr":false,"go":0,"ph":[{"k":"before","s":1792540500000,"e":1792540800000,"ps":1,"pe":60,"ss":1,"se":300,' +
+    '"cpu":{"a":25.00,"p":25.00,"t":1792540795000},"dpc":{"a":2.00,"p":2.00,"t":1792540795000},"irq":{"a":1.00,"p":1.00,"t":1792540795000},"mp":{"a":6.25,"' +
+    'p":6.25,"t":1792540795000},"un":{"a":18.75,"p":18.75,"t":1792540795000},"pr":[{"pid":42,"ct":1,"n":"worker.exe","pa":"C:\\Test\\worker.exe","st":"Avai' +
+    'lable","a":3.13,"p":3.13,"t":1792540795000,"ls":1792540795000,"c":1},{"pid":42,"ct":2,"n":"worker.exe","pa":"C:\\Test\\worker.exe","st":"Available","a' +
+    '":3.13,"p":3.13,"t":1792540795000,"ls":1792540795000,"c":1}],"ap":[{"n":"worker.exe","pc":2,"a":6.25,"p":6.25,"t":1792540795000}]},{"k":"during","s":1' +
+    '792540800000,"e":1792540810000,"ps":1,"pe":2,"ss":1,"se":10,"cpu":{"a":25.00,"p":25.00,"t":1792540805000},"dpc":{"a":2.00,"p":2.00,"t":1792540805000},' +
+    '"irq":{"a":1.00,"p":1.00,"t":1792540805000},"mp":{"a":6.25,"p":6.25,"t":1792540805000},"un":{"a":18.75,"p":18.75,"t":1792540805000},"pr":[{"pid":42,"c' +
+    't":1,"n":"worker.exe","pa":"C:\\Test\\worker.exe","st":"Available","a":3.13,"p":3.13,"t":1792540805000,"ls":1792540805000,"c":1},{"pid":42,"ct":2,"n":' +
+    '"worker.exe","pa":"C:\\Test\\worker.exe","st":"Available","a":3.13,"p":3.13,"t":1792540805000,"ls":1792540805000,"c":1}],"ap":[{"n":"worker.exe","pc":' +
+    '2,"a":6.25,"p":6.25,"t":1792540805000}]},{"k":"after","s":1792540810000,"e":1792540820000,"ps":2,"pe":2,"ss":2,"se":10,"cpu":{"a":25.00,"p":25.00,"t":' +
+    '1792540810000},"dpc":{"a":2.00,"p":2.00,"t":1792540810000},"irq":{"a":1.00,"p":1.00,"t":1792540810000},"mp":{"a":6.25,"p":6.25,"t":1792540810000},"un"' +
+    ':{"a":18.75,"p":18.75,"t":1792540810000},"pr":[{"pid":42,"ct":1,"n":"worker.exe","pa":"C:\\Test\\worker.exe","st":"Available","a":3.13,"p":3.13,"t":17' +
+    '92540810000,"ls":1792540815000,"c":2},{"pid":42,"ct":2,"n":"worker.exe","pa":"C:\\Test\\worker.exe","st":"Available","a":3.13,"p":3.13,"t":17925408100' +
+    '00,"ls":1792540815000,"c":2}],"ap":[{"n":"worker.exe","pc":2,"a":6.25,"p":6.25,"t":1792540810000}]}],"gp":[{"s":1792540500000,"e":1792540795000,"r":"s' +
+    'tarted-late"},{"s":1792540796000,"e":1792540805000,"r":"system-missing"},{"s":1792540806000,"e":1792540810000,"r":"system-missing"},{"s":1792540811000' +
+    ',"e":1792540815000,"r":"system-missing"},{"s":1792540816000,"e":1792540820000,"r":"system-missing"}]}';
+  cV1 = '{"v":1,"lp":0,"pms":5000,"sms":1000,"den":0,"tr":false,"go":0,"ph":[' +
+    '{"k":"before","s":0,"e":0,"ps":0,"pe":0,"ss":0,"se":0,"pr":[],"ap":[]},' +
+    '{"k":"during","s":0,"e":0,"ps":0,"pe":0,"ss":0,"se":0,"pr":[],"ap":[]},' +
+    '{"k":"after","s":0,"e":0,"ps":0,"pe":0,"ss":0,"se":0,"pr":[],"ap":[]}],"gp":[]}';
+var
+  lEvidence, lDecoded: TMachineOverviewIncidentEvidence;
+  lKind: TMachineOverviewEvidencePhaseKind;
+  lText, lError: string;
+  i: Integer;
+begin
+  EvidenceCheck(TryMachineOverviewEvidenceFromJson(cPopulatedV1, lEvidence, lError), 'populated base v1 reads: ' + lError);
+  EvidenceCheck((lEvidence.Resources = []) and
+    (Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].Processes) = 2) and
+    (Length(lEvidence.Gaps) > 0) and (MachineOverviewEvidenceToJson(lEvidence) = cPopulatedV1),
+    'populated frozen 595387f v1 statistics, contributors, applications and gaps remain byte-identical');
+  Writeln('SELFTEST PASS: populated frozen 595387f v1 bytes (three phases, CPU statistics, processes, applications and gaps)');
+  EvidenceCheck(TryMachineOverviewEvidenceFromJson(cV1, lEvidence, lError), 'literal v1 reads');
+  EvidenceCheck((lEvidence.Resources = []) and
+    (MachineOverviewEvidenceToJson(lEvidence) = cV1), 'CPU v1 byte-identical literal');
+  lEvidence.Resources := [TMachineOverviewResourceKind.Ram, TMachineOverviewResourceKind.Io];
+  lEvidence.DiskName := 'Disk 1 C:';
+  for lKind := Low(lKind) to High(lKind) do
+  begin
+    lEvidence.Phases[lKind].DiskName := StringOfChar(WideChar($6F22), 256);
+    lEvidence.Phases[lKind].DiskLatency.Available := True;
+    lEvidence.Phases[lKind].DiskLatency.Average := 85;
+    lEvidence.Phases[lKind].DiskLatency.Peak := 410;
+    lEvidence.Phases[lKind].DiskLatency.PeakSourceName := StringOfChar(WideChar($6F22), 256);
+    lEvidence.Phases[lKind].DiskActive := lEvidence.Phases[lKind].DiskLatency;
+    lEvidence.Phases[lKind].DiskActive.Peak := 99;
+    lEvidence.Phases[lKind].DiskQueue := lEvidence.Phases[lKind].DiskLatency;
+    lEvidence.Phases[lKind].DiskQueue.Peak := 4;
+    lEvidence.Phases[lKind].DiskThroughput := lEvidence.Phases[lKind].DiskLatency;
+    lEvidence.Phases[lKind].DiskThroughput.Peak := 200;
+    SetLength(lEvidence.Phases[lKind].RamProcesses, 200);
+    SetLength(lEvidence.Phases[lKind].IoProcesses, 200);
+    for i := 0 to 199 do
+    begin
+      lEvidence.Phases[lKind].RamProcesses[i].ProcessId := i + 1;
+      lEvidence.Phases[lKind].RamProcesses[i].CreationTime100ns := High(UInt64);
+      lEvidence.Phases[lKind].RamProcesses[i].DisplayName := StringOfChar('n', 256);
+      lEvidence.Phases[lKind].RamProcesses[i].ImagePath := StringOfChar('p', 1024);
+      lEvidence.Phases[lKind].RamProcesses[i].PathStatus := 'Available';
+      lEvidence.Phases[lKind].RamProcesses[i].FirstValue := 1073741824;
+      lEvidence.Phases[lKind].RamProcesses[i].LastValue := 3221225472.0;
+      lEvidence.Phases[lKind].RamProcesses[i].PeakValue := 3221225472.0;
+      lEvidence.Phases[lKind].RamProcesses[i].AverageValue := 2147483648.0;
+      lEvidence.Phases[lKind].IoProcesses[i] := lEvidence.Phases[lKind].RamProcesses[i];
+      lEvidence.Phases[lKind].IoProcesses[i].TotalBytes := 2097152000.0;
+    end;
+  end;
+  lText := MachineOverviewEvidenceToJson(lEvidence);
+  EvidenceCheck((TEncoding.UTF8.GetByteCount(lText) <= 16384) and
+    TryMachineOverviewEvidenceFromJson(lText, lDecoded, lError), 'bounded v2 decode: ' + lError);
+  EvidenceCheck(lDecoded.Truncated and (lDecoded.Resources = lEvidence.Resources) and
+    (lDecoded.DiskName = lEvidence.DiskName) and
+    (Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].RamProcesses) = 200), 'v2 cap owns copies');
+  EvidenceCheck(MachineOverviewEvidenceToJson(lDecoded) = lText, 'v2 stable round trip');
+  lText := StringReplace(cV1, '"v":1', '"v":3', []);
+  EvidenceCheck(not TryMachineOverviewEvidenceFromJson(lText, lDecoded, lError) and
+    (lError = 'Unsupported evidence version') and (lDecoded.Resources = []), 'v3 refused without raising');
+  Writeln('SELFTEST PASS: literal v1 bytes, v2 round trip, 200 RAM + 200 I/O identities, v3 refusal');
+end;
+
 procedure RunEvidenceCostMeasurement(const aIncidentCount: Integer);
 var
   g: TGarbos;
@@ -1305,13 +1685,26 @@ begin
   for i := 1 to aIncidentCount do
   begin
     lChange := EvidenceChange(lUtc, 'cost-' + IntToStr(i));
+    lChange.Incident.Category := TMachineOverviewIncidentCategory.UserMarked;
     ApplyEvidence(lRecorder, lChange);
   end;
   SetLength(lTimes, 21);
   for j := -1 to High(lTimes) do
   begin
     for i := 0 to High(lSamples) do
+    begin
       lSamples[i] := EvidenceSample(EvidenceSecond(lUtc, (j + 1) * 200 + i), (i mod 5) = 4, 1, 10);
+      if (i mod 5) = 4 then
+      begin
+        AddEvidenceMeasurement(lSamples[i], 'process_ram_process:1', 3221225472, '123:1', 'ram.exe');
+        AddEvidenceMeasurement(lSamples[i], 'process_io_process:1', 209715200, '456:2', 'io.exe');
+        AddEvidenceMeasurement(lSamples[i], 'process_io_measured_total_bytes_per_second', 209715200);
+      end else begin
+        AddEvidenceMeasurement(lSamples[i], 'physical_used_percent', 96);
+        AddEvidenceMeasurement(lSamples[i], 'commit_percent', 92);
+        AddEvidenceMeasurement(lSamples[i], 'paging_bytes_per_sec', 157286400);
+      end;
+    end;
     lStopwatch := TStopwatch.StartNew;
     for i := 0 to High(lSamples) do
       lRecorder.ObserveSample(lSamples[i]);
@@ -1324,7 +1717,7 @@ begin
     end;
   end;
   TArray.Sort<Double>(lTimes);
-  Writeln(Format('EVIDENCE COST Debug Win64 incidents=%d samples=4200 min_us=%.3f median_us=%.3f p95_us=%.3f max_us=%.3f',
+  Writeln(Format('EVIDENCE COST Win64 incidents=%d samples=4200 min_us=%.3f median_us=%.3f p95_us=%.3f max_us=%.3f',
     [aIncidentCount, lTimes[0], lTimes[10], lTimes[19], lTimes[20]]));
   EvidenceCheck(lRecorder.TrackedIncidentCount = aIncidentCount, 'cost workload consumed');
 end;
@@ -2337,6 +2730,12 @@ begin
     RunEvidencePostWindowSelfTest(False);
     RunEvidencePostWindowSelfTest(True);
     RunEvidenceJsonRoundTripSelfTest;
+    RunEvidenceResourceSelfTest;
+    Result := RunEvidenceDiskReviewSelfTests;
+    if Result <> 0 then
+      Exit;
+    RunEvidenceResourceBoundsSelfTest;
+    RunEvidenceJsonV2CompatSelfTest;
     RunEvidenceCostMeasurement(1);
     RunEvidenceCostMeasurement(64);
     Result := RunHighCpuIncidentSelfTest;

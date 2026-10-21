@@ -68,6 +68,10 @@ The Incidents row shows the last-24-hour count and the three newest summaries. E
 
 Process CPU is kernel plus user time divided by the sampling interval and the number of logical processors. On a 32-logical-processor machine, one fully busy logical processor is 3.125% of the whole machine. Measured processes is the total CPU measured across processes; Not attributed is system CPU minus that measured total, clamped to zero. DPC/interrupt time, inaccessible processes, missed samples and processes that start and exit between samples can leave CPU unattributed. Application evidence combines matching executable names from the five busiest groups per sample, so it can understate a group total. These measurements describe contributors, not proof of the cause of an incident.
 
+Memory-pressure evidence adds physical use, commit, paging, and the largest private-byte process contributors. RAM evidence uses private bytes, distinct from the live ranking's private working set. Growth is the last minus the first value seen in each phase. Disk-pressure evidence adds busiest-disk active time, latency, queue and throughput plus process read+write I/O. User-marked incidents retain both RAM and I/O. The recorder reuses the existing samples and keeps up to ten During and five Before/After identities per resource, shortened when necessary to fit the 16 KiB evidence limit. CPU-only incidents keep the original evidence format; older evidence remains readable.
+
+Process I/O counters include file, network and device I/O. Paging and memory-mapped file reads are not attributed to processes. Lists come from the ten largest processes per sample, so absence from a list does not prove a process used no RAM or I/O. RAM averages include only appearances in the list; I/O averages count absent samples as zero over measured phase time. These are measured contributors, not proof of cause.
+
 History and storage
 
 HistoryEnabled controls persistence. One-second system and disk samples are retained for up to 48 hours, 10-second rollups for 30 days, and one-minute rollups for 365 days. Incidents are retained for up to 365 days and at most 50,000 headlines. Ranked application snapshots and compact measured incident evidence share the same storage budget; the full process list is not written every second.
@@ -83,6 +87,8 @@ The history database is MachineOverviewHistory.db next to ActiveAppView.exe. It 
 Recording health reports Recording, Stale, Unavailable or Error, with the recording session start, last successful write, newest process sample, retained time range, used bytes and budget, main-file and WAL sizes, storage state, records dropped during the current session, sampling intervals, logical-processor count, provider status, and database/backup paths. A last write older than three commit intervals is stale. A byte budget does not guarantee a fixed number of hours of coverage.
 
 DetailedTraceEnabled is off by default. When enabled, a DPC/ISR incident or a critical automatic incident can request one 15-second WPR trace. ActiveAppView combines the Windows General and GPU profiles so the trace contains CPU scheduling, context switches, DPC/ISR, disk, process/thread, and supported GPU events and stacks. Windows must grant the Profile system performance right; otherwise the incident records Trace: Unavailable without requiring ActiveAppView to elevate. WPA-compatible ETL files are saved under the MachineOverviewTraces directory next to ActiveAppView.exe. They can contain sensitive system activity. Retention keeps at most 10 ETL traces and 2 GB total, deleting the oldest trace files first.
+
+Disk evidence names the selected busiest disk for each phase, or Multiple busiest disks when selection varied. Each peak names the disk that produced it. Samples outside the evidence window cannot change these names.
 
 Privacy and information not stored
 

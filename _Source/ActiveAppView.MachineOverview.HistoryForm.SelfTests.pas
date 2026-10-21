@@ -1115,6 +1115,121 @@ begin
   end;
 end;
 
+function RunIncidentResourceEvidenceViewSelfTest: Integer;
+var
+  lForm: TMachineOverviewHistoryFrm;
+  lMemory, lCpu, lIo: TMachineOverviewIncidentChange;
+  lResource: TMachineOverviewResourceContribution;
+  lPhase: TMachineOverviewEvidencePhase;
+  lDatabase, lText, lCpuText: string;
+  lNow: TDateTime;
+  lAccessible: IAccessible;
+  lName: WideString;
+  lChild: OleVariant;
+  i, lRamRows: Integer;
+begin
+  Result := 1;
+  lNow := EncodeDate(2026, 10, 21) + EncodeTime(17, 43, 0, 0);
+  lDatabase := TPath.Combine(TPath.GetTempPath, Format('acv-s2-resources-%d.db', [GetCurrentProcessId]));
+  lForm := nil;
+  try
+    lCpu := EvidenceFixture('cpu-v1', lNow);
+    lCpu.Incident.Category := TMachineOverviewIncidentCategory.HighCpu;
+    lCpuText := FormatMachineOverviewIncidentDetails(lCpu.Incident);
+    lMemory := EvidenceFixture('memory-v2', IncMinute(lNow, 1));
+    lMemory.Incident.Category := TMachineOverviewIncidentCategory.MemoryPressure;
+    lMemory.Incident.Summary := 'Physical memory use reached 96%';
+    lMemory.Incident.Evidence.Resources := [TMachineOverviewResourceKind.Ram];
+    lPhase := lMemory.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During];
+    lPhase.Processes := nil;
+    lPhase.Applications := nil;
+    lPhase.PhysicalUsed.Available := True;
+    lPhase.PhysicalUsed.Average := 96;
+    lPhase.PhysicalUsed.Peak := 97;
+    lPhase.PhysicalUsed.PeakAtUtc := lPhase.StartUtc;
+    lPhase.Commit := lPhase.PhysicalUsed;
+    lPhase.Commit.Average := 92;
+    lPhase.Commit.Peak := 93;
+    lPhase.Paging := lPhase.PhysicalUsed;
+    lPhase.Paging.Average := 150;
+    lPhase.Paging.Peak := 160;
+    lResource := Default(TMachineOverviewResourceContribution);
+    lResource.ProcessId := 1234;
+    lResource.CreationTime100ns := 134370781800000000; // Our fixture starts at 2026-10-21 17:43 UTC in FILETIME units.
+    lResource.DisplayName := 'grow.exe';
+    lResource.ImagePath := 'C:\Tools\grow.exe';
+    lResource.PathStatus := 'Available';
+    lResource.FirstValue := 1073741824;
+    lResource.LastValue := 3221225472.0;
+    lResource.AverageValue := 2147483648.0;
+    lResource.PeakValue := 3221225472.0;
+    lResource.PeakAtUtc := IncSecond(lPhase.StartUtc, 5);
+    lResource.LastSeenUtc := lPhase.EndUtc;
+    lResource.SampleCount := 2;
+    lPhase.RamProcesses := [lResource];
+    lMemory.Incident.EndedAtUtc := lPhase.EndUtc;
+    lMemory.Incident.PeakAtUtc := lResource.PeakAtUtc;
+    lMemory.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During] := lPhase;
+    lIo := EvidenceFixture('disk-v2', IncMinute(lNow, 2));
+    lIo.Incident.Evidence.Resources := [TMachineOverviewResourceKind.Io];
+    lIo.Incident.Evidence.DiskName := 'Disk 1 C:';
+    lPhase := lIo.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During];
+    lPhase.DiskLatency := lMemory.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During].Paging;
+    lPhase.DiskLatency.Average := 85;
+    lPhase.DiskLatency.Peak := 410;
+    lResource.AverageValue := 209715200;
+    lResource.PeakValue := 314572800;
+    lResource.TotalBytes := 2097152000;
+    lPhase.IoProcesses := [lResource];
+    lIo.Incident.EndedAtUtc := lPhase.EndUtc;
+    lIo.Incident.PeakAtUtc := lResource.PeakAtUtc;
+    lIo.Incident.Evidence.Phases[TMachineOverviewEvidencePhaseKind.During] := lPhase;
+    if not PersistIncidents(lDatabase, [lMemory, lCpu, lIo]) then
+      Exit;
+    lForm := TMachineOverviewHistoryFrm.Create(nil);
+    lForm.Configure(lDatabase, IncMinute(lNow, 3));
+    if not lForm.RefreshAndWaitForTest(True, 5000) then
+      Exit;
+    lForm.lvIncidents.Selected := lForm.lvIncidents.Items[FindIncidentItemIndex(lForm, 'disk-v2')];
+    PumpEvidence(lForm);
+    lText := lForm.memDetails.Text;
+    if not ContainsText(lText, 'Disk Disk 1 C: Latency') or not ContainsText(lText, 'average 85.0 ms') or
+      not ContainsText(lText, 'peak 410.0 ms') or not ContainsText(lText, '200.0 MB/s') then
+      raise Exception.Create('Persisted I/O and disk evidence lost units or values');
+    lForm.lvIncidents.Selected := lForm.lvIncidents.Items[FindIncidentItemIndex(lForm, 'cpu-v1')];
+    PumpEvidence(lForm);
+    if not StartsStr(lCpuText, lForm.memDetails.Text) or ContainsText(lForm.memDetails.Text, 'private bytes') then
+      raise Exception.Create('Persisted v1 CPU rendering changed');
+    lForm.lvIncidents.Selected := lForm.lvIncidents.Items[FindIncidentItemIndex(lForm, 'memory-v2')];
+    PumpEvidence(lForm);
+    lText := lForm.memDetails.Text;
+    if not ContainsText(lText, 'Process RAM grow.exe') or not ContainsText(lText, 'average 2.0 GB private') or
+      not ContainsText(lText, 'peak 3.0 GB private') or not ContainsText(lText, 'grew 2.0 GB') or
+      not ContainsText(lText, '96.0%') or not ContainsText(lText, '150.0 MB/s') or
+      not ContainsText(lText, 'Paging and memory-mapped file reads are not attributed to processes.') then
+      raise Exception.Create('Persisted RAM rows or export contract missing');
+    OleCheck(AccessibleObjectFromWindow(lForm.lvEvidence.Handle, OBJID_CLIENT, IID_IAccessible, lAccessible));
+    lRamRows := 0;
+    for i := 0 to lForm.lvEvidence.Items.Count - 1 do
+      if ContainsText(lForm.lvEvidence.Items[i].Caption, 'Process RAM') then
+      begin
+        Inc(lRamRows);
+        lChild := i + 1;
+        OleCheck(lAccessible.Get_accName(lChild, lName));
+        if not ContainsText(string(lName), 'PID 1234') or not ContainsText(string(lName), 'grew 2.0 GB') or
+          not ContainsText(string(lName), '2 of 2 samples') then
+          raise Exception.Create('RAM accessible row lost identity, growth or coverage');
+      end;
+    if lRamRows <> 1 then
+      raise Exception.Create('Expected one persisted RAM process row');
+    HoldEvidenceFormForUiProof(lForm, 'resource');
+    Result := 0;
+  finally
+    lForm.Free;
+    DeleteHistoryFiles(lDatabase);
+  end;
+end;
+
 function RunIncidentWorkAreaSelfTest: Integer;
 var
   lForm: TWorkAreaHistoryFrm;
@@ -1218,7 +1333,8 @@ begin
       Result := Result + RunIncidentEvidenceExportSelfTest;
       Result := Result + RunIncidentHistoryFormSelfTest;
       Result := Result + RunIncidentWorkAreaSelfTest;
-      Writeln(Format('Incident view: 6 tests, %d failed', [Result]));
+      Result := Result + RunIncidentResourceEvidenceViewSelfTest;
+      Writeln(Format('Incident view: 7 tests, %d failed', [Result]));
     except
       on lException: Exception do
       begin

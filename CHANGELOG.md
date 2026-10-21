@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- Memory-pressure incidents now retain private-byte RAM contributors and growth; disk-pressure incidents retain process I/O and busiest-disk measurements. User-marked incidents retain both, using the existing evidence phases and export (ACV-070).
 - `Scripts\x-mouse.ps1` toggles the MouseBeam executable at `F:\projects\MaxLogic\MouseBeam\xMouse.exe`, trying a graceful close before forced termination and ignoring instances at other paths (ACV-076).
 - Machine Overview incident history now shows measured CPU contributors before, during, and after an incident, including exited processes, application groups, sampling gaps, recording health (session start, dropped records, and provider status), and a Copy evidence command (ACV-067, ACV-068).
 - VMware Player and Workstation windows now have a `VM - ` prefix in Applications.
@@ -26,6 +27,7 @@ All notable changes to this project are documented in this file.
 - `Scripts\Copy-MarkdownAsRichText.ps1` now always converts clipboard markdown to HTML (CF_HTML with the original markdown as text fallback), without a format menu. The library still supports RTF and plain text (ACV-075).
 
 ### Fixed
+- Disk incident evidence keeps the disk responsible for each peak, labels phases that combine busiest disks, and ignores out-of-window disk names (ACV-070).
 - Incident-view self-tests use an in-memory clipboard adapter for exact-copy and failure checks, leaving the system clipboard untouched (ACV-077).
 - Machine Overview history now deletes its verified migration backup after a successful upgrade and cleanup, including after a resumed migration. Failed migrations retain the backup; deletion failures are reported without stopping recording (ACV-074).
 - Incident evidence rows now include the process start date when it differs from the incident's local day. Shorter Average/Peak cells and state rows fit at 100% scaling while retaining the machine-share units and full details (ACV-073).

@@ -39,12 +39,14 @@ function ClassifyMachineOverviewProcessPathFailure(const aErrorCode: Cardinal;
 function TryCalculateMachineOverviewPrivateWorkingSet(
   const aWorkingSetFlags: TArray<NativeUInt>; const aPageSize: Cardinal;
   out aPrivateBytes: UInt64): Boolean;
+function SelectMachineOverviewResourceProcesses(const aMetrics: TArray<TMachineOverviewProcessMetric>; //PALOFF Our process-disk fixture uses the same bounded selector as live collection.
+  const aIo: Boolean; out aMeasuredTotal: Double): TArray<TMachineOverviewProcessMetric>;
 function CreateMachineOverviewProcessProvider: IMachineOverviewProvider;
 
 implementation
 
 uses
-  System.DateUtils, System.Generics.Collections, System.SysUtils,
+  System.DateUtils, System.Generics.Collections, System.Math, System.SysUtils,
   Winapi.PsAPI, Winapi.Windows,
   AutoFree,
   ActiveAppView.MachineOverview.Domain;
@@ -90,6 +92,7 @@ type
     Path: string;
     PathStatus: TMachineOverviewProcessPathStatus;
     PrivateBytes: UInt64;
+    PrivateUsageBytes: UInt64;
     PrivateBytesAvailable: Boolean;
     WriteBytesPerSecond: Double;
     WriteBytesPerSecondAvailable: Boolean;
@@ -160,7 +163,7 @@ begin
 end;
 
 function TryReadMachineOverviewProcessMemory(const aProcessHandle: THandle;
-  out aWorkingSetBytes, aPrivateWorkingSetBytes: UInt64;
+  out aWorkingSetBytes, aPrivateWorkingSetBytes, aPrivateUsageBytes: UInt64;
   out aPrivateWorkingSetAvailable: Boolean): Boolean;
 var
   lCounters: TProcessMemoryCountersEx;
@@ -168,6 +171,7 @@ var
 begin
   aWorkingSetBytes := 0;
   aPrivateWorkingSetBytes := 0;
+  aPrivateUsageBytes := 0;
   aPrivateWorkingSetAvailable := False;
   lCountersEx2 := Default(TMachineOverviewProcessMemoryCountersEx2);
   lCountersEx2.cb := SizeOf(lCountersEx2);
@@ -176,6 +180,7 @@ begin
   if Result then
   begin
     aWorkingSetBytes := lCountersEx2.WorkingSetSize;
+    aPrivateUsageBytes := lCountersEx2.PrivateUsage;
     aPrivateWorkingSetBytes := lCountersEx2.PrivateWorkingSetSize;
     aPrivateWorkingSetAvailable := True;
     Exit;
@@ -185,7 +190,10 @@ begin
   Result := GetProcessMemoryInfo(aProcessHandle,
     PPROCESS_MEMORY_COUNTERS(@lCounters), SizeOf(lCounters));
   if Result then
+  begin
     aWorkingSetBytes := lCounters.WorkingSetSize;
+    aPrivateUsageBytes := lCounters.PrivateUsage;
+  end;
 end;
 
 function ProcessPathStatusText(
@@ -673,7 +681,7 @@ begin
     fPreviousProcesses.AddOrSetValue(lKey, lPrevious);
 
     aProcess.WorkingSetBytesAvailable := TryReadMachineOverviewProcessMemory(
-      lHandle, aProcess.WorkingSetBytes, aProcess.PrivateBytes,
+      lHandle, aProcess.WorkingSetBytes, aProcess.PrivateBytes, aProcess.PrivateUsageBytes,
       aProcess.PrivateBytesAvailable);
     if not aProcess.WorkingSetBytesAvailable then
     begin
@@ -683,7 +691,7 @@ begin
       try
         aProcess.WorkingSetBytesAvailable :=
           TryReadMachineOverviewProcessMemory(lMemoryHandle,
-            aProcess.WorkingSetBytes, aProcess.PrivateBytes,
+            aProcess.WorkingSetBytes, aProcess.PrivateBytes, aProcess.PrivateUsageBytes,
             aProcess.PrivateBytesAvailable);
       finally
         CloseHandle(lMemoryHandle);
@@ -782,6 +790,85 @@ begin
   aMeasurements.Add(lMeasurement);
 end;
 
+function SelectMachineOverviewResourceProcesses(const aMetrics: TArray<TMachineOverviewProcessMetric>;
+  const aIo: Boolean; out aMeasuredTotal: Double): TArray<TMachineOverviewProcessMetric>;
+var
+  lTop: array[0..9] of TMachineOverviewProcessMetric;
+  lMetric: TMachineOverviewProcessMetric;
+  i, j, n: Integer;
+begin
+  for i := Low(lTop) to High(lTop) do
+    lTop[i] := Default(TMachineOverviewProcessMetric);
+  n := 0;
+  aMeasuredTotal := 0;
+  for lMetric in aMetrics do
+  begin
+    if not lMetric.MetricAvailable or IsNan(lMetric.MetricValue) or IsInfinite(lMetric.MetricValue) or
+      (lMetric.MetricValue < 0) then
+      Continue;
+    aMeasuredTotal := aMeasuredTotal + lMetric.MetricValue;
+    if aIo and (lMetric.MetricValue = 0) then
+      Continue;
+    i := 0;
+    while (i < n) and ((lTop[i].MetricValue > lMetric.MetricValue) or
+      ((lTop[i].MetricValue = lMetric.MetricValue) and
+      (lTop[i].Identity.ProcessId < lMetric.Identity.ProcessId))) do
+      Inc(i);
+    if i = Length(lTop) then
+      Continue;
+    if n < Length(lTop) then
+      Inc(n);
+    for j := n - 1 downto i + 1 do
+      lTop[j] := lTop[j - 1];
+    lTop[i] := lMetric;
+  end;
+  SetLength(Result, n);
+  for i := 0 to n - 1 do
+    Result[i] := lTop[i];
+end;
+
+procedure AddIndividualResourceMeasurements(const aMeasurements: TList<TMachineOverviewMeasurement>;
+  const aMetrics: TArray<TMachineOverviewProcessMetric>;
+  const aProcesses: TList<TMachineOverviewCollectedProcess>; const aIo: Boolean);
+var
+  lTop: TArray<TMachineOverviewProcessMetric>;
+  lProcess: TMachineOverviewCollectedProcess;
+  lMeasurement: TMachineOverviewMeasurement;
+  lTotal: Double;
+  i: Integer;
+begin
+  lTop := SelectMachineOverviewResourceProcesses(aMetrics, aIo, lTotal);
+  for i := 0 to High(lTop) do
+  begin
+    if not FindCollectedProcess(aProcesses, lTop[i].Identity, lProcess) then
+      raise EInvalidOpException.Create('Ranked process identity missing from our collected snapshot');
+    lMeasurement := Default(TMachineOverviewMeasurement);
+    if aIo then
+      lMeasurement.Name := 'process_io_process:' + IntToStr(i + 1)
+    else
+      lMeasurement.Name := 'process_ram_process:' + IntToStr(i + 1);
+    lMeasurement.EntityId := MachineOverviewProcessIdentityKey(lProcess.Identity);
+    lMeasurement.DisplayText := lProcess.DisplayName;
+    lMeasurement.DetailText := lProcess.Path;
+    lMeasurement.StatusText := ProcessPathStatusText(lProcess.PathStatus);
+    lMeasurement.Available := True;
+    lMeasurement.UnitText := 'bytes';
+    if aIo then
+      lMeasurement.UnitText := 'bytes_per_second';
+    lMeasurement.Value := lTop[i].MetricValue;
+    aMeasurements.Add(lMeasurement);
+  end;
+  if aIo then
+  begin
+    lMeasurement := Default(TMachineOverviewMeasurement);
+    lMeasurement.Name := 'process_io_measured_total_bytes_per_second';
+    lMeasurement.UnitText := 'bytes_per_second';
+    lMeasurement.Available := True;
+    lMeasurement.Value := lTotal;
+    aMeasurements.Add(lMeasurement);
+  end;
+end;
+
 procedure TMachineOverviewProcessProvider.Collect(
   out aSample: TMachineOverviewProviderSample);
 var
@@ -870,6 +957,14 @@ begin
   lIoRanked := RankMachineOverviewProcesses(lIoMetrics, lProcessList.Count);
   UpdateRollingMeasurements(lCpuRanked, lRamRanked, lIoRanked,
     lNowMonotonicMs);
+  // Our live RAM ranking retains private working set; evidence ranks private usage.
+  for i := 0 to lProcessList.Count - 1 do
+  begin
+    lRamMetrics[i].MetricAvailable := lProcessList[i].WorkingSetBytesAvailable;
+    lRamMetrics[i].MetricValue := lProcessList[i].PrivateUsageBytes;
+  end;
+  AddIndividualResourceMeasurements(lMeasurementList, lRamMetrics, lProcessList, False);
+  AddIndividualResourceMeasurements(lMeasurementList, lIoMetrics, lProcessList, True);
   LimitRankedProcesses(lCpuRanked, 5);
   LimitRankedProcesses(lRamRanked, 5);
   LimitRankedProcesses(lIoRanked, 5);

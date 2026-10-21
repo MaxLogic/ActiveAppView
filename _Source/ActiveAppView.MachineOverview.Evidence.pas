@@ -68,10 +68,14 @@ const
 type
   TEvidenceSample = record
     AtUtc, PreviousUtc: TDateTime;
-    IsProcess, Available, Truncated: Boolean;
+    IsProcess, IsDisk, Available, Truncated, RamTruncated, IoTruncated: Boolean;
     IntervalMs: Cardinal;
     LogicalProcessors, Inaccessible, ProcessCount, ApplicationCount: Integer;
     Cpu, Dpc, Interrupt, Residual: TMachineOverviewOptionalDouble;
+    PhysicalUsed, Commit, Paging, DiskActive, DiskLatency, DiskQueue, DiskThroughput,
+      MeasuredIo: TMachineOverviewOptionalDouble;
+    DiskIdentity, DiskName: string;
+    RamProcesses, IoProcesses: TArray<TMachineOverviewResourceContribution>;
     Processes: TArray<TMachineOverviewProcessContribution>;
     Applications: TArray<TMachineOverviewApplicationContribution>;
   end;
@@ -79,13 +83,27 @@ type
   TEvidenceTotal = record
     Sum, Weight: Double;
     Value: TMachineOverviewEvidenceStatistic;
-    procedure Add(const aValue: Double; const aWeight: Double; const aAtUtc: TDateTime);
+    procedure Add(const aValue: Double; const aWeight: Double; const aAtUtc: TDateTime;
+      const aPeakSourceName: string = '');
     function Snapshot: TMachineOverviewEvidenceStatistic;
+  end;
+
+  TResourceAccumulator = record
+    Items: array[0..63] of TMachineOverviewResourceContribution;
+    Count: Integer;
+    procedure Add(const aValue: TMachineOverviewResourceContribution; const aWeight: Double;
+      const aIo: Boolean; var aTruncated: Boolean);
+    function Snapshot(const aWeight: Double; const aMaximum: Integer;
+      const aIo: Boolean): TArray<TMachineOverviewResourceContribution>;
   end;
 
   TEvidencePhaseAccumulator = record
     Value: TMachineOverviewEvidencePhase;
     Cpu, Dpc, Interrupt, Measured, Residual: TEvidenceTotal;
+    PhysicalUsed, Commit, Paging, DiskActive, DiskLatency, DiskQueue, DiskThroughput, MeasuredIo: TEvidenceTotal;
+    Ram, Io: TResourceAccumulator;
+    DiskIdentity: string;
+    HasDisk: Boolean;
     ProcessWeight: Double;
     ProcessCount, ApplicationCount: Integer;
     Processes: array[0..63] of TMachineOverviewProcessContribution;
@@ -94,7 +112,7 @@ type
       var aTruncated: Boolean);
     procedure AddApplication(const aValue: TMachineOverviewApplicationContribution; const aWeight: Double;
       var aTruncated: Boolean);
-    procedure Add(const aSample: TEvidenceSample; var aTruncated: Boolean);
+    procedure Add(const aSample: TEvidenceSample; var aTruncated: Boolean; const aRam, aIo: Boolean);
     function Snapshot(const aEndUtc: TDateTime; const aProcessMs, aSystemMs: Cardinal): TMachineOverviewEvidencePhase;
   end;
 
@@ -106,8 +124,8 @@ type
     Config: TMachineOverviewEvidenceConfig;
     Value: TMachineOverviewIncidentEvidence;
     Phases: TEvidencePhaseAccumulators;
-    Pending: array[Boolean] of TEvidenceSample;
-    HasPending: array[Boolean] of Boolean;
+    Pending: array[0..2] of TEvidenceSample;
+    HasPending: array[0..2] of Boolean;
     LatestUtc: TDateTime;
     constructor Create(const aIncident: TMachineOverviewIncident; const aConfig: TMachineOverviewEvidenceConfig);
     procedure AddGap(const aStart, aEnd: TDateTime; const aReason: TMachineOverviewEvidenceGapReason);
@@ -118,9 +136,9 @@ type
   TEvidenceRecorderState = class
   public
     Config: TMachineOverviewEvidenceConfig;
-    Ring: array[0..511] of TEvidenceSample;
+    Ring: array[0..1023] of TEvidenceSample;
     RingFirst, RingCount: Integer;
-    LastProcessUtc, LastSystemUtc, LatestUtc: TDateTime;
+    LastProcessUtc, LastSystemUtc, LastDiskUtc, LatestUtc: TDateTime;
     Entries: TObjectList<TEvidenceIncident>;
     Ready: TList<TMachineOverviewIncidentChange>;
     FinalizedKeys: THashSet<string>;
@@ -172,6 +190,27 @@ resourcestring
   rsEvidenceProcess = 'Process';
   rsEvidenceApplication = 'Application';
   rsEvidenceGap = 'Gap';
+  rsEvidenceMemory = 'Memory';
+  rsEvidenceDisk = 'Disk';
+  rsEvidenceMultipleDisks = 'Multiple busiest disks';
+  rsEvidenceUnknownDisk = 'Unknown disk';
+  rsEvidenceProcessRam = 'Process RAM';
+  rsEvidenceProcessIo = 'Process I/O';
+  rsEvidencePhysicalUsed = 'Physical used';
+  rsEvidenceCommit = 'Commit';
+  rsEvidencePaging = 'Paging';
+  rsEvidenceActive = 'Active';
+  rsEvidenceLatency = 'Latency';
+  rsEvidenceQueue = 'Queue';
+  rsEvidenceThroughput = 'Throughput';
+  rsEvidenceMeasuredIo = 'Measured process I/O';
+  rsEvidencePrivate = '%s private';
+  rsEvidenceGrowth = '%s; grew %s';
+  rsEvidenceIoBytes = '%s; transferred %s';
+  rsEvidenceResourceMeasurement = 'RAM is each process''s private bytes at each %d ms process sample, ' +
+    'from the 10 largest per sample; growth is the last minus the first value in the phase. ' +
+    'I/O is read+write bytes per second from process I/O counters (file, network and device I/O). ' +
+    'Paging and memory-mapped file reads are not attributed to processes. Disk values are for the busiest disk.';
   rsEvidenceCpu = 'CPU';
   rsEvidenceDpc = 'DPC';
   rsEvidenceInterrupt = 'Interrupt';
@@ -279,6 +318,114 @@ begin
     Result.Measured := Format(rsEvidenceSampleCount, [aPhase.SystemSampleCount, aPhase.ExpectedSystemSampleCount]);
 end;
 
+function EvidenceBytes(const aValue: Double; const aRate: Boolean): string;
+begin
+  if Abs(aValue) >= 1073741824 then
+    Result := FormatFloat('0.0', aValue / 1073741824, TFormatSettings.Invariant) + ' GB'
+  else if Abs(aValue) >= 1048576 then
+    Result := FormatFloat('0.0', aValue / 1048576, TFormatSettings.Invariant) + ' MB'
+  else if Abs(aValue) >= 1024 then
+    Result := FormatFloat('0.0', aValue / 1024, TFormatSettings.Invariant) + ' KB'
+  else
+    Result := FormatFloat('0.0', aValue, TFormatSettings.Invariant) + ' B';
+  if aRate then
+    Result := Result + '/s';
+end;
+
+function ResourceStatisticRow(const aPhase: TMachineOverviewEvidencePhase;
+  const aKind, aName, aUnit: string; const aValue: TMachineOverviewEvidenceStatistic;
+  const aExport: Boolean; const aUtcToLocal: TFunc<TDateTime, TDateTime>): TMachineOverviewEvidenceRow;
+begin
+  Result := Default(TMachineOverviewEvidenceRow);
+  Result.Phase := EvidencePhaseText(aPhase.Kind);
+  Result.Kind := aKind;
+  Result.Name := aName;
+  Result.Average := rsEvidenceNoMeasurementRow;
+  if aValue.Available then
+  begin
+    Result.Average := FormatFloat('0.0', aValue.Average, TFormatSettings.Invariant) + aUnit;
+    Result.Peak := FormatFloat('0.0', aValue.Peak, TFormatSettings.Invariant) + aUnit;
+    if not aValue.PeakSourceName.IsEmpty then
+      Result.Peak := Result.Peak + ' (' + aValue.PeakSourceName + ')';
+    Result.PeakTime := EvidenceRowTime(aValue.PeakAtUtc, aExport, aUtcToLocal);
+  end;
+end;
+
+procedure AddResourceEvidenceRows(const aRows: TList<TMachineOverviewEvidenceRow>;
+  const aEvidence: TMachineOverviewIncidentEvidence; const aPhase: TMachineOverviewEvidencePhase;
+  const aExport: Boolean; const aUtcToLocal: TFunc<TDateTime, TDateTime>);
+var
+  lResource: TMachineOverviewResourceKind;
+  lItems: TArray<TMachineOverviewResourceContribution>;
+  lItem: TMachineOverviewResourceContribution;
+  lRow: TMachineOverviewEvidenceRow;
+  lStartUtc, lIncidentUtc: TDateTime;
+  lIdentity: string;
+begin
+  if TMachineOverviewResourceKind.Ram in aEvidence.Resources then
+  begin
+    aRows.Add(ResourceStatisticRow(aPhase, rsEvidenceMemory, rsEvidencePhysicalUsed, '%', aPhase.PhysicalUsed, aExport, aUtcToLocal));
+    aRows.Add(ResourceStatisticRow(aPhase, rsEvidenceMemory, rsEvidenceCommit, '%', aPhase.Commit, aExport, aUtcToLocal));
+    aRows.Add(ResourceStatisticRow(aPhase, rsEvidenceMemory, rsEvidencePaging, ' MB/s', aPhase.Paging, aExport, aUtcToLocal));
+  end;
+  if TMachineOverviewResourceKind.Io in aEvidence.Resources then
+  begin
+    var lDiskName := aPhase.DiskName;
+    if lDiskName.IsEmpty then
+      lDiskName := aEvidence.DiskName; // Our earlier v2 payloads have only the incident-wide name.
+    aRows.Add(ResourceStatisticRow(aPhase, rsEvidenceDisk, lDiskName + ' ' + rsEvidenceActive, '%', aPhase.DiskActive, aExport, aUtcToLocal));
+    aRows.Add(ResourceStatisticRow(aPhase, rsEvidenceDisk, lDiskName + ' ' + rsEvidenceLatency, ' ms', aPhase.DiskLatency, aExport, aUtcToLocal));
+    aRows.Add(ResourceStatisticRow(aPhase, rsEvidenceDisk, lDiskName + ' ' + rsEvidenceQueue, '', aPhase.DiskQueue, aExport, aUtcToLocal));
+    aRows.Add(ResourceStatisticRow(aPhase, rsEvidenceDisk, lDiskName + ' ' + rsEvidenceThroughput, ' MB/s', aPhase.DiskThroughput, aExport, aUtcToLocal));
+    aRows.Add(ResourceStatisticRow(aPhase, rsEvidenceDisk, rsEvidenceMeasuredIo, ' MB/s', aPhase.MeasuredProcessIo, aExport, aUtcToLocal));
+  end;
+  for lResource := Low(lResource) to High(lResource) do
+  begin
+    if not (lResource in aEvidence.Resources) then
+      Continue;
+    if lResource = TMachineOverviewResourceKind.Ram then
+      lItems := aPhase.RamProcesses
+    else
+      lItems := aPhase.IoProcesses;
+    for lItem in lItems do
+    begin
+      lRow := Default(TMachineOverviewEvidenceRow);
+      lRow.Phase := EvidencePhaseText(aPhase.Kind);
+      lRow.Kind := rsEvidenceProcessRam;
+      if lResource = TMachineOverviewResourceKind.Io then
+        lRow.Kind := rsEvidenceProcessIo;
+      lRow.Name := lItem.DisplayName;
+      lStartUtc := EncodeDate(1601, 1, 1) + lItem.CreationTime100ns / 864000000000.0;
+      if aExport then
+        lRow.Identity := Format(rsEvidenceProcessIdentity, [lItem.ProcessId,
+          EvidenceRowTime(lStartUtc, True, aUtcToLocal), EvidenceRowTime(lItem.LastSeenUtc, True, aUtcToLocal),
+          lItem.ImagePath])
+      else
+      begin
+        lIdentity := EvidenceRowTime(lStartUtc, False, aUtcToLocal);
+        lIncidentUtc := aEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].StartUtc;
+        if Trunc(TTimeZone.Local.ToLocalTime(lStartUtc)) <> Trunc(TTimeZone.Local.ToLocalTime(lIncidentUtc)) then
+          lIdentity := FormatDateTime('yyyy-mm-dd', TTimeZone.Local.ToLocalTime(lStartUtc), TFormatSettings.Invariant) +
+            ' ' + lIdentity;
+        lRow.Identity := Format(rsEvidenceProcessListIdentity, [lItem.ProcessId, lIdentity]);
+      end;
+      lRow.PeakTime := EvidenceRowTime(lItem.PeakAtUtc, aExport, aUtcToLocal);
+      lRow.Measured := Format(rsEvidenceSampleCount, [lItem.SampleCount, aPhase.ExpectedProcessSampleCount]);
+      if lResource = TMachineOverviewResourceKind.Ram then
+      begin
+        lRow.Average := Format(rsEvidencePrivate, [EvidenceBytes(lItem.AverageValue, False)]);
+        lRow.Peak := Format(rsEvidencePrivate, [EvidenceBytes(lItem.PeakValue, False)]);
+        lRow.Measured := Format(rsEvidenceGrowth, [lRow.Measured, EvidenceBytes(lItem.LastValue - lItem.FirstValue, False)]);
+      end else begin
+        lRow.Average := EvidenceBytes(lItem.AverageValue, True);
+        lRow.Peak := EvidenceBytes(lItem.PeakValue, True);
+        lRow.Measured := Format(rsEvidenceIoBytes, [lRow.Measured, EvidenceBytes(lItem.TotalBytes, False)]);
+      end;
+      aRows.Add(lRow);
+    end;
+  end;
+end;
+
 function BuildEvidenceRows(const aEvidence: TMachineOverviewIncidentEvidence; const aExport: Boolean;
   const aUtcToLocal: TFunc<TDateTime, TDateTime>):
   TArray<TMachineOverviewEvidenceRow>;
@@ -306,6 +453,8 @@ begin
       lPhase.Kind := lKind;
       if lPhase.StartUtc <= 0 then
         Continue;
+      if aEvidence.Resources <> [] then
+        AddResourceEvidenceRows(lRows, aEvidence, lPhase, aExport, aUtcToLocal);
       lRows.Add(EvidenceStatisticRow(lPhase, rsEvidenceCpu, lPhase.SystemCpu, False, aExport, aUtcToLocal));
       lRows.Add(EvidenceStatisticRow(lPhase, rsEvidenceDpc, lPhase.Dpc, False, aExport, aUtcToLocal));
       lRows.Add(EvidenceStatisticRow(lPhase, rsEvidenceInterrupt, lPhase.Interrupt, False, aExport, aUtcToLocal));
@@ -423,6 +572,8 @@ begin
       EvidenceNumber(100 / aEvidence.LogicalProcessorCount), aEvidence.ProcessIntervalMs, aEvidence.SystemIntervalMs]))
   else
     lLines.Add(rsEvidenceNoMeasurement);
+  if aEvidence.Resources <> [] then
+    lLines.Add(Format(rsEvidenceResourceMeasurement, [aEvidence.ProcessIntervalMs]));
   lRows := BuildEvidenceRows(aEvidence, True, aUtcToLocal);
   for lKind in cEvidenceDisplayPhases do
   begin
@@ -508,7 +659,8 @@ begin
     Result.Value := lValue.Value;
 end;
 
-procedure TEvidenceTotal.Add(const aValue: Double; const aWeight: Double; const aAtUtc: TDateTime);
+procedure TEvidenceTotal.Add(const aValue: Double; const aWeight: Double; const aAtUtc: TDateTime;
+  const aPeakSourceName: string);
 begin
   if (aWeight <= 0) or IsNan(aValue) or IsInfinite(aValue) then
     Exit;
@@ -518,6 +670,7 @@ begin
   begin
     Value.Peak := aValue;
     Value.PeakAtUtc := aAtUtc;
+    Value.PeakSourceName := aPeakSourceName;
   end;
   Value.Available := True;
 end;
@@ -527,6 +680,103 @@ begin
   Result := Value;
   if Weight > 0 then
     Result.Average := Sum / Weight;
+end;
+
+procedure TResourceAccumulator.Add(const aValue: TMachineOverviewResourceContribution;
+  const aWeight: Double; const aIo: Boolean; var aTruncated: Boolean);
+var
+  i, n, lLowest: Integer;
+  lScore, lLowestScore: Double;
+begin
+  n := -1;
+  lLowest := 0;
+  lLowestScore := MaxDouble;
+  for i := 0 to Count - 1 do
+  begin
+    if (Items[i].ProcessId = aValue.ProcessId) and (Items[i].CreationTime100ns = aValue.CreationTime100ns) then
+      n := i;
+    lScore := Items[i].PeakValue;
+    if aIo then
+      lScore := Items[i].TotalBytes;
+    if lScore < lLowestScore then
+    begin
+      lLowest := i;
+      lLowestScore := lScore;
+    end;
+  end;
+  if n < 0 then
+  begin
+    if Count < Length(Items) then
+    begin
+      n := Count;
+      Inc(Count);
+    end else begin
+      aTruncated := True;
+      lScore := aValue.PeakValue;
+      if aIo then
+        lScore := aValue.AverageValue * aWeight / 1000;
+      if lScore <= lLowestScore then
+        Exit;
+      n := lLowest;
+    end;
+    Items[n] := aValue;
+    Items[n].AverageValue := 0;
+    Items[n].TotalBytes := 0;
+    Items[n].SampleCount := 0;
+    Items[n].FirstValue := aValue.AverageValue;
+  end;
+  Items[n].AverageValue := Items[n].AverageValue + aValue.AverageValue;
+  Items[n].TotalBytes := Items[n].TotalBytes + aValue.AverageValue * aWeight / 1000;
+  if aValue.PeakValue > Items[n].PeakValue then
+  begin
+    Items[n].PeakValue := aValue.PeakValue;
+    Items[n].PeakAtUtc := aValue.PeakAtUtc;
+  end;
+  Items[n].LastValue := aValue.AverageValue;
+  Items[n].LastSeenUtc := aValue.LastSeenUtc;
+  Inc(Items[n].SampleCount);
+end;
+
+function TResourceAccumulator.Snapshot(const aWeight: Double; const aMaximum: Integer;
+  const aIo: Boolean): TArray<TMachineOverviewResourceContribution>;
+var
+  i, j: Integer;
+  lItem: TMachineOverviewResourceContribution;
+  lScore, lOther: Double;
+begin
+  SetLength(Result, Count);
+  for i := 0 to Count - 1 do
+  begin
+    Result[i] := Items[i];
+    if aIo then
+    begin
+      if aWeight > 0 then
+        Result[i].AverageValue := Items[i].TotalBytes * 1000 / aWeight;
+    end else
+      Result[i].AverageValue := Items[i].AverageValue / Items[i].SampleCount;
+  end;
+  for i := 1 to High(Result) do
+  begin
+    lItem := Result[i];
+    lScore := lItem.PeakValue;
+    if aIo then
+      lScore := lItem.TotalBytes;
+    j := i - 1;
+    while j >= 0 do
+    begin
+      lOther := Result[j].PeakValue;
+      if aIo then
+        lOther := Result[j].TotalBytes;
+      if (lOther > lScore) or ((lOther = lScore) and
+        ((Result[j].ProcessId < lItem.ProcessId) or ((Result[j].ProcessId = lItem.ProcessId) and
+        (Result[j].CreationTime100ns <= lItem.CreationTime100ns)))) then
+        Break;
+      Result[j + 1] := Result[j];
+      Dec(j);
+    end;
+    Result[j + 1] := lItem;
+  end;
+  SetLength(Result, Min(aMaximum, Length(Result)));
 end;
 
 procedure TEvidencePhaseAccumulator.AddProcess(const aValue: TMachineOverviewProcessContribution;
@@ -608,19 +858,51 @@ begin
   end;
 end;
 
-procedure TEvidencePhaseAccumulator.Add(const aSample: TEvidenceSample; var aTruncated: Boolean);
+procedure TEvidencePhaseAccumulator.Add(const aSample: TEvidenceSample; var aTruncated: Boolean;
+  const aRam, aIo: Boolean);
 var
   i: Integer;
 begin
   if not aSample.Available then
     Exit;
+  if aSample.IsDisk then
+  begin
+    if not (aSample.DiskActive.Available or aSample.DiskLatency.Available or
+      aSample.DiskQueue.Available or aSample.DiskThroughput.Available) then
+      Exit;
+    if not HasDisk then
+    begin
+      HasDisk := True;
+      DiskIdentity := aSample.DiskIdentity;
+      Value.DiskName := aSample.DiskName;
+    end else if DiskIdentity <> aSample.DiskIdentity then
+      Value.DiskName := rsEvidenceMultipleDisks;
+    if aSample.DiskActive.Available then
+      DiskActive.Add(aSample.DiskActive.Value, 1, aSample.AtUtc, aSample.DiskName);
+    if aSample.DiskLatency.Available then
+      DiskLatency.Add(aSample.DiskLatency.Value, 1, aSample.AtUtc, aSample.DiskName);
+    if aSample.DiskQueue.Available then
+      DiskQueue.Add(aSample.DiskQueue.Value, 1, aSample.AtUtc, aSample.DiskName);
+    if aSample.DiskThroughput.Available then
+      DiskThroughput.Add(aSample.DiskThroughput.Value, 1, aSample.AtUtc, aSample.DiskName);
+    Exit;
+  end;
   if aSample.IsProcess then
   begin
-    if (aSample.IntervalMs = 0) or not aSample.Cpu.Available then
+    if aSample.IntervalMs = 0 then
       Exit;
     Inc(Value.ProcessSampleCount);
     ProcessWeight := ProcessWeight + aSample.IntervalMs;
-    Measured.Add(aSample.Cpu.Value, aSample.IntervalMs, aSample.AtUtc);
+    if aSample.Cpu.Available then
+      Measured.Add(aSample.Cpu.Value, aSample.IntervalMs, aSample.AtUtc);
+    if aSample.MeasuredIo.Available then
+      MeasuredIo.Add(aSample.MeasuredIo.Value, aSample.IntervalMs, aSample.AtUtc);
+    if aRam then
+      for i := 0 to High(aSample.RamProcesses) do
+        Ram.Add(aSample.RamProcesses[i], aSample.IntervalMs, False, aTruncated);
+    if aIo then
+      for i := 0 to High(aSample.IoProcesses) do
+        Io.Add(aSample.IoProcesses[i], aSample.IntervalMs, True, aTruncated);
     if aSample.Residual.Available then
       Residual.Add(aSample.Residual.Value, aSample.IntervalMs, aSample.AtUtc);
     for i := 0 to aSample.ProcessCount - 1 do
@@ -628,6 +910,12 @@ begin
     for i := 0 to aSample.ApplicationCount - 1 do
       AddApplication(aSample.Applications[i], aSample.IntervalMs, aTruncated);
   end else begin
+    if aSample.PhysicalUsed.Available then
+      PhysicalUsed.Add(aSample.PhysicalUsed.Value, 1, aSample.AtUtc);
+    if aSample.Commit.Available then
+      Commit.Add(aSample.Commit.Value, 1, aSample.AtUtc);
+    if aSample.Paging.Available then
+      Paging.Add(aSample.Paging.Value, 1, aSample.AtUtc);
     if aSample.Cpu.Available then
     begin
       Inc(Value.SystemSampleCount);
@@ -689,6 +977,16 @@ begin
   if Value.Kind = TMachineOverviewEvidencePhaseKind.During then
     lMaximum := 10;
   SetLength(Result.Processes, Min(lMaximum, Length(Result.Processes)));
+  Result.RamProcesses := Ram.Snapshot(ProcessWeight, lMaximum, False);
+  Result.IoProcesses := Io.Snapshot(ProcessWeight, lMaximum, True);
+  Result.PhysicalUsed := PhysicalUsed.Snapshot;
+  Result.Commit := Commit.Snapshot;
+  Result.Paging := Paging.Snapshot;
+  Result.DiskActive := DiskActive.Snapshot;
+  Result.DiskLatency := DiskLatency.Snapshot;
+  Result.DiskQueue := DiskQueue.Snapshot;
+  Result.DiskThroughput := DiskThroughput.Snapshot;
+  Result.MeasuredProcessIo := MeasuredIo.Snapshot;
   SetLength(Result.Applications, ApplicationCount);
   for i := 0 to ApplicationCount - 1 do
   begin
@@ -721,6 +1019,14 @@ begin
   Headline.Evidence := Default(TMachineOverviewIncidentEvidence);
   Config := aConfig;
   Value.State := TMachineOverviewEvidenceState.Collecting;
+  case aIncident.Category of
+    TMachineOverviewIncidentCategory.MemoryPressure: Value.Resources := [TMachineOverviewResourceKind.Ram];
+    TMachineOverviewIncidentCategory.DiskPressure: Value.Resources := [TMachineOverviewResourceKind.Io];
+    TMachineOverviewIncidentCategory.UserMarked:
+      Value.Resources := [TMachineOverviewResourceKind.Ram, TMachineOverviewResourceKind.Io];
+  else
+    Value.Resources := [];
+  end;
   Value.ProcessIntervalMs := Config.ProcessIntervalMs;
   Value.SystemIntervalMs := Config.SystemIntervalMs;
   LatestUtc := aIncident.StartedAtUtc;
@@ -777,12 +1083,19 @@ procedure TEvidenceIncident.Observe(const aSample: TEvidenceSample);
 var
   lKind: TMachineOverviewEvidencePhaseKind;
   lExpected: Cardinal;
+  lStream: Integer;
 begin
+  if aSample.IsDisk and not (TMachineOverviewResourceKind.Io in Value.Resources) then
+    Exit;
   if aSample.AtUtc < Phases[TMachineOverviewEvidencePhaseKind.Before].Value.StartUtc then
     Exit;
   if (Headline.EndedAtUtc > 0) and
     (aSample.AtUtc > Headline.EndedAtUtc + Config.PostWindowMs / cDayMs + 0.5 / cDayMs) then
     Exit;
+  // Our window guards precede every incident metadata or accumulator update.
+  lStream := Ord(aSample.IsProcess);
+  if aSample.IsDisk then
+    lStream := 2;
   LatestUtc := Max(LatestUtc, aSample.AtUtc);
   lKind := TMachineOverviewEvidencePhaseKind.Before;
   if aSample.AtUtc >= Headline.StartedAtUtc then
@@ -805,23 +1118,26 @@ begin
       AddGap(aSample.PreviousUtc + lExpected / cDayMs, aSample.AtUtc,
         TMachineOverviewEvidenceGapReason.SystemSamplesMissing);
   end;
-  if not aSample.Available or not aSample.Cpu.Available then
+  if not aSample.Available or (not aSample.IsDisk and not aSample.Cpu.Available) then
     AddGap(aSample.AtUtc - lExpected / cDayMs, aSample.AtUtc,
       TMachineOverviewEvidenceGapReason.ProviderUnavailable);
   Value.LogicalProcessorCount := Max(Value.LogicalProcessorCount, aSample.LogicalProcessors);
   Value.InaccessibleProcessCountMax := Max(Value.InaccessibleProcessCountMax, aSample.Inaccessible);
-  Value.Truncated := Value.Truncated or aSample.Truncated;
-  if HasPending[aSample.IsProcess] then
+  Value.Truncated := Value.Truncated or aSample.Truncated or
+    ((TMachineOverviewResourceKind.Ram in Value.Resources) and aSample.RamTruncated) or
+    ((TMachineOverviewResourceKind.Io in Value.Resources) and aSample.IoTruncated);
+  if HasPending[lStream] then
   begin
     lKind := TMachineOverviewEvidencePhaseKind.Before;
-    if Pending[aSample.IsProcess].AtUtc >= Headline.StartedAtUtc then
+    if Pending[lStream].AtUtc >= Headline.StartedAtUtc then
       lKind := TMachineOverviewEvidencePhaseKind.During;
-    if (Headline.EndedAtUtc > 0) and (Pending[aSample.IsProcess].AtUtc >= Headline.EndedAtUtc) then
+    if (Headline.EndedAtUtc > 0) and (Pending[lStream].AtUtc >= Headline.EndedAtUtc) then
       lKind := TMachineOverviewEvidencePhaseKind.After;
-    Phases[lKind].Add(Pending[aSample.IsProcess], Value.Truncated);
+    Phases[lKind].Add(Pending[lStream], Value.Truncated,
+      TMachineOverviewResourceKind.Ram in Value.Resources, TMachineOverviewResourceKind.Io in Value.Resources);
   end;
-  Pending[aSample.IsProcess] := aSample;
-  HasPending[aSample.IsProcess] := True;
+  Pending[lStream] := aSample;
+  HasPending[lStream] := True;
 end;
 
 function TEvidenceIncident.Snapshot(const aState: TMachineOverviewEvidenceState): TMachineOverviewIncidentEvidence;
@@ -829,18 +1145,19 @@ var
   lEnd: TDateTime;
   lPhases: TEvidencePhaseAccumulators;
   lKind: TMachineOverviewEvidencePhaseKind;
-  lProcess: Boolean;
+  lStream: Integer;
 begin
   lPhases := Phases;
-  for lProcess := False to True do
-    if HasPending[lProcess] then
+  for lStream := 0 to 2 do
+    if HasPending[lStream] then
     begin
       lKind := TMachineOverviewEvidencePhaseKind.Before;
-      if Pending[lProcess].AtUtc >= Headline.StartedAtUtc then
+      if Pending[lStream].AtUtc >= Headline.StartedAtUtc then
         lKind := TMachineOverviewEvidencePhaseKind.During;
-      if (Headline.EndedAtUtc > 0) and (Pending[lProcess].AtUtc >= Headline.EndedAtUtc) then
+      if (Headline.EndedAtUtc > 0) and (Pending[lStream].AtUtc >= Headline.EndedAtUtc) then
         lKind := TMachineOverviewEvidencePhaseKind.After;
-      lPhases[lKind].Add(Pending[lProcess], Value.Truncated);
+      lPhases[lKind].Add(Pending[lStream], Value.Truncated,
+      TMachineOverviewResourceKind.Ram in Value.Resources, TMachineOverviewResourceKind.Io in Value.Resources);
     end;
   if Value.Truncated then
     AddGap(Headline.StartedAtUtc, LatestUtc, TMachineOverviewEvidenceGapReason.Truncated);
@@ -860,6 +1177,35 @@ begin
     lEnd := Min(LatestUtc, lEnd + Config.PostWindowMs / cDayMs);
   Result.Phases[TMachineOverviewEvidencePhaseKind.After] :=
     lPhases[TMachineOverviewEvidencePhaseKind.After].Snapshot(lEnd, Config.ProcessIntervalMs, Config.SystemIntervalMs);
+  Result.DiskName := '';
+  for lKind := Low(lKind) to High(lKind) do
+  begin
+    if TMachineOverviewResourceKind.Io in Result.Resources then
+    begin
+      if not Result.Phases[lKind].DiskName.IsEmpty then
+        if Result.DiskName.IsEmpty then
+          Result.DiskName := Result.Phases[lKind].DiskName
+        else if Result.DiskName <> Result.Phases[lKind].DiskName then
+          Result.DiskName := rsEvidenceMultipleDisks;
+    end else
+      Result.Phases[lKind].DiskName := '';
+    if not (TMachineOverviewResourceKind.Ram in Result.Resources) then
+    begin
+      Result.Phases[lKind].RamProcesses := nil;
+      Result.Phases[lKind].PhysicalUsed := Default(TMachineOverviewEvidenceStatistic);
+      Result.Phases[lKind].Commit := Default(TMachineOverviewEvidenceStatistic);
+      Result.Phases[lKind].Paging := Default(TMachineOverviewEvidenceStatistic);
+    end;
+    if not (TMachineOverviewResourceKind.Io in Result.Resources) then
+    begin
+      Result.Phases[lKind].IoProcesses := nil;
+      Result.Phases[lKind].DiskActive := Default(TMachineOverviewEvidenceStatistic);
+      Result.Phases[lKind].DiskLatency := Default(TMachineOverviewEvidenceStatistic);
+      Result.Phases[lKind].DiskQueue := Default(TMachineOverviewEvidenceStatistic);
+      Result.Phases[lKind].DiskThroughput := Default(TMachineOverviewEvidenceStatistic);
+      Result.Phases[lKind].MeasuredProcessIo := Default(TMachineOverviewEvidenceStatistic);
+    end;
+  end;
 end;
 
 constructor TEvidenceRecorderState.Create(const aConfig: TMachineOverviewEvidenceConfig);
@@ -883,6 +1229,61 @@ begin
   inherited;
 end;
 
+function ResourceMeasurement(const aSample: TMachineOverviewProviderSample;
+  const aName: string; const aDivisor: Double = 1; const aEntity: string = ''): TMachineOverviewOptionalDouble;
+var
+  lMeasurement: TMachineOverviewMeasurement;
+begin
+  Result := Default(TMachineOverviewOptionalDouble);
+  for lMeasurement in aSample.Measurements do
+    if (lMeasurement.Name = aName) and ((aEntity = '') or (lMeasurement.EntityId = aEntity)) then
+    begin
+      Result.Available := lMeasurement.Available and not IsNan(lMeasurement.Value) and
+        not IsInfinite(lMeasurement.Value) and (lMeasurement.Value >= 0) and (lMeasurement.Value <= 1E18);
+      if Result.Available then
+        Result.Value := lMeasurement.Value / aDivisor;
+      Exit;
+    end;
+end;
+
+function CompactResourceProcesses(const aSample: TMachineOverviewProviderSample; const aPrefix: string;
+  var aTruncated: Boolean): TArray<TMachineOverviewResourceContribution>;
+var
+  i, n, lColon: Integer;
+  lMeasurement: TMachineOverviewMeasurement;
+  lItem: TMachineOverviewResourceContribution;
+  lPid: Cardinal;
+  lCreation: UInt64;
+begin
+  Result := nil;
+  for i := 1 to 10 do
+    if FindMeasurement(aSample, aPrefix + IntToStr(i), lMeasurement) and
+      (lMeasurement.Value >= 0) and (lMeasurement.Value <= 1E18) then
+    begin
+      lItem := Default(TMachineOverviewResourceContribution);
+      lColon := Pos(':', lMeasurement.EntityId);
+      if (lColon < 2) or not TryStrToUInt(Copy(lMeasurement.EntityId, 1, lColon - 1), lPid) or
+        not TryStrToUInt64(Copy(lMeasurement.EntityId, lColon + 1), lCreation) then
+        Continue;
+      lItem.ProcessId := lPid;
+      lItem.CreationTime100ns := lCreation;
+      lItem.DisplayName := EvidenceTextPrefix(lMeasurement.DisplayText, 256);
+      lItem.ImagePath := EvidenceTextPrefix(lMeasurement.DetailText, 1024);
+      lItem.PathStatus := EvidenceTextPrefix(lMeasurement.StatusText, 64);
+      aTruncated := aTruncated or (Length(lMeasurement.DisplayText) > 256) or
+        (Length(lMeasurement.DetailText) > 1024) or (Length(lMeasurement.StatusText) > 64);
+      lItem.AverageValue := lMeasurement.Value;
+      lItem.PeakValue := lMeasurement.Value;
+      lItem.FirstValue := lMeasurement.Value;
+      lItem.LastValue := lMeasurement.Value;
+      lItem.PeakAtUtc := aSample.State.CapturedAtUtc;
+      lItem.LastSeenUtc := aSample.State.CapturedAtUtc;
+      n := Length(Result);
+      SetLength(Result, n + 1);
+      Result[n] := lItem;
+    end;
+end;
+
 function TEvidenceRecorderState.Compact(const aSample: TMachineOverviewProviderSample): TEvidenceSample;
 var
   i, n, lColon: Integer;
@@ -895,9 +1296,39 @@ begin
   Result := Default(TEvidenceSample);
   Result.AtUtc := aSample.State.CapturedAtUtc;
   Result.IsProcess := aSample.State.ProviderId = 'processes';
+  Result.IsDisk := aSample.State.ProviderId = 'disks';
   Result.Available := aSample.State.Status = TMachineOverviewProviderStatus.Available;
+  if Result.IsDisk then
+  begin
+    Result.PreviousUtc := LastDiskUtc;
+    LastDiskUtc := Result.AtUtc;
+    if FindMeasurement(aSample, 'disk_worst', lMeasurement) then
+    begin
+      Result.DiskIdentity := EvidenceTextPrefix(lMeasurement.EntityId, 256);
+      Result.DiskName := EvidenceTextPrefix(lMeasurement.DisplayText, 256);
+      if Result.DiskName.IsEmpty then
+        Result.DiskName := Result.DiskIdentity;
+      if Result.DiskName.IsEmpty then
+        Result.DiskName := rsEvidenceUnknownDisk;
+      if Result.DiskIdentity.IsEmpty then
+        Result.DiskIdentity := Result.DiskName;
+      Result.Truncated := (Length(lMeasurement.DisplayText) > 256) or (Length(lMeasurement.EntityId) > 256);
+      Result.DiskActive := ResourceMeasurement(aSample, 'disk_active_percent', 1, lMeasurement.EntityId);
+      Result.DiskLatency := ResourceMeasurement(aSample, 'disk_latency_ms', 1, lMeasurement.EntityId);
+      Result.DiskQueue := ResourceMeasurement(aSample, 'disk_queue_length', 1, lMeasurement.EntityId);
+      Result.DiskThroughput := ResourceMeasurement(aSample, 'disk_read_mb_per_sec', 1, lMeasurement.EntityId);
+      Result.Paging := ResourceMeasurement(aSample, 'disk_write_mb_per_sec', 1, lMeasurement.EntityId);
+      Result.DiskThroughput.Available := Result.DiskThroughput.Available and Result.Paging.Available;
+      Result.DiskThroughput.Value := Result.DiskThroughput.Value + Result.Paging.Value;
+      Result.Paging := Default(TMachineOverviewOptionalDouble);
+    end;
+    Exit;
+  end;
   if not Result.IsProcess then
   begin
+    Result.PhysicalUsed := OptionalMeasurement(aSample, 'physical_used_percent');
+    Result.Commit := OptionalMeasurement(aSample, 'commit_percent');
+    Result.Paging := ResourceMeasurement(aSample, 'paging_bytes_per_sec', 1048576);
     Result.PreviousUtc := LastSystemUtc;
     LastSystemUtc := Result.AtUtc;
     Result.Cpu := OptionalMeasurement(aSample, 'cpu_total_percent');
@@ -916,6 +1347,9 @@ begin
   if FindMeasurement(aSample, 'process_access_denied_count', lMeasurement) then
     Result.Inaccessible := Round(EnsureRange(lMeasurement.Value, 0.0, MaxInt * 1.0));
   Result.Cpu := OptionalMeasurement(aSample, 'process_cpu_measured_total_percent');
+  Result.RamProcesses := CompactResourceProcesses(aSample, 'process_ram_process:', Result.RamTruncated);
+  Result.IoProcesses := CompactResourceProcesses(aSample, 'process_io_process:', Result.IoTruncated);
+  Result.MeasuredIo := ResourceMeasurement(aSample, 'process_io_measured_total_bytes_per_second', 1048576);
   SetLength(Result.Processes, 10);
   SetLength(Result.Applications, 5);
   for i := 1 to 10 do
@@ -959,7 +1393,7 @@ begin
   for i := 0 to RingCount - 1 do
   begin
     lSample := Ring[(RingFirst + i) mod Length(Ring)];
-    if not lSample.IsProcess and lSample.Available and lSample.Cpu.Available and
+    if not lSample.IsProcess and not lSample.IsDisk and lSample.Available and lSample.Cpu.Available and
       (lSample.AtUtc > Result.AtUtc - Result.IntervalMs / cDayMs) and (lSample.AtUtc <= Result.AtUtc) then
       lTotal.Add(lSample.Cpu.Value, 1, lSample.AtUtc);
   end;
@@ -982,7 +1416,7 @@ begin
     lSample := Ring[(RingFirst + i) mod Length(Ring)];
     if lSample.IsProcess and (lFirstProcess = 0) then
       lFirstProcess := lSample.AtUtc;
-    if not lSample.IsProcess and (lFirstSystem = 0) then
+    if not lSample.IsProcess and not lSample.IsDisk and (lFirstSystem = 0) then
       lFirstSystem := lSample.AtUtc;
     // An Ended change without a tracked start has no measured During accumulator.
     if (aEntry.Headline.EndedAtUtc <= 0) or (lSample.AtUtc < aEntry.Headline.StartedAtUtc) or
@@ -1058,7 +1492,8 @@ var
   lSample: TEvidenceSample;
   lEntry: TEvidenceIncident;
 begin
-  if (aSample.State.ProviderId <> 'processes') and (aSample.State.ProviderId <> 'windows-core') then
+  if (aSample.State.ProviderId <> 'processes') and (aSample.State.ProviderId <> 'windows-core') and
+    (aSample.State.ProviderId <> 'disks') then
     Exit;
   if (aSample.State.CapturedAtUtc <= 0) or IsNan(aSample.State.CapturedAtUtc) or
     IsInfinite(aSample.State.CapturedAtUtc) then
@@ -1066,7 +1501,8 @@ begin
   lState := (fState as TEvidenceRecorderState);
   // Duplicate or backwards timestamps cannot add CPU twice or reorder our ring.
   if ((aSample.State.ProviderId = 'processes') and (aSample.State.CapturedAtUtc <= lState.LastProcessUtc)) or
-    ((aSample.State.ProviderId = 'windows-core') and (aSample.State.CapturedAtUtc <= lState.LastSystemUtc)) then
+    ((aSample.State.ProviderId = 'windows-core') and (aSample.State.CapturedAtUtc <= lState.LastSystemUtc)) or
+    ((aSample.State.ProviderId = 'disks') and (aSample.State.CapturedAtUtc <= lState.LastDiskUtc)) then
     Exit;
   lSample := lState.Compact(aSample);
   lState.LatestUtc := Max(lState.LatestUtc, lSample.AtUtc);
@@ -1166,8 +1602,8 @@ begin
     for lProcess := False to True do
     begin
       lLastUtc := lEntry.Headline.StartedAtUtc;
-      if lEntry.HasPending[lProcess] then
-        lLastUtc := Max(lLastUtc, lEntry.Pending[lProcess].AtUtc);
+      if lEntry.HasPending[Ord(lProcess)] then
+        lLastUtc := Max(lLastUtc, lEntry.Pending[Ord(lProcess)].AtUtc);
       lInterval := lState.Config.SystemIntervalMs;
       if lProcess then
         lInterval := lState.Config.ProcessIntervalMs;
@@ -1233,7 +1669,7 @@ begin
 end;
 
 procedure JsonStatistic(const aObject: TJSONObject; const aKey: string;
-  const aValue: TMachineOverviewEvidenceStatistic);
+  const aValue: TMachineOverviewEvidenceStatistic; const aPeakSource: Boolean = False);
 var
   lObject: TJSONObject;
 begin
@@ -1244,6 +1680,70 @@ begin
   JsonPercent(lObject, 'a', aValue.Average);
   JsonPercent(lObject, 'p', aValue.Peak);
   JsonInteger(lObject, 't', EvidenceUtcMs(aValue.PeakAtUtc));
+  if aPeakSource and not aValue.PeakSourceName.IsEmpty then
+    lObject.AddPair('n', aValue.PeakSourceName);
+end;
+
+procedure JsonResourceRows(const aObject: TJSONObject; const aKey: string;
+  const aItems: TArray<TMachineOverviewResourceContribution>; const aIo: Boolean);
+var
+  lRows: TJSONArray;
+  lRow: TJSONObject;
+  lItem: TMachineOverviewResourceContribution;
+begin
+  lRows := TJSONArray.Create;
+  aObject.AddPair(aKey, lRows);
+  for lItem in aItems do
+  begin
+    lRow := TJSONObject.Create;
+    lRows.AddElement(lRow);
+    JsonInteger(lRow, 'pid', lItem.ProcessId);
+    lRow.AddPair('ct', TJSONNumber.Create(UIntToStr(lItem.CreationTime100ns)));
+    lRow.AddPair('n', lItem.DisplayName);
+    lRow.AddPair('pa', lItem.ImagePath);
+    lRow.AddPair('st', lItem.PathStatus);
+    lRow.AddPair('a', TJSONNumber.Create(FormatFloat('0', lItem.AverageValue, TFormatSettings.Invariant)));
+    lRow.AddPair('p', TJSONNumber.Create(FormatFloat('0', lItem.PeakValue, TFormatSettings.Invariant)));
+    if aIo then
+      lRow.AddPair('b', TJSONNumber.Create(FormatFloat('0', lItem.TotalBytes, TFormatSettings.Invariant)))
+    else
+    begin
+      lRow.AddPair('f', TJSONNumber.Create(FormatFloat('0', lItem.FirstValue, TFormatSettings.Invariant)));
+      lRow.AddPair('l', TJSONNumber.Create(FormatFloat('0', lItem.LastValue, TFormatSettings.Invariant)));
+    end;
+    JsonInteger(lRow, 't', EvidenceUtcMs(lItem.PeakAtUtc));
+    JsonInteger(lRow, 'ls', EvidenceUtcMs(lItem.LastSeenUtc));
+    JsonInteger(lRow, 'c', lItem.SampleCount);
+  end;
+end;
+
+procedure JsonResourcePhase(const aObject: TJSONObject; const aPhase: TMachineOverviewEvidencePhase;
+  const aEvidence: TMachineOverviewIncidentEvidence);
+var
+  lObject: TJSONObject;
+begin
+  if TMachineOverviewResourceKind.Ram in aEvidence.Resources then
+  begin
+    lObject := TJSONObject.Create;
+    aObject.AddPair('mem', lObject);
+    JsonStatistic(lObject, 'pu', aPhase.PhysicalUsed);
+    JsonStatistic(lObject, 'cm', aPhase.Commit);
+    JsonStatistic(lObject, 'pg', aPhase.Paging);
+    JsonResourceRows(aObject, 'rm', aPhase.RamProcesses, False);
+  end;
+  if TMachineOverviewResourceKind.Io in aEvidence.Resources then
+  begin
+    lObject := TJSONObject.Create;
+    aObject.AddPair('dk', lObject);
+    if not aPhase.DiskName.IsEmpty then
+      lObject.AddPair('dn', aPhase.DiskName);
+    JsonStatistic(lObject, 'ac', aPhase.DiskActive, True);
+    JsonStatistic(lObject, 'lt', aPhase.DiskLatency, True);
+    JsonStatistic(lObject, 'q', aPhase.DiskQueue, True);
+    JsonStatistic(lObject, 'tp', aPhase.DiskThroughput, True);
+    JsonStatistic(aObject, 'mio', aPhase.MeasuredProcessIo);
+    JsonResourceRows(aObject, 'io', aPhase.IoProcesses, True);
+  end;
 end;
 
 function EncodeEvidence(const aEvidence: TMachineOverviewIncidentEvidence): string;
@@ -1259,7 +1759,19 @@ var
 begin
   g := Default(TGarbos);
   GC(lRoot, TJSONObject.Create, g);
-  JsonInteger(lRoot, 'v', 1);
+  if aEvidence.Resources = [] then
+    JsonInteger(lRoot, 'v', 1)
+  else
+  begin
+    JsonInteger(lRoot, 'v', 2);
+    lRows := TJSONArray.Create;
+    lRoot.AddPair('rs', lRows);
+    if TMachineOverviewResourceKind.Ram in aEvidence.Resources then
+      lRows.Add('ram');
+    if TMachineOverviewResourceKind.Io in aEvidence.Resources then
+      lRows.Add('io');
+    lRoot.AddPair('dn', aEvidence.DiskName);
+  end;
   JsonInteger(lRoot, 'lp', aEvidence.LogicalProcessorCount);
   JsonInteger(lRoot, 'pms', aEvidence.ProcessIntervalMs);
   JsonInteger(lRoot, 'sms', aEvidence.SystemIntervalMs);
@@ -1285,6 +1797,8 @@ begin
     JsonStatistic(lObject, 'irq', lPhase.Interrupt);
     JsonStatistic(lObject, 'mp', lPhase.MeasuredProcessCpu);
     JsonStatistic(lObject, 'un', lPhase.UnattributedCpu);
+    if aEvidence.Resources <> [] then
+      JsonResourcePhase(lObject, lPhase, aEvidence);
     lRows := TJSONArray.Create;
     lObject.AddPair('pr', lRows);
     for lProcess in lPhase.Processes do
@@ -1332,7 +1846,9 @@ function MachineOverviewEvidenceToJson(const aEvidence: TMachineOverviewIncident
 var
   lEvidence: TMachineOverviewIncidentEvidence;
   lKind: TMachineOverviewEvidencePhaseKind;
-  i, lStep: Integer;
+  i, j, lStep, lAction: Integer;
+  lResource: TMachineOverviewResourceKind;
+  lItems: TArray<TMachineOverviewResourceContribution>;
 begin
   lEvidence := aEvidence;
   // Our copy must own every dynamic array before applying the serialization budget.
@@ -1347,18 +1863,73 @@ begin
     i := 5;
     if lKind = TMachineOverviewEvidencePhaseKind.During then
       i := 10;
+    lEvidence.Phases[lKind].RamProcesses := Copy(aEvidence.Phases[lKind].RamProcesses, 0, i);
+    lEvidence.Phases[lKind].IoProcesses := Copy(aEvidence.Phases[lKind].IoProcesses, 0, i);
+    lEvidence.Truncated := lEvidence.Truncated or (Length(aEvidence.Phases[lKind].RamProcesses) > i) or
+      (Length(aEvidence.Phases[lKind].IoProcesses) > i);
     lEvidence.Phases[lKind].Processes := Copy(aEvidence.Phases[lKind].Processes, 0, i);
     lEvidence.Phases[lKind].Applications := Copy(aEvidence.Phases[lKind].Applications, 0, 5);
     lEvidence.Truncated := lEvidence.Truncated or (Length(aEvidence.Phases[lKind].Processes) > i) or
       (Length(aEvidence.Phases[lKind].Applications) > 5);
   end;
-  for lStep := 0 to 7 do
+  for lStep := 0 to 10 do
   begin
     Result := EncodeEvidence(lEvidence);
     if TEncoding.UTF8.GetByteCount(Result) <= cMaximumJsonBytes then
       Exit;
     lEvidence.Truncated := True;
-    case lStep of
+    lAction := lStep;
+    if aEvidence.Resources <> [] then
+    begin
+      lAction := lStep - 2;
+      if lStep < 2 then
+      begin
+        lKind := TMachineOverviewEvidencePhaseKind.After;
+        if lStep = 1 then
+          lKind := TMachineOverviewEvidencePhaseKind.Before;
+        SetLength(lEvidence.Phases[lKind].RamProcesses, Min(3, Length(lEvidence.Phases[lKind].RamProcesses)));
+        SetLength(lEvidence.Phases[lKind].IoProcesses, Min(3, Length(lEvidence.Phases[lKind].IoProcesses)));
+        Continue;
+      end;
+      if lAction = 7 then
+      begin
+        SetLength(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].RamProcesses,
+          Min(5, Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].RamProcesses)));
+        SetLength(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].IoProcesses,
+          Min(5, Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.During].IoProcesses)));
+        Continue;
+      end;
+      if lAction = 5 then
+      begin
+        lEvidence.DiskName := EvidenceTextPrefix(lEvidence.DiskName, 64);
+        for lKind := Low(lKind) to High(lKind) do
+        begin
+          lEvidence.Phases[lKind].DiskName := EvidenceTextPrefix(lEvidence.Phases[lKind].DiskName, 64);
+          lEvidence.Phases[lKind].DiskActive.PeakSourceName := EvidenceTextPrefix(lEvidence.Phases[lKind].DiskActive.PeakSourceName, 64);
+          lEvidence.Phases[lKind].DiskLatency.PeakSourceName := EvidenceTextPrefix(lEvidence.Phases[lKind].DiskLatency.PeakSourceName, 64);
+          lEvidence.Phases[lKind].DiskQueue.PeakSourceName := EvidenceTextPrefix(lEvidence.Phases[lKind].DiskQueue.PeakSourceName, 64);
+          lEvidence.Phases[lKind].DiskThroughput.PeakSourceName := EvidenceTextPrefix(lEvidence.Phases[lKind].DiskThroughput.PeakSourceName, 64);
+        end;
+      end;
+      if lAction in [3, 5] then
+        for lKind := Low(lKind) to High(lKind) do
+          for lResource := Low(lResource) to High(lResource) do
+          begin
+            if lResource = TMachineOverviewResourceKind.Ram then
+              lItems := lEvidence.Phases[lKind].RamProcesses
+            else
+              lItems := lEvidence.Phases[lKind].IoProcesses;
+            for j := 0 to High(lItems) do
+              if lAction = 3 then
+                lItems[j].ImagePath := ''
+              else
+              begin
+                lItems[j].DisplayName := EvidenceTextPrefix(lItems[j].DisplayName, 64);
+                lItems[j].PathStatus := EvidenceTextPrefix(lItems[j].PathStatus, 32);
+              end;
+          end;
+    end;
+    case lAction of
       0: SetLength(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.After].Processes,
         Min(3, Length(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.After].Processes)));
       1: SetLength(lEvidence.Phases[TMachineOverviewEvidencePhaseKind.Before].Processes,
@@ -1450,7 +2021,18 @@ begin
         raise EConvertError.Create('Duplicate evidence member');
 end;
 
-function ReadStatistic(const aObject: TJSONObject; const aKey: string): TMachineOverviewEvidenceStatistic;
+function ReadResourceNumber(const aObject: TJSONObject; const aKey: string): Double;
+var
+  lValue: TJSONValue;
+begin
+  lValue := aObject.GetValue(aKey);
+  if not (lValue is TJSONNumber) or
+    not TryStrToFloat(lValue.Value, Result, TFormatSettings.Invariant) or IsNan(Result) or
+    IsInfinite(Result) or (Result < 0) or (Result > 1E30) then
+    raise EConvertError.Create('Invalid evidence resource number: ' + aKey);
+end;
+
+function ReadStatistic(const aObject: TJSONObject; const aKey: string; const aResource: Boolean = False): TMachineOverviewEvidenceStatistic;
 var
   lValue: TJSONValue;
 begin
@@ -1462,12 +2044,20 @@ begin
     raise EConvertError.Create('Invalid evidence statistic: ' + aKey);
   ValidateObject(lValue as TJSONObject);
   Result.Available := True;
-  Result.Average := ReadPercent((lValue as TJSONObject), 'a');
+  if aResource then
+    Result.Average := ReadResourceNumber((lValue as TJSONObject), 'a')
+  else
+    Result.Average := ReadPercent((lValue as TJSONObject), 'a');
   // Peak is optional for measured and residual aggregates in format v1.
   if Assigned((lValue as TJSONObject).GetValue('p')) then
-    Result.Peak := ReadPercent((lValue as TJSONObject), 'p');
+    if aResource then
+      Result.Peak := ReadResourceNumber((lValue as TJSONObject), 'p')
+    else
+      Result.Peak := ReadPercent((lValue as TJSONObject), 'p');
   if Assigned((lValue as TJSONObject).GetValue('t')) then
     Result.PeakAtUtc := ReadUtc((lValue as TJSONObject), 't');
+  if aResource and Assigned((lValue as TJSONObject).GetValue('n')) then
+    Result.PeakSourceName := ReadText((lValue as TJSONObject), 'n', 256);
 end;
 
 function ReadArray(const aObject: TJSONObject; const aKey: string; const aMaximum: Integer): TJSONArray;
@@ -1486,6 +2076,80 @@ begin
     raise EConvertError.Create('Invalid evidence row');
   Result := TJSONObject(aArray.Items[aIndex]);
   ValidateObject(Result);
+end;
+
+function ReadResourceRows(const aObject: TJSONObject; const aKey: string;
+  const aIo: Boolean): TArray<TMachineOverviewResourceContribution>;
+var
+  lArray: TJSONArray;
+  lRow: TJSONObject;
+  lCreation: TJSONValue;
+  i: Integer;
+begin
+  Result := nil;
+  if not Assigned(aObject.GetValue(aKey)) then
+    Exit;
+  lArray := ReadArray(aObject, aKey, 10);
+  SetLength(Result, lArray.Count);
+  for i := 0 to lArray.Count - 1 do
+  begin
+    lRow := ArrayObject(lArray, i);
+    Result[i].ProcessId := ReadCardinal(lRow, 'pid');
+    lCreation := lRow.GetValue('ct');
+    if not (lCreation is TJSONNumber) or
+      not TryStrToUInt64(lCreation.Value, Result[i].CreationTime100ns) then
+      raise EConvertError.Create('Invalid evidence creation time');
+    Result[i].DisplayName := ReadText(lRow, 'n', 256);
+    Result[i].ImagePath := ReadText(lRow, 'pa', 1024);
+    Result[i].PathStatus := ReadText(lRow, 'st', 64);
+    Result[i].AverageValue := ReadResourceNumber(lRow, 'a');
+    Result[i].PeakValue := ReadResourceNumber(lRow, 'p');
+    if aIo then
+      Result[i].TotalBytes := ReadResourceNumber(lRow, 'b')
+    else
+    begin
+      Result[i].FirstValue := ReadResourceNumber(lRow, 'f');
+      Result[i].LastValue := ReadResourceNumber(lRow, 'l');
+    end;
+    Result[i].PeakAtUtc := ReadUtc(lRow, 't');
+    Result[i].LastSeenUtc := ReadUtc(lRow, 'ls');
+    Result[i].SampleCount := ReadCount(lRow, 'c');
+  end;
+end;
+
+procedure ReadResourcePhase(const aObject: TJSONObject; var aPhase: TMachineOverviewEvidencePhase);
+var
+  lValue: TJSONValue;
+  lObject: TJSONObject;
+begin
+  lValue := aObject.GetValue('mem');
+  if Assigned(lValue) then
+  begin
+    if not (lValue is TJSONObject) then
+      raise EConvertError.Create('Invalid memory statistics');
+    lObject := lValue as TJSONObject;
+    ValidateObject(lObject);
+    aPhase.PhysicalUsed := ReadStatistic(lObject, 'pu');
+    aPhase.Commit := ReadStatistic(lObject, 'cm');
+    aPhase.Paging := ReadStatistic(lObject, 'pg', True);
+  end;
+  lValue := aObject.GetValue('dk');
+  if Assigned(lValue) then
+  begin
+    if not (lValue is TJSONObject) then
+      raise EConvertError.Create('Invalid disk statistics');
+    lObject := lValue as TJSONObject;
+    ValidateObject(lObject);
+    if Assigned(lObject.GetValue('dn')) then
+      aPhase.DiskName := ReadText(lObject, 'dn', 256);
+    aPhase.DiskActive := ReadStatistic(lObject, 'ac', True);
+    aPhase.DiskLatency := ReadStatistic(lObject, 'lt', True);
+    aPhase.DiskQueue := ReadStatistic(lObject, 'q', True);
+    aPhase.DiskThroughput := ReadStatistic(lObject, 'tp', True);
+  end;
+  aPhase.MeasuredProcessIo := ReadStatistic(aObject, 'mio', True);
+  aPhase.RamProcesses := ReadResourceRows(aObject, 'rm', False);
+  aPhase.IoProcesses := ReadResourceRows(aObject, 'io', True);
 end;
 
 function ReadPhase(const aObject: TJSONObject; const aKind: TMachineOverviewEvidencePhaseKind): TMachineOverviewEvidencePhase;
@@ -1553,11 +2217,11 @@ var
   g: TGarbos;
   lValue, lBoolean: TJSONValue;
   lRoot, lRow: TJSONObject;
-  lPhases, lGaps: TJSONArray;
+  lPhases, lGaps, lResources: TJSONArray;
   lKind: TMachineOverviewEvidencePhaseKind;
   lReason: TMachineOverviewEvidenceGapReason;
   lCode: string;
-  i: Integer;
+  i, lVersion: Integer;
   lFound: Boolean;
 begin
   Result := False;
@@ -1573,8 +2237,29 @@ begin
       raise EConvertError.Create('Evidence must be a JSON object');
     lRoot := (lValue as TJSONObject);
     ValidateObject(lRoot);
-    if ReadCount(lRoot, 'v') <> 1 then
+    lVersion := ReadCount(lRoot, 'v');
+    if not (lVersion in [1, 2]) then
       raise EConvertError.Create('Unsupported evidence version');
+    if lVersion = 2 then
+    begin
+      if Assigned(lRoot.GetValue('rs')) then
+      begin
+        lResources := ReadArray(lRoot, 'rs', 2);
+        for i := 0 to lResources.Count - 1 do
+        begin
+          if not (lResources.Items[i] is TJSONString) then
+            raise EConvertError.Create('Invalid resource kind');
+          if lResources.Items[i].Value = 'ram' then
+            Include(aEvidence.Resources, TMachineOverviewResourceKind.Ram)
+          else if lResources.Items[i].Value = 'io' then
+            Include(aEvidence.Resources, TMachineOverviewResourceKind.Io)
+          else
+            raise EConvertError.Create('Invalid resource kind');
+        end;
+      end;
+      if Assigned(lRoot.GetValue('dn')) then
+        aEvidence.DiskName := ReadText(lRoot, 'dn', 256);
+    end;
     aEvidence.LogicalProcessorCount := ReadCount(lRoot, 'lp');
     if aEvidence.LogicalProcessorCount > 65536 then
       raise EConvertError.Create('Invalid evidence logical processor count');
@@ -1592,7 +2277,11 @@ begin
     if lPhases.Count <> 3 then
       raise EConvertError.Create('Evidence must contain three phases');
     for lKind := Low(lKind) to High(lKind) do
+    begin
       aEvidence.Phases[lKind] := ReadPhase(ArrayObject(lPhases, Ord(lKind)), lKind);
+      if lVersion = 2 then
+        ReadResourcePhase(ArrayObject(lPhases, Ord(lKind)), aEvidence.Phases[lKind]);
+    end;
     lGaps := ReadArray(lRoot, 'gp', 16);
     SetLength(aEvidence.Gaps, lGaps.Count);
     for i := 0 to lGaps.Count - 1 do

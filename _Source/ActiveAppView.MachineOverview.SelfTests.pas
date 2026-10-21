@@ -7,7 +7,7 @@ function RunMachineOverviewSelfTests(const aArg: string): Integer;
 implementation
 
 uses
-  System.Classes, System.DateUtils, System.Diagnostics, System.IniFiles,
+  System.Classes, System.DateUtils, System.Diagnostics, System.Generics.Collections, System.IniFiles,
   System.IOUtils, System.Math, System.StrUtils, System.SyncObjs, System.SysUtils,
   System.Variants,
   Winapi.ActiveX, Winapi.CommCtrl, Winapi.oleacc, Winapi.PsAPI, Winapi.Windows,
@@ -1029,11 +1029,16 @@ function HasRecentUtcTimestamp(
 
 function RunProcessProviderFixtureSelfTest: Integer;
 var
+  lMetricProcessId: Cardinal;
+  lMetricCreationTime: UInt64;
   lCachedIdentity: TMachineOverviewProcessIdentity;
   lCurrentIdentity: TMachineOverviewProcessIdentity;
   lDelta: TMachineOverviewProcessDelta;
   lPrivateBytes: UInt64;
   lWorkingSetFlags: TArray<NativeUInt>;
+  lMetrics, lRanked: TArray<TMachineOverviewProcessMetric>;
+  lTotal: Double;
+  i: Integer;
 begin
   Result := 1;
   if (not TryCalculateMachineOverviewProcessDelta(18000000, 2000000,
@@ -1108,7 +1113,99 @@ begin
     Writeln('SELFTEST FAILED: private working-set page flags or byte width are wrong');
     Exit;
   end;
+  SetLength(lMetrics, 15);
+  lMetricProcessId := 100;
+  lMetricCreationTime := 1;
+  for i := 0 to High(lMetrics) do
+  begin
+    lMetrics[i].Identity.ProcessId := lMetricProcessId;
+    lMetrics[i].Identity.CreationTime100ns := lMetricCreationTime;
+    lMetrics[i].DisplayName := 'same.exe';
+    lMetrics[i].MetricAvailable := True;
+    lMetrics[i].MetricValue := (i + 1) * 100;
+    Inc(lMetricProcessId);
+    Inc(lMetricCreationTime);
+  end;
+  lMetrics[14].MetricAvailable := False;
+  lMetrics[13].MetricValue := 0;
+  lMetrics[12].MetricValue := 1200;
+  lRanked := SelectMachineOverviewResourceProcesses(lMetrics, True, lTotal);
+  if (Length(lRanked) <> 10) or (lTotal <> 9000) or
+    (lRanked[0].Identity.ProcessId <> 111) or (lRanked[1].Identity.ProcessId <> 112) or
+    (lRanked[9].MetricValue <> 400) then
+    raise Exception.Create('Individual I/O top-ten fixture must preserve identities, PID ties and full measured total');
+  lRanked := SelectMachineOverviewResourceProcesses([lMetrics[13], lMetrics[14]], True, lTotal);
+  if (Length(lRanked) <> 0) or (lTotal <> 0) then
+    raise Exception.Create('Zero and unavailable I/O must not enter the individual list');
+  lRanked := SelectMachineOverviewResourceProcesses([lMetrics[13], lMetrics[14]], False, lTotal);
+  if (Length(lRanked) <> 1) or (lRanked[0].Identity.ProcessId <> 113) or (lRanked[0].MetricValue <> 0) or (lTotal <> 0) then
+    raise Exception.Create('Available zero private bytes must remain a valid RAM measurement');
+  Writeln('SELFTEST PASS: individual RAM/I/O fixture ranking, PID ties, full total and availability');
   Result := 0;
+end;
+
+procedure CheckIndividualResourceMeasurements(const aSample: TMachineOverviewProviderSample);
+var
+  lPrefix: string;
+  lMeasurement, lTotal: TMachineOverviewMeasurement;
+  lPrevious, lSum: Double;
+  lPid, lPreviousPid: Cardinal;
+  i, lCount, lColon: Integer;
+begin
+  for lPrefix in ['process_ram_process:', 'process_io_process:'] do
+  begin
+    lPrevious := MaxDouble;
+    lPreviousPid := 0;
+    lSum := 0;
+    lCount := CountSystemProviderMeasurements(aSample, lPrefix);
+    if (lCount > 10) or ((lPrefix = 'process_ram_process:') and (lCount < 1)) then
+      raise Exception.Create('Resource measurements must be bounded top ten');
+    for i := 1 to lCount do
+    begin
+      if not TryFindSystemProviderMeasurement(aSample, lPrefix + IntToStr(i), lMeasurement) then
+        raise Exception.Create('Resource measurement ranks must be contiguous');
+      lColon := Pos(':', lMeasurement.EntityId);
+      if (lColon <= 1) or not TryStrToUInt(Copy(lMeasurement.EntityId, 1, lColon - 1), lPid) or
+        not lMeasurement.Available or (lMeasurement.Value < 0) or lMeasurement.DisplayText.IsEmpty or
+        lMeasurement.StatusText.IsEmpty or (lMeasurement.Value > lPrevious) or
+        ((lMeasurement.Value = lPrevious) and (lPid < lPreviousPid)) or
+        ((lPrefix = 'process_io_process:') and (lMeasurement.Value <= 0)) then
+        raise Exception.Create('Resource value, identity, path status or descending/PID rank invalid');
+      lPrevious := lMeasurement.Value;
+      lPreviousPid := lPid;
+      lSum := lSum + lMeasurement.Value;
+    end;
+    if lPrefix = 'process_io_process:' then
+      if not TryFindSystemProviderMeasurement(aSample, 'process_io_measured_total_bytes_per_second', lTotal) or
+        not lTotal.Available or (lTotal.Value < lSum - 0.01) then
+        raise Exception.Create('Measured I/O total must include every ranked process');
+  end;
+end;
+
+procedure MeasureProcessProviderCost(const aProvider: IMachineOverviewProvider;
+  out aSample: TMachineOverviewProviderSample);
+var
+  lWatch: TStopwatch;
+  lTimes: TArray<Double>;
+  i: Integer;
+begin
+  SetLength(lTimes, 31);
+  for i := -1 to High(lTimes) do
+  begin
+    lWatch := TStopwatch.StartNew;
+    aProvider.Collect(aSample);
+    if i >= 0 then
+    begin
+      lTimes[i] := lWatch.ElapsedTicks * 1000000.0 / TStopwatch.Frequency;
+      Writeln(Format('PROCESS COST raw sample=%d us=%.3f', [i, lTimes[i]]));
+    end;
+    if aSample.State.Status <> TMachineOverviewProviderStatus.Available then
+      raise Exception.Create('Measured process collection unavailable');
+    Sleep(10);
+  end;
+  TArray.Sort<Double>(lTimes);
+  Writeln(Format('PROCESS COST samples=31 min_us=%.3f median_us=%.3f p95_us=%.3f max_us=%.3f',
+    [lTimes[0], lTimes[15], lTimes[29], lTimes[30]]));
 end;
 
 function RunProcessProviderLiveSelfTest: Integer;
@@ -1153,6 +1250,9 @@ begin
       [lFirstCollectDurationMs]));
     Exit;
   end;
+  if GetEnvironmentVariable('ACV_S2_COST') = '1' then
+    MeasureProcessProviderCost(lProvider, lSample);
+  CheckIndividualResourceMeasurements(lSample);
   lCpuCount := CountSystemProviderMeasurements(lSample, 'process_cpu_rank:');
   if (not TryFindSystemProviderMeasurement(lSample, 'process_cpu_interval_ms', lMeasurement)) or
     (lMeasurement.Value <= 0) or

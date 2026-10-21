@@ -1,4 +1,4 @@
-﻿unit ActiveAppView.MachineOverview.Incidents;
+unit ActiveAppView.MachineOverview.Incidents;
 
 interface
 
@@ -29,6 +29,15 @@ type
     PeakAtUtc, LastSeenUtc: TDateTime;
     SampleCount: Integer;
   end;
+  TMachineOverviewResourceKind = (Ram, Io);
+  TMachineOverviewResourceContribution = record
+    ProcessId: Cardinal;
+    CreationTime100ns: UInt64;
+    DisplayName, ImagePath, PathStatus: string;
+    AverageValue, PeakValue, FirstValue, LastValue, TotalBytes: Double;
+    PeakAtUtc, LastSeenUtc: TDateTime;
+    SampleCount: Integer;
+  end;
   TMachineOverviewApplicationContribution = record
     DisplayName: string;
     ProcessCount: Integer;
@@ -40,20 +49,27 @@ type
     Reason: TMachineOverviewEvidenceGapReason;
   end;
   TMachineOverviewEvidenceStatistic = record
+    PeakSourceName: string;
     Available: Boolean;
     Average, Peak: Double;
     PeakAtUtc: TDateTime;
   end;
   TMachineOverviewEvidencePhase = record
+    DiskName: string;
     Kind: TMachineOverviewEvidencePhaseKind;
     StartUtc, EndUtc: TDateTime;
     ProcessSampleCount, ExpectedProcessSampleCount, SystemSampleCount, ExpectedSystemSampleCount: Integer;
     SystemCpu, Dpc, Interrupt, MeasuredProcessCpu, UnattributedCpu: TMachineOverviewEvidenceStatistic;
+    PhysicalUsed, Commit, Paging, DiskActive, DiskLatency, DiskQueue, DiskThroughput,
+      MeasuredProcessIo: TMachineOverviewEvidenceStatistic;
+    RamProcesses, IoProcesses: TArray<TMachineOverviewResourceContribution>;
     Processes: TArray<TMachineOverviewProcessContribution>;
     Applications: TArray<TMachineOverviewApplicationContribution>;
   end;
   TMachineOverviewIncidentEvidence = record
     State: TMachineOverviewEvidenceState;
+    Resources: set of TMachineOverviewResourceKind;
+    DiskName: string;
     LogicalProcessorCount: Integer;
     ProcessIntervalMs, SystemIntervalMs: Cardinal;
     InaccessibleProcessCountMax: Integer;
