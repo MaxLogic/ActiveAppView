@@ -144,6 +144,8 @@ resourcestring
   rsHealthHeading = 'Recording health: %s; last write %s';
   rsHealthStorage = 'Storage: %s of %s MB used; WAL %s MB not counted; file %s MB; evidence %s MB; %s. %s';
   rsHealthNever = 'never';
+  rsHealthSessionStarted = 'Session started %s';
+  rsHealthUnknown = 'unknown';
   rsHealthSecondsAgo = '%d s ago';
   rsHealthMinutesAgo = '%d min ago';
   rsHealthRange = '%s: oldest %s; newest %s';
@@ -430,11 +432,15 @@ function FormatMachineOverviewHistoryHealth(const aHealth: TMachineOverviewHisto
 var
   g: TGarbos;
   lLines: TStringList;
-  lStorage, lAge: string;
+  lStorage, lAge, lSessionStarted: string;
   lSeconds: Int64;
 begin
   g := Default(TGarbos);
   GC(lLines, TStringList.Create, g);
+  lSessionStarted := rsHealthUnknown;
+  if aHealth.SessionStartedUtc > 0 then
+    // Keep the existing offset and full UTC timestamp; omit the local date prefix.
+    lSessionStarted := Copy(MachineOverviewEvidenceTimeText(aHealth.SessionStartedUtc), 12, MaxInt);
   lAge := rsHealthNever;
   if aHealth.LastWriteUtc > 0 then
   begin
@@ -447,6 +453,7 @@ begin
       lAge := Format(rsHealthMinutesAgo, [lSeconds div 60]);
   end;
   lLines.Add(Format(rsHealthHeading, [MachineOverviewRecordingState(aHealth, aNowUtc), lAge]));
+  lLines.Add(Format(rsHealthSessionStarted, [lSessionStarted]));
   case aHealth.StorageState of
     TMachineOverviewStorageState.WithinBudget: lStorage := rsStorageWithinBudget;
     TMachineOverviewStorageState.Trimming: lStorage := rsStorageTrimming;

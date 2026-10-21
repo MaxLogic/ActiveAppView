@@ -2732,6 +2732,131 @@ begin
   end;
 end;
 
+function RunHistorySessionHealthSelfTest: Integer;
+var
+  g: TGarbos;
+  lConfig: TMachineOverviewHistoryConfig;
+  lConnection: TFDConnection;
+  lService: TMachineOverviewHistoryService;
+  lPipeline: TMachineOverviewPipeline;
+  lProviderSample: TMachineOverviewProviderSample;
+  lChange: TMachineOverviewIncidentChange;
+  lFileName, lError: string;
+  lHealth: TMachineOverviewHistoryHealth;
+  lInjected: Boolean;
+  lUtc: TDateTime;
+begin
+  g := Default(TGarbos);
+  Result := 1;
+  lFileName := NewHistoryMigrationFile('session-health');
+  lService := nil;
+  lPipeline := nil;
+  lConnection := nil;
+  lInjected := False;
+  lUtc := TTimeZone.Local.ToUniversalTime(Now);
+  try
+    lConfig := CreateHistoryReliabilityConfig(lFileName, 2, 32 * 1024 * 1024);
+    lChange := Default(TMachineOverviewIncidentChange);
+    lChange.Incident.StableId := 'health-overflow';
+    lChange.Incident.StartedAtUtc := lUtc;
+    lConfig.MigrationObserver :=
+      procedure(aStage: string)
+      begin
+        if (aStage <> 'BeforeBatchCommit') or lInjected then
+          Exit;
+        lInjected := True;
+        // The writer owns the in-flight batch, so these five records overflow
+        // the two-slot backlog deterministically: two raw and one incident.
+        if (lService.EnqueueRaw(CreateHistorySystemTestSample(lUtc, 2, 42)) <>
+          TMachineOverviewHistoryEnqueueResult.Queued) or
+          (lService.EnqueueRaw(CreateHistorySystemTestSample(lUtc, 3, 42)) <>
+          TMachineOverviewHistoryEnqueueResult.Queued) or
+          (lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued) or
+          (lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Queued) or
+          (lService.EnqueueIncident(lChange) <> TMachineOverviewHistoryEnqueueResult.Dropped) then
+          raise Exception.Create('Writer backlog overflow fixture failed');
+      end;
+    // Force both pipeline loss counters before the history writer drains it.
+    lPipeline := TMachineOverviewPipeline.Create(1, 1);
+    lPipeline.SetHistoryEnabled(True);
+    if (lPipeline.EnqueueRaw(CreateHistorySystemTestSample(lUtc, 10, 42)) <>
+      TMachineOverviewEnqueueResult.Queued) or
+      (lPipeline.EnqueueRaw(CreateHistorySystemTestSample(lUtc, 11, 42)) <>
+      TMachineOverviewEnqueueResult.Full) or
+      (lPipeline.EnqueueRaw(CreateHistorySystemTestSample(lUtc, 12, 42)) <>
+      TMachineOverviewEnqueueResult.Full) then
+      raise Exception.Create('Pipeline raw overflow fixture failed');
+    lPipeline.Start;
+    if not lPipeline.WaitForSequence(1, 5000) then
+      raise Exception.Create('Pipeline first sample did not aggregate');
+    if (lPipeline.EnqueueRaw(CreateHistorySystemTestSample(lUtc, 13, 42)) <>
+      TMachineOverviewEnqueueResult.Queued) or (not lPipeline.WaitForSequence(2, 5000)) or
+      (lPipeline.Diagnostics.RawDropped <> 2) or (lPipeline.Diagnostics.HistoryDropped <> 1) then
+      raise Exception.Create('Pipeline history overflow fixture failed');
+    lService := TMachineOverviewHistoryService.Create(lPipeline, lConfig);
+    lService.Start;
+    if (not lService.WaitUntilInitialized(5000)) or (not lService.Diagnostics.Available) then
+      raise Exception.Create('Pipeline session history failed to initialize');
+    EnqueueHistoryBudgetRaw(lService, CreateHistorySystemTestSample(lUtc, 1, 42));
+    if not lService.Flush(5000) then
+      raise Exception.Create('Session health fixture did not flush');
+    GC(lConnection, TFDConnection.Create(nil), g);
+    ConfigureHistoryTestConnection(lFileName, lConnection);
+    Writeln(Format('Session health persisted: started=%d dropped=%d provider_present=%d raw_drops=%d incident_drops=%d',
+      [QueryHistoryInt64(lConnection, 'SELECT CAST(session_started_utc_ms AS TEXT) FROM history_status'),
+      QueryHistoryInt64(lConnection, 'SELECT session_dropped_records FROM history_status'),
+      QueryHistoryInt64(lConnection, 'SELECT length(provider_status_text) FROM history_status'),
+      lService.Diagnostics.RawDropped, lService.Diagnostics.IncidentDropped]));
+    if (lService.Diagnostics.RawDropped <> 2) or (lService.Diagnostics.IncidentDropped <> 1) or
+      (QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_status WHERE session_started_utc_ms>0 ' +
+      'AND session_dropped_records=6 AND provider_status_text LIKE ''%windows-core%Available%''') <> 1) then
+      raise Exception.Create('Session health row does not persist start, raw/history drops and provider status');
+    if (not TryLoadMachineOverviewHistoryHealth(lFileName, lHealth, lError)) or
+      (lHealth.SessionDroppedRecords <> 6) or (lHealth.SessionStartedUtc < lUtc) or
+      (not ContainsText(lHealth.ProviderStatus, 'windows-core')) then
+      raise Exception.Create('Session health reader lost writer values: ' + lError);
+    lProviderSample := Default(TMachineOverviewProviderSample);
+    lProviderSample.State.ProviderId := 'windows-core';
+    lProviderSample.State.Status := TMachineOverviewProviderStatus.Failed;
+    lProviderSample.State.ErrorText := 'injected provider failure';
+    lProviderSample.State.CapturedAtUtc := lUtc;
+    EnqueueHistoryBudgetRaw(lService, CreateMachineOverviewRawSample(lProviderSample));
+    EnqueueHistoryBudgetRaw(lService, CreateHistoryDiskTestSample(lUtc));
+    if (not lService.Flush(5000)) or
+      (not TryLoadMachineOverviewHistoryHealth(lFileName, lHealth, lError)) or
+      (not ContainsText(lHealth.ProviderStatus, 'windows-core=Failed: injected provider failure')) or
+      (not ContainsText(lHealth.ProviderStatus, 'disks=Available')) or
+      ContainsText(lHealth.ProviderStatus, 'windows-core=Available') or
+      (lHealth.SessionDroppedRecords <> 6) then
+      raise Exception.Create('Latest status per provider did not replace old status or preserve drop total');
+    if lPipeline.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Session health pipeline did not stop');
+    if lService.Stop(5000) <> TMachineOverviewShutdownResult.Stopped then
+      raise Exception.Create('Session health writer did not stop');
+    FreeAndNil(lService);
+    lConnection.ExecSQL('UPDATE history_status SET session_started_utc_ms=1');
+    lConnection.Connected := False;
+    lConfig.MigrationObserver := nil;
+    lService := StartHistoryBudgetService(lConfig);
+    lConnection.Connected := True;
+    if QueryHistoryInt64(lConnection, 'SELECT COUNT(*) FROM history_status WHERE session_started_utc_ms>1 ' +
+      'AND session_dropped_records=0 AND provider_status_text NOT LIKE ''%windows-core%''') <> 1 then
+      raise Exception.Create('Reopen did not reset session health before the first write');
+    if (not TryLoadMachineOverviewHistoryHealth(lFileName, lHealth, lError)) or
+      (lHealth.SessionStartedUtc < lUtc) or (lHealth.SessionDroppedRecords <> 0) then
+      raise Exception.Create('Health reader did not expose the reopened session start/reset');
+    Writeln('PASS RunHistorySessionHealthSelfTest: session start, backlog raw=2/incident=1 + pipeline raw=2/history=1 = 6 drops, latest provider states/errors, reader, reopen reset');
+    Result := 0;
+  finally
+    if Assigned(lConnection) then
+      lConnection.Connected := False;
+    lService.Free;
+    lPipeline.Free;
+    g.Clear;
+    DeleteHistoryReliabilityFiles(lFileName);
+  end;
+end;
+
 function RunMachineOverviewHistorySelfTests(const aArg: string): Integer;
 begin
   Result := -1;
@@ -2740,6 +2865,9 @@ begin
   if not SameText(aArg, cMachineOverviewHistorySelfTestArg) then
     Exit;
   try
+    Result := RunHistorySessionHealthSelfTest;
+    if Result <> 0 then
+      Exit;
     Result := RunHistoryStopWithoutFlushSelfTest;
     if Result <> 0 then
       Exit;

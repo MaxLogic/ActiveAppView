@@ -822,6 +822,8 @@ begin
   lNow := EncodeDate(2026, 10, 20);
   lHealth := Default(TMachineOverviewHistoryHealth);
   lText := FormatMachineOverviewHistoryHealth(lHealth, lNow);
+  if not ContainsText(lText, 'Session started unknown') then
+    raise Exception.Create('Unknown session start must be explicit in recording health');
   if not ContainsText(lText, 'last write never') or ContainsText(lText, '0 min ago') then
   begin
     Writeln('SELFTEST FAILED: S5 unavailable last write must say never');
@@ -860,8 +862,15 @@ begin
     Result := 1;
     if not PersistIncidents(lDatabase, [EvidenceFixture('health', lNow)]) then
       Exit;
+    if not TryLoadMachineOverviewHistoryHealth(lDatabase, lHealth, lError) then
+      raise Exception.Create('Persisted session health could not be loaded: ' + lError);
+    lText := FormatMachineOverviewHistoryHealth(lHealth, lNow);
+    if (not ContainsText(lText, 'records dropped this session 0')) or
+      (not ContainsText(lText, 'No provider samples received this session.')) then
+      raise Exception.Create('Health text lost persisted new-session drop/provider values: ' + lText);
     ConfigureLockConnection(lDatabase, lConnection);
-    lConnection.ExecSQL('UPDATE history_status SET updated_utc_ms=1792454400000, commit_interval_ms=1000, ' +
+    lConnection.ExecSQL('UPDATE history_status SET session_started_utc_ms=1792454400000, ' +
+      'updated_utc_ms=1792454400000, commit_interval_ms=1000, ' +
       'used_bytes=1234, budget_bytes=5678, wal_bytes=90, file_bytes=6000, storage_state=3, ' +
       'storage_message=''fixture pressure'', process_interval_ms=5000, system_interval_ms=1000, ' +
       'logical_processor_count=32, migration_backup_path=''C:\fixture-backup.db'', ' +
@@ -878,6 +887,11 @@ begin
       (lHealth.OldestEvidenceUtc <> lNow) or (lHealth.NewestEvidenceUtc <> lNow) then
       Exit;
     lText := FormatMachineOverviewHistoryHealth(lHealth, IncMinute(lNow, 5));
+    if lHealth.SessionStartedUtc <> lNow then
+      raise Exception.Create('Health reader lost the 64-bit session timestamp');
+    if not ContainsText(lText, 'Session started ' +
+      Copy(MachineOverviewEvidenceTimeText(lNow), 12, MaxInt)) then
+      raise Exception.Create('Persisted 64-bit session start missing from recording health: ' + lText);
     if not ContainsText(lText, 'MB') or ContainsText(lText, 'U/B') or
       not ContainsText(lText, '5 min ago') or not ContainsText(lText, 'WAL') or
       not ContainsText(lText, 'Over budget. fixture pressure') or
@@ -886,9 +900,27 @@ begin
       not ContainsText(lText, '32 logical processors') or not ContainsText(lText, 'Available') or
       not ContainsText(lText, lDatabase) or not ContainsText(lText, 'C:\fixture-backup.db') or
       not ContainsText(lText, 'records dropped this session 5') then
-      Writeln('SELFTEST FAILED: S5 loaded history health fields')
-    else
-      Result := 0;
+    begin
+      Writeln('SELFTEST FAILED: S5 loaded history health fields');
+      Exit;
+    end;
+    lConnection.Connected := True;
+    lConnection.ExecSQL('UPDATE history_status SET session_started_utc_ms=0');
+    lConnection.Connected := False;
+    if (not TryLoadMachineOverviewHistoryHealth(lDatabase, lHealth, lError)) or
+      (lHealth.SessionStartedUtc <> 0) or
+      (not ContainsText(FormatMachineOverviewHistoryHealth(lHealth, lNow), 'Session started unknown')) then
+      raise Exception.Create('Persisted zero session start must remain unknown');
+    lConnection.Connected := True;
+    lConnection.ExecSQL('UPDATE history_status SET session_started_utc_ms=1792454400000');
+    lConnection.Connected := False;
+    // Finish fixture writes before refresh starts the asynchronous evidence reader.
+    lForm.Configure(lDatabase, lNow);
+    if (not lForm.RefreshAndWaitForTest(True, 5000)) or
+      (not ContainsText(lForm.memDetails.Text, 'Session started ' +
+      Copy(MachineOverviewEvidenceTimeText(lNow), 12, MaxInt))) then
+      raise Exception.Create('Displayed health omitted the persisted session start');
+    Result := 0;
   finally
     lForm.Free;
     lConnection.Free;
@@ -930,6 +962,9 @@ begin
       HoldEvidenceFormForUiProof(aForm, 'keyboard')
     else
       aForm.btnCopyEvidence.Click;
+    if (not ContainsText(Clipboard.AsText, 'Session started ')) or
+      ContainsText(Clipboard.AsText, 'Session started unknown') then
+      raise Exception.Create('Copy evidence omitted the persisted session start');
     if Clipboard.AsText <> aForm.memDetails.Text then
       raise Exception.Create('Copy evidence does not match the full memo text');
     if aForm.StatusText <> 'Evidence copied to the clipboard.' then

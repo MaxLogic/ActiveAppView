@@ -18,7 +18,7 @@ type
   TMachineOverviewHistoryHealth = record
     Available: Boolean;
     DatabaseFileName, BackupFileName, StorageMessage, ProviderStatus, LastError: string;
-    LastWriteUtc, NewestProcessSampleUtc: TDateTime;
+    LastWriteUtc, NewestProcessSampleUtc, SessionStartedUtc: TDateTime;
     OldestIncidentUtc, NewestIncidentUtc, OldestEvidenceUtc, NewestEvidenceUtc: TDateTime;
     CommitIntervalMs, ProcessIntervalMs, SystemIntervalMs: Cardinal;
     LogicalProcessorCount: Integer;
@@ -196,6 +196,8 @@ type
     fEvidenceUpsert, fEvidenceSize: TFDQuery;
     fLogicalProcessorCount: Integer;
     fProcessInsert: TFDQuery;
+    fProviderStatus: TStringList;
+    fSessionDroppedRecords: Int64;
     fRollup10s: TFDQuery;
     fRollup1m: TFDQuery;
     fSystemInsert: TFDQuery;
@@ -307,6 +309,25 @@ resourcestring
   rsHistoryTrimming = 'History trimming will continue after the next batch.';
   rsHistoryFloorBreached = 'Storage budget too small: protected recent history was removed. Increase MaxDatabaseSizeMB.';
   rsHistoryOverBudget = 'Storage is over budget: only the committed batch or collecting evidence remains. Increase MaxDatabaseSizeMB.';
+
+  rsHistoryNoProviderSamples = 'No provider samples received this session.';
+  rsHistoryProviderAvailable = 'Available';
+  rsHistoryProviderStale = 'Stale';
+  rsHistoryProviderUnavailable = 'Unavailable';
+  rsHistoryProviderFailed = 'Failed';
+
+function HistoryProviderStatusText(const aState: TMachineOverviewProviderState): string;
+begin
+  case aState.Status of
+    TMachineOverviewProviderStatus.Available: Result := rsHistoryProviderAvailable;
+    TMachineOverviewProviderStatus.Stale: Result := rsHistoryProviderStale;
+    TMachineOverviewProviderStatus.Unavailable: Result := rsHistoryProviderUnavailable;
+  else
+    Result := rsHistoryProviderFailed;
+  end;
+  if not aState.ErrorText.IsEmpty then
+    Result := Result + ': ' + aState.ErrorText;
+end;
 
 function GetHistoryBacklogState(const aState: TObject):
   TMachineOverviewHistoryBacklogState;
@@ -512,6 +533,7 @@ begin
     fConfig.MaximumIncidentCount := 50000;
   fStopping := aStopping;
   try
+    fProviderStatus := TStringList.Create;
     ConfigureConnection;
     CreateOrMigrateSchema;
     RecoverLegacyIncidents;
@@ -526,6 +548,9 @@ begin
       Int64((fConfig.MaxDatabaseSizeBytes div 10) * 9));
     lQuery.Close;
     PrepareStatements;
+    fConnection.ExecSQL('UPDATE history_status SET session_started_utc_ms=?, ' +
+      'session_dropped_records=0, provider_status_text=? WHERE id=1',
+      [HistoryUtcMilliseconds(TTimeZone.Local.ToUniversalTime(Now)), rsHistoryNoProviderSamples]);
   except
     FreeAndNil(fRollup1m);
     FreeAndNil(fRollup10s);
@@ -536,6 +561,7 @@ begin
     FreeAndNil(fDiskInsert);
     FreeAndNil(fSystemInsert);
     FreeAndNil(fConnection);
+    FreeAndNil(fProviderStatus);
     fDriverLink := nil;
     raise;
   end;
@@ -543,6 +569,7 @@ end;
 
 destructor TMachineOverviewHistoryStore.Destroy;
 begin
+  FreeAndNil(fProviderStatus);
   FreeAndNil(fRollup1m);
   FreeAndNil(fRollup10s);
   FreeAndNil(fEvidenceSize);
@@ -1885,14 +1912,17 @@ begin
     'storage_state=?, storage_message=?, last_floor_breach_utc_ms=CASE WHEN ?=2 THEN ? ELSE ' +
     'last_floor_breach_utc_ms END, evidence_trimmed_total=evidence_trimmed_total+?, ' +
     'incidents_deleted_total=incidents_deleted_total+?, samples_deleted_total=samples_deleted_total+?, ' +
-    'last_error=?, process_interval_ms=?, system_interval_ms=?, logical_processor_count=? WHERE id=1',
+    'last_error=?, process_interval_ms=?, system_interval_ms=?, logical_processor_count=?, ' +
+    'session_dropped_records=?, provider_status_text=? WHERE id=1',
     [lStatusUtc, Int64(fConfig.CommitIntervalMs),
     Int64(fConfig.MaxDatabaseSizeBytes), fUsedBytes,
     Scalar('PRAGMA page_count') * Scalar('PRAGMA page_size'), lWalBytes, fEvidenceBytes,
     Ord(fStorageState), fStorageMessage, Ord(fStorageState), lStatusUtc,
     fTrimmedEvidence, fDeletedIncidents, fDeletedSamples,
     Trim(fStartupError + ' ' + fMaintenanceError), Int64(fConfig.ProcessSampleIntervalMs),
-    Int64(fConfig.SystemSampleIntervalMs), fLogicalProcessorCount]);
+    Int64(fConfig.SystemSampleIntervalMs), fLogicalProcessorCount,
+    fSessionDroppedRecords, IfThen(fProviderStatus.Count = 0,
+    rsHistoryNoProviderSamples, Trim(fProviderStatus.Text))]);
 end;
 
 function TMachineOverviewHistoryStore.RunMaintenance: Integer;
@@ -1951,6 +1981,7 @@ procedure TMachineOverviewHistoryStore.WriteBatch(
   const aItems: TArray<TMachineOverviewHistoryItem>);
 var
   lItem: TMachineOverviewHistoryItem;
+  lProviderState: TMachineOverviewProviderState;
   lTime, lOriginalEvidenceBytes: Int64;
 begin
   fBatchBoundary := High(Int64);
@@ -1963,6 +1994,8 @@ begin
       lTime := 0;
       if (lItem.Kind = TMachineOverviewHistoryItemKind.RawSample) and Assigned(lItem.Sample) then
       begin
+        lProviderState := lItem.Sample.ProviderSample.State;
+        fProviderStatus.Values[lItem.Sample.ProviderId] := HistoryProviderStatusText(lProviderState);
         if SameText(lItem.Sample.ProviderId, 'disks') then
           WriteDiskSample(lItem.Sample)
         else if SameText(lItem.Sample.ProviderId, 'processes') then
@@ -2460,6 +2493,7 @@ var
   lCommitFailed: Boolean;
   lDiagnostics: TMachineOverviewHistoryBacklogDiagnostics;
   lEnqueueResult: TMachineOverviewHistoryEnqueueResult;
+  lPipelineDiagnostics: TMachineOverviewPipelineDiagnostics;
   lFlushRequested: Boolean;
   lIncidentError: string;
   lIncidents: TArray<TMachineOverviewIncident>;
@@ -2544,6 +2578,14 @@ begin
         lCommitFailed := False;
         try
           lStore.WriteBatch(lBatch);
+          lDiagnostics := fServiceState.Backlog.Diagnostics;
+          lStore.fSessionDroppedRecords := lDiagnostics.RawDropped + lDiagnostics.IncidentDropped;
+          if Assigned(fServiceState.Pipeline) then
+          begin
+            lPipelineDiagnostics := fServiceState.Pipeline.Diagnostics;
+            lStore.fSessionDroppedRecords := lStore.fSessionDroppedRecords +
+              lPipelineDiagnostics.RawDropped + lPipelineDiagnostics.HistoryDropped;
+          end;
           lStorageCapDropped := lStore.RunMaintenance;
           fServiceState.MarkCommitSuccess(Length(lBatch),
             GetTickCount64 - lCommitStartedMs, lStorageCapDropped);
@@ -3050,6 +3092,7 @@ begin
     // SQLite INTEGER metadata can resolve to ftInteger. Cast persisted 64-bit
     // counters and timestamps to text before conversion, as in our headline reader.
     lQuery.Open('SELECT *, CAST(updated_utc_ms AS TEXT) AS write_ms, ' +
+      'CAST(session_started_utc_ms AS TEXT) AS session_ms, ' +
       'CAST(budget_bytes AS TEXT) AS budget64, CAST(used_bytes AS TEXT) AS used64, ' +
       'CAST(file_bytes AS TEXT) AS file64, CAST(wal_bytes AS TEXT) AS wal64, ' +
       'CAST(evidence_bytes AS TEXT) AS evidence64, CAST(evidence_trimmed_total AS TEXT) AS trimmed64, ' +
@@ -3058,6 +3101,8 @@ begin
     if lQuery.Eof then
       Exit;
     aHealth.LastWriteUtc := HistoryDateTimeFromMilliseconds(StrToInt64(lQuery.FieldByName('write_ms').AsWideString));
+    aHealth.SessionStartedUtc := HistoryDateTimeFromMilliseconds(
+      StrToInt64(lQuery.FieldByName('session_ms').AsWideString));
     aHealth.CommitIntervalMs := lQuery.FieldByName('commit_interval_ms').AsLongWord;
     aHealth.ProcessIntervalMs := lQuery.FieldByName('process_interval_ms').AsLongWord;
     aHealth.SystemIntervalMs := lQuery.FieldByName('system_interval_ms').AsLongWord;
