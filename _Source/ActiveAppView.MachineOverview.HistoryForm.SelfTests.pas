@@ -1,4 +1,4 @@
-﻿unit ActiveAppView.MachineOverview.HistoryForm.SelfTests;
+unit ActiveAppView.MachineOverview.HistoryForm.SelfTests;
 
 interface
 
@@ -8,7 +8,8 @@ function RunMachineOverviewIncidentHistorySelfTests(
 implementation
 
 uses
-  System.DateUtils, System.Diagnostics, System.IOUtils, System.StrUtils, System.SysUtils, System.Types, System.Win.ComObj,
+  System.DateUtils, System.Diagnostics, System.IOUtils, System.StrUtils, System.SyncObjs, System.SysUtils,
+  System.Types, System.Win.ComObj,
   Winapi.ActiveX, Winapi.Messages, Winapi.oleacc, Winapi.Windows,
   Vcl.ComCtrls, Vcl.Controls, Vcl.Forms, Vcl.StdCtrls,
   AutoFree, FireDAC.Comp.Client, FireDAC.Phys.SQLite,
@@ -16,6 +17,7 @@ uses
   ActiveAppView.MachineOverview.Evidence, ActiveAppView.MachineOverview.History,
   ActiveAppView.MachineOverview.HistoryForm,
   ActiveAppView.MachineOverview.Incidents,
+  ActiveAppView.MachineOverview.Recording, ActiveAppView.MachineOverview.Recording.SelfTests,
   ActiveAppView.MachineOverview.Types;
 
 const
@@ -29,6 +31,39 @@ type
   public
     WorkArea: TRect;
   end;
+
+type
+  TBlockedRecordingHistoryFrm = class(TMachineOverviewHistoryFrm)
+  protected
+    function RecordingReadTimeoutMs: Cardinal; override;
+    function RecordingCollector: TFunc<NativeUInt, Cardinal>; override;
+  public
+    Entered: TEvent;
+    NeverRelease: Boolean;
+  end;
+
+function TBlockedRecordingHistoryFrm.RecordingReadTimeoutMs: Cardinal;
+begin
+  Result := 100;
+end;
+
+function TBlockedRecordingHistoryFrm.RecordingCollector: TFunc<NativeUInt, Cardinal>;
+var
+  lEntered: TEvent;
+  lNeverRelease: Boolean;
+begin
+  lNeverRelease := NeverRelease;
+  // Capture the independently owned gate, never our form in a reader callback.
+  lEntered := Entered;
+  Result := function(aQuery: NativeUInt): Cardinal
+    begin
+      lEntered.SetEvent;
+      if lNeverRelease then
+        Sleep(INFINITE);
+      Sleep(1500); // Fake PDH call cannot observe cancellation while blocked.
+      Result := $C0000BCC; // PDH_NO_MORE_DATA, a successful late empty read.
+    end;
+end;
 
 function TWorkAreaHistoryFrm.InitialWorkArea: TRect;
 begin
@@ -150,6 +185,7 @@ begin
 end;
 
 procedure PumpEvidence(const aForm: TMachineOverviewHistoryFrm); forward;
+procedure WaitForRecording(const aForm: TMachineOverviewHistoryFrm); forward;
 
 function RunIncidentHistoryFormSelfTest: Integer;
 var
@@ -223,7 +259,8 @@ begin
       (not Assigned(lForm.FindComponent('lvEvidence'))) or
       (not Assigned(lForm.FindComponent('btnCopyEvidence'))) or
       (lForm.lvEvidence.TabOrder <> 1) or
-      (lForm.btnCopyEvidence.TabOrder <> 0) or (lForm.btnClose.TabOrder <> 1) or
+      (lForm.btnCopyEvidence.TabOrder <> 0) or (lForm.btnReadRecording.TabOrder <> 1) or
+      (lForm.btnClose.TabOrder <> 2) or
       (lForm.btnCopyEvidence.Caption <> '&Copy evidence') or
       (lForm.lvEvidence.Columns.Count <> 6) or not lForm.lvEvidence.ReadOnly or
       not lForm.lvEvidence.RowSelect or lForm.lvEvidence.HideSelection or
@@ -472,17 +509,31 @@ begin
   TFile.Move(aPath + '.tmp', aPath);
 end;
 
-procedure HoldEvidenceFormForUiProof(const aForm: TMachineOverviewHistoryFrm; const aState: string);
+procedure HoldEvidenceFormForUiProof(const aForm: TMachineOverviewHistoryFrm; const aState: string;
+  const aRecordingFiles: TArray<string> = nil);
 var
   lRoot: string;
   lTimer: TStopwatch;
-  lPpi: Integer;
+  lPpi, i: Integer;
   lMessage: TMsg;
   lHeld: Boolean;
 begin
   lRoot := GetEnvironmentVariable('ACV_S5_UI_PROOF');
   if lRoot.IsEmpty or (GetEnvironmentVariable('ACV_S5_UI_STATE') <> aState) then
     Exit;
+  if aState = 'recording' then
+  begin
+    // The external proof controller acquires its foreground lease before Show.
+    WriteUiProofMarker(TPath.Combine(lRoot, 'before-show.txt'), IntToStr(GetCurrentProcessId));
+    lTimer := TStopwatch.StartNew;
+    while not TFile.Exists(TPath.Combine(lRoot, 'show.txt')) and (lTimer.ElapsedMilliseconds < 30000) do
+    begin
+      Application.ProcessMessages;
+      Sleep(10);
+    end;
+    if not TFile.Exists(TPath.Combine(lRoot, 'show.txt')) then
+      raise Exception.Create('Recording UI proof controller did not release Show');
+  end;
   lPpi := StrToIntDef(GetEnvironmentVariable('ACV_S5_UI_PPI'), 96);
   aForm.Show;
   aForm.ScaleForPPI(lPpi);
@@ -490,6 +541,25 @@ begin
   aForm.Hide;
   aForm.Show;
   aForm.ActiveControl := aForm.cbFilter;
+  if aState = 'recording' then
+  begin
+    // Follow the visible form's production journey: initial Show refreshes the
+    // incident list, then a user-selected recording is read for that selection.
+    PumpEvidence(aForm);
+    aForm.ReadRecording(aRecordingFiles);
+    WaitForRecording(aForm);
+    for i := 0 to aForm.lvEvidence.Items.Count - 1 do
+      if ContainsText(aForm.lvEvidence.Items[i].Caption, 'Recording during') then
+      begin
+        aForm.lvEvidence.Items[i].MakeVisible(False);
+        if Assigned(aForm.lvEvidence.TopItem) then
+          aForm.lvEvidence.Scroll(0, (i - aForm.lvEvidence.TopItem.Index) *
+            aForm.lvEvidence.Items[i].DisplayRect(drBounds).Height);
+        Break;
+      end;
+    if not ContainsText(EvidenceListText(aForm), 'Recorded process') then
+      raise Exception.Create('Recording UI proof lacks the recording result');
+  end;
   lTimer := TStopwatch.StartNew;
   lHeld := False;
   while (lTimer.ElapsedMilliseconds < 120000) and not TFile.Exists(TPath.Combine(lRoot, 'stop.txt')) do
@@ -1318,6 +1388,202 @@ begin
   end;
 end;
 
+procedure WaitForRecording(const aForm: TMachineOverviewHistoryFrm);
+var
+  lTimer: TStopwatch;
+begin
+  lTimer := TStopwatch.StartNew;
+  repeat
+    Application.ProcessMessages;
+    if not aForm.RecordingPending then
+      Exit;
+    Sleep(1);
+  until lTimer.ElapsedMilliseconds > 10000;
+  raise Exception.Create('Recording worker did not finish');
+end;
+
+function RunIncidentRecordingViewSelfTest: Integer;
+var
+  g: TGarbos;
+  lForm: TMachineOverviewHistoryFrm;
+  lDirectory, lDatabase, lFile, lSecond, lName, lSelectedCaption: string;
+  lIncident: TMachineOverviewIncident;
+  lChanges: TArray<TMachineOverviewIncidentChange>;
+  lTimer: TStopwatch;
+  lAccessible: IAccessible;
+  lChild: OleVariant;
+  lAccName: WideString;
+  i: Integer;
+begin
+  Result := 1;
+  g := Default(TGarbos);
+  lDirectory := TPath.Combine(TPath.GetTempPath, Format('acv-recording-view-%d', [GetCurrentProcessId]));
+  ForceDirectories(lDirectory);
+  lDatabase := TPath.Combine(lDirectory, 'history.db');
+  try
+    lFile := CreateMachineOverviewRecordingFixture(lDirectory, 'normalization', lIncident);
+    lSecond := CreateMachineOverviewRecordingFixture(lDirectory, 'reuse', lIncident);
+    lChanges := [EvidenceFixture('recording-first', IncMinute(lIncident.StartedAtUtc, -1)),
+      EvidenceFixture('recording-latest', lIncident.StartedAtUtc)];
+    lChanges[1].Incident.EndedAtUtc := lIncident.EndedAtUtc;
+    if not PersistIncidents(lDatabase, lChanges) then
+      raise Exception.Create('Recording-view fixture persistence failed');
+    GC(lForm, TMachineOverviewHistoryFrm.Create(nil), g);
+    lForm.Configure(lDatabase, IncHour(lIncident.EndedAtUtc, 1));
+    if lForm.btnReadRecording.Enabled then
+      raise Exception.Create('Recording requires a selected incident');
+    if not lForm.RefreshAndWaitForTest(True, 5000) then
+      raise Exception.Create('Recording-view refresh failed');
+    PumpEvidence(lForm);
+    lForm.ActiveControl := lForm.cbFilter;
+    if not lForm.btnReadRecording.Enabled then
+      raise Exception.Create('Selected incident must enable Read recording');
+    lTimer := TStopwatch.StartNew;
+    lForm.ReadRecording([lFile]);
+    if (lTimer.ElapsedMilliseconds > 100) or not lForm.RecordingPending or
+      not ContainsText(EvidenceListText(lForm), 'Reading recording') then
+      raise Exception.Create('Read must return promptly with loading row');
+    // A second request replaces the pending input, never adds another worker.
+    lForm.ReadRecording([lSecond]);
+    lForm.ActiveControl := lForm.lvEvidence;
+    lForm.lvEvidence.Selected := lForm.lvEvidence.Items[0];
+    lSelectedCaption := lForm.lvEvidence.Selected.Caption;
+    WaitForRecording(lForm);
+    if not ContainsText(lForm.memDetails.Text, lSecond) or ContainsText(lForm.memDetails.Text, lFile) or
+      not ContainsText(EvidenceListText(lForm), 'Recorded process') or
+      not ContainsText(lForm.memDetails.Text, 'Windows performance recording') or
+      not ContainsText(lForm.memDetails.Text, '3.125% of machine') or
+      (lForm.ActiveControl <> lForm.lvEvidence) or not Assigned(lForm.lvEvidence.Selected) or
+      (lForm.lvEvidence.Selected.Caption <> lSelectedCaption) or (lForm.SelectedIncidentId <> 'recording-latest') or
+      (lForm.LastRecordingQueryThreadId = GetCurrentThreadId) or (lForm.LastRecordingQueryThreadId = 0) then
+      raise Exception.Create('Recording result, latest-request identity, export, or focus incorrect');
+    OleCheck(AccessibleObjectFromWindow(lForm.lvEvidence.Handle, OBJID_CLIENT, IID_IAccessible, lAccessible));
+    for i := 0 to lForm.lvEvidence.Items.Count - 1 do
+      if ContainsText(lForm.lvEvidence.Items[i].Caption, 'Recorded process') then
+      begin
+        lChild := i + 1;
+        OleCheck(lAccessible.Get_accName(lChild, lAccName));
+        lName := string(lAccName);
+        if not ContainsText(lName, 'identity PID ') or not ContainsText(lName, 'average ') or
+          not ContainsText(lName, 'peak time ') or not ContainsText(lName, 'measured ') then
+          raise Exception.Create('Recorded process row lacks labelled accessible fields');
+      end;
+    lAccessible := nil;
+    HoldEvidenceFormForUiProof(lForm, 'recording', [lSecond]);
+    lForm.ReadRecording([lFile]);
+    lForm.CancelRecording;
+    Application.ProcessMessages;
+    if lForm.RecordingPending or not ContainsText(lForm.memDetails.Text, 'cancelled') then
+      raise Exception.Create('Cancellation state must remain visible');
+    lForm.ReadRecording([lFile]);
+    lForm.lvIncidents.Selected := lForm.lvIncidents.Items[1];
+    PumpEvidence(lForm);
+    Application.ProcessMessages;
+    if ContainsText(lForm.memDetails.Text, 'Windows performance recording') or
+      ContainsText(EvidenceListText(lForm), 'Recorded process') or lForm.RecordingPending then
+      raise Exception.Create('Incident reselection must clear recording and reject stale results');
+    lForm.ReadRecording([TPath.Combine(lDirectory, 'missing.blg')]);
+    WaitForRecording(lForm);
+    if not ContainsText(lForm.memDetails.Text, 'closed BLG') then
+      raise Exception.Create('Recording read errors must be surfaced');
+    lForm.ReadRecording([lFile]);
+    g.Clear; // Recording cleanup continues independently after form destruction.
+    if not WaitForMachineOverviewRecordingReaders(5000) then
+      raise Exception.Create('Recording reader did not release its native handles');
+    Application.ProcessMessages;
+    Result := 0;
+  finally
+    g.Clear;
+    if not WaitForMachineOverviewRecordingReaders(5000) then
+      raise Exception.Create('Recording fixture reader did not finish');
+    DeleteHistoryFiles(lDatabase);
+    TDirectory.Delete(lDirectory, True);
+  end;
+end;
+
+function RunBlockedRecordingViewSelfTest(const aClose: Boolean): Integer;
+var
+  lForm: TBlockedRecordingHistoryFrm;
+  lEntered: TEvent;
+  lDirectory, lDatabase, lFile, lText: string; //PALOFF Our conventions require non-loop locals in the var section.
+  lIncident: TMachineOverviewIncident;
+  lTimer: TStopwatch;
+  lChanges: TArray<TMachineOverviewIncidentChange>;
+begin
+  Result := 1;
+  lForm := nil;
+  lEntered := TEvent.Create(nil, True, False, '');
+  lDirectory := TPath.Combine(TPath.GetTempPath, Format('acv-recording-blocked-%d', [GetCurrentProcessId]));
+  ForceDirectories(lDirectory);
+  lDatabase := TPath.Combine(lDirectory, 'history.db');
+  try
+    try
+      lFile := CreateMachineOverviewRecordingFixture(lDirectory, 'normalization', lIncident);
+      lChanges := [EvidenceFixture('blocked', lIncident.StartedAtUtc)];
+      lChanges[0].Incident.EndedAtUtc := lIncident.EndedAtUtc;
+      if not PersistIncidents(lDatabase, lChanges) then
+        raise Exception.Create('Blocked-read fixture persistence failed');
+      lForm := TBlockedRecordingHistoryFrm.Create(nil);
+      lForm.Entered := lEntered;
+      lForm.NeverRelease := GetEnvironmentVariable('ACV_RECORDING_EXIT_PROBE') = '1';
+      lForm.Configure(lDatabase, IncHour(lIncident.EndedAtUtc, 1));
+      if not lForm.RefreshAndWaitForTest(True, 5000) then
+        raise Exception.Create('Blocked-read refresh failed');
+      PumpEvidence(lForm);
+      lForm.ReadRecording([lFile]);
+      if lEntered.WaitFor(5000) <> TWaitResult.wrSignaled then
+        raise Exception.Create('Fake PDH was not entered');
+      lTimer := TStopwatch.StartNew;
+      if aClose then
+      begin
+        FreeAndNil(lForm);
+        Writeln(Format('blocked close elapsed_ms=%d', [lTimer.ElapsedMilliseconds]));
+        if lTimer.ElapsedMilliseconds >= 1000 then
+          raise Exception.Create('Closing a blocked PDH read took >= 1 s');
+        if GetEnvironmentVariable('ACV_RECORDING_EXIT_PROBE') = '1' then
+        begin
+          DeleteHistoryFiles(lDatabase);
+          Writeln('EXIT PROBE: detached fake PDH blocked indefinitely; fixture=' + lDirectory);
+          Flush(Output);
+          Halt(0); // Exercise the exact production unit-finalization guard.
+        end;
+      end else begin
+        WaitForRecording(lForm);
+        if (lTimer.ElapsedMilliseconds >= 1000) or not ContainsText(lForm.memDetails.Text, 'timed out') then
+          raise Exception.Create('Deadline did not show timed out while PDH remained blocked');
+        Writeln(Format('blocked deadline elapsed_ms=%d', [lTimer.ElapsedMilliseconds]));
+        lText := lForm.memDetails.Text;
+        while lTimer.ElapsedMilliseconds < 1800 do
+        begin
+          Application.ProcessMessages;
+          Sleep(1);
+        end;
+        if not ContainsText(EvidenceListText(lForm), 'timed out') then
+          raise Exception.Create('Deadline status missing from evidence rows');
+        if lForm.RecordingPending or (lForm.memDetails.Text <> lText) then
+          raise Exception.Create('Late result replaced the timed-out state');
+      end;
+      Result := 0;
+      Writeln('PASS blocked recording close=' + BoolToStr(aClose, True));
+    except
+      on lException: Exception do
+        Writeln('FAIL blocked recording close=' + BoolToStr(aClose, True) + ': ' + lException.Message);
+    end;
+  finally
+    lForm.Free;
+    // Wait only in this fixture teardown, never in the production form.
+    if not WaitForMachineOverviewRecordingReaders(5000) then
+      raise Exception.Create('Fake PDH did not finish/close native handles');
+    if MachineOverviewRecordingOutstandingRequests <> 0 then
+      raise Exception.Create('A shared recording request leaked after detached cleanup');
+    Writeln('Reader ownership: threads=0 shared_requests=0; fixture files released');
+    Application.ProcessMessages;
+    lEntered.Free;
+    DeleteHistoryFiles(lDatabase);
+    TDirectory.Delete(lDirectory, True);
+  end;
+end;
+
 function RunMachineOverviewIncidentHistorySelfTests(
   const aArg: string): Integer;
 var
@@ -1326,6 +1592,15 @@ begin
   Result := -1;
   if not SameText(aArg, cMachineOverviewIncidentHistorySelfTestArg) then
     Exit;
+  ReportMemoryLeaksOnShutdown := GetEnvironmentVariable('ACV_RECORDING_LEAK_DIAGNOSTIC') = '1';
+  if GetEnvironmentVariable('ACV_RECORDING_LIFETIME_ONLY') = 'baseline' then
+    Exit(0);
+  if GetEnvironmentVariable('ACV_RECORDING_LIFETIME_ONLY') = '1' then
+  begin
+    Result := RunBlockedRecordingViewSelfTest(True);
+    Result := Result + RunBlockedRecordingViewSelfTest(False);
+    Exit;
+  end;
   lProductionWriter := MachineOverviewEvidenceClipboardWriter;
   if not Assigned(lProductionWriter) then
     raise Exception.Create('The production clipboard adapter must be configured');
@@ -1343,7 +1618,10 @@ begin
       Result := Result + RunIncidentHistoryFormSelfTest;
       Result := Result + RunIncidentWorkAreaSelfTest;
       Result := Result + RunIncidentResourceEvidenceViewSelfTest;
-      Writeln(Format('Incident view: 7 tests, %d failed', [Result]));
+      Result := Result + RunIncidentRecordingViewSelfTest;
+      Result := Result + RunBlockedRecordingViewSelfTest(True);
+      Result := Result + RunBlockedRecordingViewSelfTest(False);
+      Writeln(Format('Incident view: 10 tests, %d failed', [Result]));
     except
       on lException: Exception do
       begin

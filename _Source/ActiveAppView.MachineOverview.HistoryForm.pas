@@ -3,10 +3,11 @@ unit ActiveAppView.MachineOverview.HistoryForm;
 interface
 
 uses
-  System.Classes, System.SysUtils, System.Types,
+  System.Classes, System.Diagnostics, System.SysUtils, System.Types,
   Winapi.Messages,
   Vcl.ComCtrls, Vcl.Controls, Vcl.ExtCtrls, Vcl.Forms, Vcl.StdCtrls,
-  ActiveAppView.MachineOverview.History, ActiveAppView.MachineOverview.Incidents;
+  ActiveAppView.MachineOverview.History, ActiveAppView.MachineOverview.Incidents,
+  ActiveAppView.MachineOverview.Recording;
 
 type
   TMachineOverviewIncidentHistoryFilter = (Last24Hours, Last7Days, All);
@@ -14,6 +15,7 @@ type
   TMachineOverviewHistoryFrm = class(TForm)
     btnClose: TButton;
     btnCopyEvidence: TButton;
+    btnReadRecording: TButton;
     btnRefresh: TButton;
     cbFilter: TComboBox;
     labFilter: TStaticText;
@@ -26,6 +28,7 @@ type
     pnlFilter: TPanel;
     gridDetails: TGridPanel;
     procedure btnCopyEvidenceClick(aSender: TObject);
+    procedure btnReadRecordingClick(aSender: TObject);
     procedure btnRefreshClick(aSender: TObject);
     procedure cbFilterChange(aSender: TObject);
     procedure FormDestroy(aSender: TObject);
@@ -51,6 +54,20 @@ type
     fLastEvidenceQueryThreadId: Cardinal;
     fEvidenceNamedCount, fIncidentNamedCount: Integer;
     fEvidenceRowNames: TArray<string>;
+    fRecordingWorker: IMachineOverviewRecordingRequest;
+    fRecordingTimer: TTimer;
+    fRecordingClock: TStopwatch;
+    fRecordingWorkerRequest: Cardinal;
+    fRecordingRequest: Cardinal;
+    fRecordingFiles: TArray<string>;
+    fRecordingKey, fRecordingText, fEvidenceStateLine: string;
+    fRecording: TMachineOverviewRecording;
+    fHasRecording, fRecordingPending: Boolean;
+    fLastRecordingQueryThreadId: Cardinal;
+    procedure StartRecordingWorker;
+    procedure ApplyRecordingResult;
+    procedure ClearRecording;
+    procedure RecordingTimerTick(aSender: TObject);
     procedure ApplyEvidenceResult;
     procedure BeginEvidenceRefresh;
     procedure StartEvidenceWorker;
@@ -74,11 +91,17 @@ type
   protected
     procedure CMShowingChanged(var aMessage: TMessage); message CM_SHOWINGCHANGED;
     function InitialWorkArea: TRect; virtual;
+    function RecordingReadTimeoutMs: Cardinal; virtual; //PALOFF Blocked-PDH fixture overrides the deadline.
+    function RecordingCollector: TFunc<NativeUInt, Cardinal>; virtual; //PALOFF Blocked-PDH fixture replaces the native call.
     procedure DoAfterMonitorDpiChanged(aOldDpi, aNewDpi: Integer); override;
   public
     destructor Destroy; override;
     procedure ScaleForPPI(aNewPpi: Integer); override;
     function LastEvidenceQueryThreadId: Cardinal;
+    procedure ReadRecording(const aFileNames: TArray<string>); //PALOFF UI command and incident-view fixture entry point; unit analysis omits fixture callers.
+    procedure CancelRecording; //PALOFF UI command and incident-view fixture entry point; unit analysis omits fixture callers.
+    function RecordingPending: Boolean;
+    function LastRecordingQueryThreadId: Cardinal;
     procedure Configure(const aDatabaseFileName: string;
       const aReferenceUtc: TDateTime = 0);
     function IncidentAt(const aIndex: Integer): TMachineOverviewIncident;
@@ -111,9 +134,9 @@ var
 implementation
 
 uses
-  System.DateUtils, System.Math, System.Win.ComObj,
+  System.DateUtils, System.IniFiles, System.IOUtils, System.Math, System.SyncObjs, System.Win.ComObj,
   Winapi.CommCtrl, Winapi.oleacc, Winapi.Windows,
-  Vcl.Clipbrd,
+  Vcl.Clipbrd, Vcl.Dialogs,
   AutoFree,
   ActiveAppView.MachineOverview.Evidence,
   ActiveAppView.MachineOverview.Types;
@@ -173,6 +196,13 @@ resourcestring
   rsEvidenceTrimmedRow = 'Removed by budget';
   rsEvidencePartialRow = 'Incomplete';
   rsEvidenceUnavailableRow = 'Evidence unavailable';
+  rsReadRecording = 'Read &recording...';
+  rsCancelRecording = 'Cancel &reading';
+  rsReadingRecording = 'Reading recording...';
+  rsRecordingFailed = 'Windows performance recording: %s';
+  rsRecordingFiles = 'Closed Windows performance recordings (*.blg)';
+  rsRecordingSelect = 'Select closed performance recordings';
+  rsRecordingTimedOut = 'Windows performance recording: reading timed out after 120 seconds. Background cleanup continues when storage responds.';
 
 type
   // As in our overview adapter, use the native HWND ABI on Win64. The Delphi
@@ -617,6 +647,8 @@ begin
     fWorker.Terminate;
   if Assigned(fEvidenceWorker) then
     fEvidenceWorker.Terminate;
+  if Assigned(fRecordingWorker) then
+    fRecordingWorker.Cancel;
   if Assigned(fWorker) then
   begin
     fWorker.WaitFor;
@@ -627,16 +659,22 @@ begin
     fEvidenceWorker.WaitFor;
     FreeAndNil(fEvidenceWorker);
   end;
+  if Assigned(fRecordingWorker) then
+  begin
+    fRecordingWorker := nil;
+  end;
   if HandleAllocated then
     // Completion messages carry no owned payload. Both workers have stopped.
-    while PeekMessage(lMessage, Handle, WM_APP + 146, WM_APP + 147, PM_REMOVE) do
+    while PeekMessage(lMessage, Handle, WM_APP + 146, WM_APP + 148, PM_REMOVE) do
       Continue;
 end;
 
 destructor TMachineOverviewHistoryFrm.Destroy;
 begin
   fClosing := True;
-  // Join while our target HWND still exists, before TCustomForm destroys it.
+  // Recording has no target HWND or form reference and is never joined here.
+  if Assigned(fRecordingTimer) then
+    fRecordingTimer.Enabled := False;
   CloseWorker;
   inherited;
 end;
@@ -654,6 +692,241 @@ begin
   except
     on lException: Exception do
       labStatus.Caption := Format(rsEvidenceCopyFailed, [lException.Message]);
+  end;
+end;
+
+procedure TMachineOverviewHistoryFrm.ClearRecording;
+begin
+  Inc(fRecordingRequest);
+  if Assigned(fRecordingWorker) then
+    fRecordingWorker.Cancel;
+  fRecordingFiles := nil;
+  fRecordingKey := '';
+  fRecordingText := '';
+  fRecording := Default(TMachineOverviewRecording);
+  fRecordingPending := False;
+  fHasRecording := False;
+  btnReadRecording.Caption := rsReadRecording;
+end;
+
+procedure TMachineOverviewHistoryFrm.CancelRecording;
+var
+  lIndex: Integer;
+begin
+  ClearRecording;
+  fRecordingText := Format(rsRecordingFailed, ['Reading recording cancelled.']);
+  lIndex := FindIncidentIndex(SelectedIncidentId);
+  if lIndex >= 0 then
+  begin
+    RenderEvidence;
+    RenderDetails(lIndex, fEvidenceStateLine);
+  end;
+end;
+
+function TMachineOverviewHistoryFrm.RecordingPending: Boolean;
+begin
+  Result := fRecordingPending;
+end;
+
+function TMachineOverviewHistoryFrm.LastRecordingQueryThreadId: Cardinal;
+begin
+  Result := fLastRecordingQueryThreadId;
+end;
+
+procedure TMachineOverviewHistoryFrm.ReadRecording(const aFileNames: TArray<string>);
+var
+  lIndex: Integer;
+begin
+  if fClosing then
+    Exit;
+  lIndex := FindIncidentIndex(SelectedIncidentId);
+  if (lIndex < 0) or (Length(aFileNames) = 0) then
+    Exit;
+  ClearRecording;
+  fRecordingFiles := Copy(aFileNames);
+  fRecordingKey := SelectedIncidentId;
+  fRecordingPending := True;
+  fRecordingClock := TStopwatch.StartNew;
+  if not Assigned(fRecordingTimer) then
+  begin
+    fRecordingTimer := TTimer.Create(Self);
+    fRecordingTimer.Enabled := False;
+    fRecordingTimer.Interval := 50;
+    fRecordingTimer.OnTimer := RecordingTimerTick;
+  end;
+  fRecordingTimer.Enabled := True;
+  fRecordingText := rsReadingRecording;
+  btnReadRecording.Caption := rsCancelRecording;
+  RenderEvidence;
+  RenderDetails(lIndex, fEvidenceStateLine);
+  StartRecordingWorker;
+end;
+
+function TMachineOverviewHistoryFrm.RecordingReadTimeoutMs: Cardinal;
+begin
+  Result := 120000;
+end;
+
+function TMachineOverviewHistoryFrm.RecordingCollector: TFunc<NativeUInt, Cardinal>;
+begin
+  Result := nil;
+end;
+
+procedure TMachineOverviewHistoryFrm.StartRecordingWorker;
+var
+  lIndex: Integer;
+  lIncident: TMachineOverviewIncident;
+begin
+  if fClosing or Assigned(fRecordingWorker) or not fRecordingPending then
+    Exit;
+  lIndex := FindIncidentIndex(fRecordingKey);
+  if lIndex < 0 then
+    Exit;
+  lIncident := fIncidents[lIndex];
+  if lIncident.Evidence.LogicalProcessorCount <= 0 then
+    lIncident.Evidence.LogicalProcessorCount := fHealth.LogicalProcessorCount;
+  fRecordingWorkerRequest := fRecordingRequest;
+  if not TryStartMachineOverviewRecordingRead(fRecordingFiles, lIncident, RecordingCollector(),
+    fRecordingWorker, fRecordingText) then
+  begin
+    fRecordingPending := False;
+    fRecordingText := Format(rsRecordingFailed, [fRecordingText]);
+    btnReadRecording.Caption := rsReadRecording;
+    RenderEvidence;
+    RenderDetails(lIndex, fEvidenceStateLine);
+  end;
+end;
+
+procedure TMachineOverviewHistoryFrm.ApplyRecordingResult;
+var
+  lRecording: TMachineOverviewRecording;
+  lError: string;
+  lSucceeded: Boolean;
+  lThreadId: Cardinal;
+  lIndex, i: Integer;
+  lCurrent: Boolean;
+  lSelectedCaption, lSelectedIdentity: string; //PALOFF Our conventions require non-loop locals in the var section.
+  lSelected: Boolean;
+begin
+  if fClosing or not Assigned(fRecordingWorker) then
+    Exit;
+  if not fRecordingWorker.TryResult(lRecording, lError, lSucceeded, lThreadId) then
+    Exit;
+  lCurrent := fRecordingPending and (fRecordingWorkerRequest = fRecordingRequest) and
+    (fRecordingKey = SelectedIncidentId);
+  if lCurrent then
+  begin
+    fRecordingPending := False;
+    fLastRecordingQueryThreadId := lThreadId;
+    fHasRecording := lSucceeded;
+    if lSucceeded then
+    begin
+      fRecording := lRecording;
+      fRecordingText := MachineOverviewRecordingText(fRecording);
+    end else begin
+      fRecordingText := Format(rsRecordingFailed, [lError]);
+    end;
+    btnReadRecording.Caption := rsReadRecording;
+  end;
+  fRecordingWorker := nil;
+  if not lCurrent then
+  begin
+    StartRecordingWorker;
+    Exit;
+  end;
+  lIndex := FindIncidentIndex(SelectedIncidentId);
+  if lIndex >= 0 then
+  begin
+    lSelected := Assigned(lvEvidence.Selected);
+    lSelectedCaption := '';
+    lSelectedIdentity := '';
+    if lSelected then
+    begin
+      lSelectedCaption := lvEvidence.Selected.Caption;
+      if lvEvidence.Selected.SubItems.Count > 0 then
+        lSelectedIdentity := lvEvidence.Selected.SubItems[0];
+    end;
+    RenderEvidence;
+    if lSelected then
+      for i := 0 to lvEvidence.Items.Count - 1 do
+        if (lvEvidence.Items[i].Caption = lSelectedCaption) and
+          (((lvEvidence.Items[i].SubItems.Count = 0) and lSelectedIdentity.IsEmpty) or
+           ((lvEvidence.Items[i].SubItems.Count > 0) and (lvEvidence.Items[i].SubItems[0] = lSelectedIdentity))) then
+        begin
+          lvEvidence.Selected := lvEvidence.Items[i];
+          Break;
+        end;
+    RenderDetails(lIndex, fEvidenceStateLine);
+  end;
+end;
+
+procedure TMachineOverviewHistoryFrm.RecordingTimerTick(aSender: TObject);
+var
+  lIndex: Integer;
+begin
+  if fClosing then
+    Exit;
+  // Check deadline before completion, so a late result cannot win the race.
+  // The clock starts with the command, including any coalesced waiting time.
+  if fRecordingPending and (fRecordingClock.ElapsedMilliseconds >= RecordingReadTimeoutMs) then
+  begin
+    Inc(fRecordingRequest);
+    if Assigned(fRecordingWorker) then
+      fRecordingWorker.Cancel;
+    fRecordingPending := False;
+    fHasRecording := False;
+    fRecordingText := rsRecordingTimedOut;
+    btnReadRecording.Caption := rsReadRecording;
+    lIndex := FindIncidentIndex(SelectedIncidentId);
+    if lIndex >= 0 then
+    begin
+      RenderEvidence;
+      RenderDetails(lIndex, fEvidenceStateLine);
+    end;
+  end;
+  ApplyRecordingResult;
+  fRecordingTimer.Enabled := fRecordingPending or Assigned(fRecordingWorker);
+end;
+
+procedure TMachineOverviewHistoryFrm.btnReadRecordingClick(aSender: TObject);
+var
+  g: TGarbos;
+  lDialog: TFileOpenDialog;
+  lIni: TMemIniFile;
+  lDirectory, lSettingsFile: string;
+  lFiles: TArray<string>;
+  i: Integer;
+begin
+  if fRecordingPending then
+  begin
+    CancelRecording;
+    Exit;
+  end;
+  g := Default(TGarbos);
+  try
+    lSettingsFile := TPath.Combine(ExtractFilePath(ParamStr(0)), 'settings.ini');
+    GC(lIni, TMemIniFile.Create(lSettingsFile, TEncoding.UTF8, False), g);
+    lDirectory := lIni.ReadString('MachineOverview', 'PerformanceRecordingDirectory', '');
+    GC(lDialog, TFileOpenDialog.Create(nil), g);
+    lDialog.Title := rsRecordingSelect;
+    lDialog.Options := lDialog.Options + [fdoAllowMultiSelect, fdoFileMustExist, fdoPathMustExist];
+    lDialog.FileTypes.Add.DisplayName := rsRecordingFiles;
+    lDialog.FileTypes[0].FileMask := '*.blg';
+    lDialog.DefaultExtension := 'blg';
+    lDialog.DefaultFolder := lDirectory;
+    if not lDialog.Execute(Handle) then
+      Exit;
+    SetLength(lFiles, lDialog.Files.Count);
+    for i := 0 to High(lFiles) do
+      lFiles[i] := lDialog.Files[i];
+    if Length(lFiles) = 0 then
+      Exit;
+    ReadRecording(lFiles);
+    lIni.WriteString('MachineOverview', 'PerformanceRecordingDirectory', ExtractFileDir(lFiles[0]));
+    lIni.UpdateFile;
+  except
+    on lException: Exception do
+      labStatus.Caption := Format(rsRecordingFailed, [lException.Message]);
   end;
 end;
 
@@ -693,11 +966,13 @@ var
 begin
   if fClosing then
     Exit;
+  ClearRecording;
   Inc(fEvidenceRequest);
   fRequestedEvidenceKey := SelectedIncidentId;
   fEvidenceRowNames := nil;
   lvEvidence.Items.Clear;
   btnCopyEvidence.Enabled := False;
+  btnReadRecording.Enabled := not fRequestedEvidenceKey.IsEmpty;
   lIndex := FindIncidentIndex(fRequestedEvidenceKey);
   if lIndex < 0 then
   begin
@@ -773,9 +1048,12 @@ end;
 
 procedure TMachineOverviewHistoryFrm.RenderDetails(const aIndex: Integer; const aEvidenceStateLine: string);
 begin
+  fEvidenceStateLine := aEvidenceStateLine;
   memDetails.Text := FormatIncidentDetails(fIncidents[aIndex], aEvidenceStateLine, nil) +
     sLineBreak + FormatMachineOverviewHistoryHealth(fHealth, CurrentReferenceUtc) +
     sLineBreak + Format(rsEvidenceRawReference, [fDatabaseFileName, fIncidents[aIndex].StableId]);
+  if not fRecordingText.IsEmpty then
+    memDetails.Text := memDetails.Text + sLineBreak + sLineBreak + fRecordingText;
 end;
 
 function IncidentTraceName(const aIncident: TMachineOverviewIncident): string;
@@ -838,6 +1116,23 @@ begin
       SetLength(fEvidenceRowNames, Length(fEvidenceRowNames) + 1);
       fEvidenceRowNames[High(fEvidenceRowNames)] := rsEvidenceTraceKind + ', ' + IncidentTraceName(fIncidents[lIndex]) +
         ', ' + ExtractFileName(fIncidents[lIndex].TraceFile) + ', ' + fIncidents[lIndex].TraceDetail;
+    end;
+    if fHasRecording then
+      for lRow in MachineOverviewRecordingRows(fRecording) do
+      begin
+        lItem := lvEvidence.Items.Add;
+        lItem.Caption := Trim(lRow.Phase + ' ' + lRow.Kind + ' ' + lRow.Name);
+        lItem.SubItems.Add(lRow.Identity);
+        lItem.SubItems.Add(lRow.Average);
+        lItem.SubItems.Add(lRow.Peak);
+        lItem.SubItems.Add(lRow.PeakTime);
+        lItem.SubItems.Add(lRow.Measured);
+        fEvidenceRowNames := fEvidenceRowNames + [lRow.AccessibleText];
+      end
+    else if not fRecordingText.IsEmpty then
+    begin
+      lvEvidence.Items.Add.Caption := fRecordingText;
+      fEvidenceRowNames := fEvidenceRowNames + [fRecordingText];
     end;
   finally
     lvEvidence.Items.EndUpdate;

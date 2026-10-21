@@ -40,6 +40,8 @@ uses
   ActiveAppView.MachineOverview.Presentation in 'ActiveAppView.MachineOverview.Presentation.pas',
   ActiveAppView.MachineOverview.ProcessProvider in 'ActiveAppView.MachineOverview.ProcessProvider.pas',
   ActiveAppView.MachineOverview.Providers in 'ActiveAppView.MachineOverview.Providers.pas',
+  ActiveAppView.MachineOverview.Recording in 'ActiveAppView.MachineOverview.Recording.pas',
+  ActiveAppView.MachineOverview.Recording.SelfTests in 'ActiveAppView.MachineOverview.Recording.SelfTests.pas',
   ActiveAppView.MachineOverview.SelfTests in 'ActiveAppView.MachineOverview.SelfTests.pas',
   ActiveAppView.MachineOverview.Service in 'ActiveAppView.MachineOverview.Service.pas',
   ActiveAppView.MachineOverview.Settings in 'ActiveAppView.MachineOverview.Settings.pas',
@@ -147,6 +149,10 @@ begin
   end;
 
   lSelfTestResult := RunWindowSnapshotSelfTests(ParamStr(1));
+  if lSelfTestResult <> -1 then
+    Halt(lSelfTestResult);
+
+  lSelfTestResult := RunMachineOverviewRecordingSelfTests(ParamStr(1));
   if lSelfTestResult <> -1 then
     Halt(lSelfTestResult);
 

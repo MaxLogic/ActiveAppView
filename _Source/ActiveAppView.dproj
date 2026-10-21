@@ -171,6 +171,8 @@
         <DCCReference Include="ActiveAppView.MachineOverview.Presentation.pas"/>
         <DCCReference Include="ActiveAppView.MachineOverview.ProcessProvider.pas"/>
         <DCCReference Include="ActiveAppView.MachineOverview.Providers.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Recording.pas"/>
+        <DCCReference Include="ActiveAppView.MachineOverview.Recording.SelfTests.pas"/>
         <DCCReference Include="ActiveAppView.MachineOverview.SelfTests.pas"/>
         <DCCReference Include="ActiveAppView.MachineOverview.Service.pas"/>
         <DCCReference Include="ActiveAppView.MachineOverview.Settings.pas"/>

@@ -211,7 +211,7 @@ object MachineOverviewHistoryFrm: TMachineOverviewHistoryFrm
     TabOrder = 2
     object btnCopyEvidence: TButton
       AlignWithMargins = True
-      Left = 641
+      Left = 471
       Top = 3
       Width = 150
       Height = 46
@@ -220,6 +220,18 @@ object MachineOverviewHistoryFrm: TMachineOverviewHistoryFrm
       Enabled = False
       TabOrder = 0
       OnClick = btnCopyEvidenceClick
+    end
+    object btnReadRecording: TButton
+      AlignWithMargins = True
+      Left = 627
+      Top = 3
+      Width = 164
+      Height = 46
+      Align = alRight
+      Caption = 'Read &recording...'
+      Enabled = False
+      TabOrder = 1
+      OnClick = btnReadRecordingClick
     end
     object btnClose: TButton
       AlignWithMargins = True
@@ -231,7 +243,7 @@ object MachineOverviewHistoryFrm: TMachineOverviewHistoryFrm
       Cancel = True
       Caption = 'Close'
       ModalResult = 2
-      TabOrder = 1
+      TabOrder = 2
     end
     object labStatus: TStaticText
       AlignWithMargins = True
