@@ -52,3 +52,4 @@ _analysis/
 .windsurf/
 /_Source/ConsoleFilterSounds.res
 /_Source/*.dfmcheck.cache
+.claude/skills/
