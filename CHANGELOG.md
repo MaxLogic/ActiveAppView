@@ -29,6 +29,7 @@ All notable changes to this project are documented in this file.
 - `Scripts\Copy-MarkdownAsRichText.ps1` now always converts clipboard markdown to HTML (CF_HTML with the original markdown as text fallback), without a format menu. The library still supports RTF and plain text (ACV-075).
 
 ### Fixed
+- `Scripts\x-mouse.ps1` now closes its PowerShell host after success or failure, including when launched with `-NoExit`.
 - Onset tracing cleans up retained sessions even when disabled, reports retained memory and invalid ownership markers, and documents its reserved WPR instance name (ACV-069).
 - Onset tracing preserves foreign sessions with the same instance name and retries pending-session cleanup from a durable ownership marker (ACV-069).
 - Onset tracing recovers sessions from uncertain starts, captures real user marks once, and applies ETL retention after failed saves while reporting both save and cleanup errors (ACV-069).

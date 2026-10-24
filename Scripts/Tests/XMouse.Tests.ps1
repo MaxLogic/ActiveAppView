@@ -3,7 +3,55 @@ BeforeAll {
     $script:mouseBeamPath = 'F:\projects\MaxLogic\MouseBeam\xMouse.exe'
 }
 
+Describe 'MouseBeam host shutdown' {
+    It 'closes a -NoExit host with exit code <ExpectedExitCode>' -TestCases @(
+        @{ ExecutableExists = '$true'; ExpectedExitCode = 0 }
+        @{ ExecutableExists = '$false'; ExpectedExitCode = 1 }
+    ) {
+        param($ExecutableExists, $ExpectedExitCode)
+
+        $escapedPath = $script:togglePath.Replace("'", "''")
+        $command = @"
+function Test-Path { $ExecutableExists }
+function Get-Process { @() }
+function Start-Process { [pscustomobject]@{ Id = 456 } }
+& '$escapedPath'
+"@
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = (Get-Command powershell.exe -ErrorAction Stop).Source
+        $startInfo.Arguments = '-NoProfile -NoExit -EncodedCommand ' +
+            [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        try {
+            $process.Start() | Should -BeTrue
+            $process.WaitForExit(5000) | Should -BeTrue -Because 'the script must close its host even with -NoExit'
+            $process.ExitCode | Should -Be $ExpectedExitCode
+        }
+        finally {
+            if (-not $process.HasExited) {
+                $process.Kill()
+                $process.WaitForExit()
+            }
+            $process.Dispose()
+        }
+    }
+}
+
 Describe 'MouseBeam toggle' {
+    BeforeAll {
+        # Keep process termination inside the dedicated host-shutdown tests.
+        $script:behaviorTogglePath = Join-Path $TestDrive 'x-mouse.ps1'
+        $scriptText = Get-Content -LiteralPath $script:togglePath -Raw
+        $scriptText = $scriptText -replace '\[Environment\]::Exit\((\d+)\)', 'exit $1'
+        [IO.File]::WriteAllText($script:behaviorTogglePath, $scriptText)
+    }
+
     BeforeEach {
         Mock Test-Path { $true }
         Mock Get-Process { @() }
@@ -31,7 +79,7 @@ Describe 'MouseBeam toggle' {
 
     It 'closes the matching image gracefully, ignoring path case' {
         Mock Get-Process { $mouseProcess }
-        $output = & $script:togglePath
+        $output = & $script:behaviorTogglePath
         $LASTEXITCODE | Should -Be 0
         $mouseProcess.CloseRequested | Should -BeTrue
         $mouseProcess.WaitMilliseconds | Should -Be 2000
@@ -43,7 +91,7 @@ Describe 'MouseBeam toggle' {
     It 'forces termination when graceful shutdown times out' {
         $mouseProcess.Exits = $false
         Mock Get-Process { $mouseProcess }
-        $output = & $script:togglePath
+        $output = & $script:behaviorTogglePath
         $LASTEXITCODE | Should -Be 0
         $mouseProcess.CloseRequested | Should -BeTrue
         $mouseProcess.WaitMilliseconds | Should -Be 2000
@@ -55,7 +103,7 @@ Describe 'MouseBeam toggle' {
     It 'forces termination when no main window can close' {
         $mouseProcess.CanClose = $false
         Mock Get-Process { $mouseProcess }
-        $output = & $script:togglePath
+        $output = & $script:behaviorTogglePath
         $LASTEXITCODE | Should -Be 0
         $mouseProcess.WaitMilliseconds | Should -Be 0
         $output | Should -Match 'force.*123'
@@ -63,7 +111,7 @@ Describe 'MouseBeam toggle' {
     }
 
     It 'starts the executable when it is not running' {
-        $output = & $script:togglePath
+        $output = & $script:behaviorTogglePath
         $LASTEXITCODE | Should -Be 0
         $output | Should -Match 'Started.*456'
         Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
@@ -75,7 +123,7 @@ Describe 'MouseBeam toggle' {
     It 'ignores an xMouse instance at another image path' {
         $mouseProcess.Path = 'C:\Other\xMouse.exe'
         Mock Get-Process { $mouseProcess }
-        & $script:togglePath
+        & $script:behaviorTogglePath
         $LASTEXITCODE | Should -Be 0
         $mouseProcess.CloseRequested | Should -BeFalse
         Should -Invoke Stop-Process -Times 0 -Exactly
@@ -84,7 +132,7 @@ Describe 'MouseBeam toggle' {
 
     It 'reports a missing executable and exits with code 1' {
         Mock Test-Path { $false }
-        & $script:togglePath
+        & $script:behaviorTogglePath
         $LASTEXITCODE | Should -Be 1
         Should -Invoke Write-Error -Times 1 -Exactly -ParameterFilter { $Message -like '*MouseBeam executable not found*' }
         Should -Invoke Get-Process -Times 0 -Exactly
