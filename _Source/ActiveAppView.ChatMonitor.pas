@@ -96,7 +96,7 @@ uses
   System.DateUtils, System.IOUtils, System.JSON, System.StrUtils,
   Winapi.MMSystem,
   maxLogic.StrUtils, maxLogic.Windows.Desktop, MaxLogic.Windows.Identity,
-  ActiveAppView.MachineOverview.BoundedProcess, ActiveAppViewCore;
+  ActiveAppView.WindowSnapshots, ActiveAppViewCore;
 
 type
   // Lets the monitor retry a lookup whose helper process failed without discarding what it did learn.
@@ -924,7 +924,7 @@ begin
 
   // Metadata belongs to one window of one process instance and cannot change while that process lives.
   // Keying by the process start time as well lets a reused window handle or PID load fresh data, while
-  // an unchanged window never starts the helper processes (and their WMI query) again.
+  // an unchanged window is read only once.
   lPid := maxLogic.Windows.Desktop.RetrievePID(aWnd);
   lStartedAt := 0;
   lHasStartedAt := (lPid <> 0) and TryGetProcessStartedAtUtcMilliseconds(lPid, lStartedAt);
@@ -935,17 +935,12 @@ begin
   lLoader :=
     function: IInterface
     var
-      lAppUserModelID: string;
-      lCommandLineParams: string;
       lComplete: Boolean;
-      lData: TJSONValue;
       lFileName: string;
-      lMask: Integer;
-      lProcessResult: TMachineOverviewProcessResult;
+      lWindow: TWindowSnapshot;
     begin
       lFileName := '';
-      lAppUserModelID := '';
-      lCommandLineParams := '';
+      lWindow := Default(TWindowSnapshot);
       // Without a process identity there is nothing more to ask; retry later in case it was transient.
       lComplete := lHasStartedAt;
 
@@ -957,56 +952,19 @@ begin
 
       if lHasStartedAt and (fCancel.WaitFor(0) <> wrSignaled) then
       begin
-        // Keep WMI and shell COM calls outside our process so shutdown can cancel them.
-        // Identity remains usable even when the independent command-line query fails.
-        for lMask := 1 to 2 do
-        begin
-          if fCancel.WaitFor(0) = wrSignaled then
+        // In-process and bounded: no helper process and no WMI query (see CollectWindowMetadata).
+        try
+          if not CollectWindowMetadata(aWnd, lPid, lStartedAt, [wmIdentity, wmCommandLine], lWindow) then
+            lComplete := False;
+        except
+          on lException: Exception do
           begin
             lComplete := False;
-            Break;
-          end;
-          try
-            lProcessResult := RunMachineOverviewBoundedProcessCancelable(ParamStr(0),
-              Format('--window-metadata %s %d %d %d',
-                [UIntToStr(NativeUInt(aWnd)), lPid, lStartedAt, lMask]),
-              15000, 262144, fCancel.Handle);
-            if lProcessResult.Cancelled then
-            begin
-              lComplete := False;
-              Break;
-            end;
-            if lProcessResult.Started and (lProcessResult.ExitCode = 0) then
-            begin
-              lData := TJSONObject.ParseJSONValue(lProcessResult.OutputText);
-              try
-                if lData is TJSONObject then
-                begin
-                  if lMask = 1 then
-                    lAppUserModelID := lData.GetValue<string>('appUserModelId', '')
-                  else
-                    lCommandLineParams := lData.GetValue<string>('commandLineParams', '');
-                end else
-                  lComplete := False;
-              finally
-                lData.Free;
-              end;
-            end else
-            begin
-              lComplete := False;
-              OutputDebugString(PChar(Format('Chat monitor metadata: pid=%d fields=%d exit=%d %s',
-                [lPid, lMask, lProcessResult.ExitCode, lProcessResult.ErrorText])));
-            end;
-          except
-            on lException: Exception do
-            begin
-              lComplete := False;
-              OutputDebugString(PChar('Chat monitor metadata: ' + lException.Message));
-            end;
+            OutputDebugString(PChar('Chat monitor metadata: ' + lException.Message));
           end;
         end;
       end;
-      Result := TChatAppMetadata.Create(lFileName, lAppUserModelID, lCommandLineParams, lComplete);
+      Result := TChatAppMetadata.Create(lFileName, lWindow.AppUserModelID, lWindow.CommandLineParams, lComplete);
     end;
 
   lOptions := TMaxCacheOptions.Create;

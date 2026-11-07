@@ -77,6 +77,8 @@ type
   end;
 
 function RunCoreSelfTests(const aArg: string): Integer;
+// Everything after the executable path (quoted or not), trimmed.
+function ExtractCommandLineParams(const aCommandLine: string): string;
 
 implementation
 
@@ -170,46 +172,44 @@ begin
   Result:= fCommandLine;
 end;
 
-function TAppInfo.GetCommandLineParams: String;
+function ExtractCommandLineParams(const aCommandLine: string): string;
 var
   lLen: Integer;
   s: String;
   i: Integer;
 begin
+  s := aCommandLine.Trim;
+  if s = '' then
+    Exit('');
+
+  if startsStr('"', s) then
+  begin
+    i := posEx('"', s, 2);
+    if i > 0 then
+      Inc(i);
+  end else begin
+    i := 1;
+    lLen := Length(s);
+    while (i <= lLen) and (not CharInSet(s[i], [#9, #10, #13, ' '])) do
+      Inc(i);
+    if i > lLen then
+      i := 0;
+  end;
+
+  if i <= 0 then
+    Exit('');
+  lLen := Length(s);
+  while (i <= lLen) and CharInSet(s[i], [#9, #10, #13, ' ']) do
+    Inc(i);
+  Result := Copy(s, i, Length(s)).Trim;
+end;
+
+function TAppInfo.GetCommandLineParams: String;
+begin
   if not fCommandLineParamsRetrieved then
   begin
     fCommandLineParamsRetrieved := True;
-    s := Self.CommandLine.Trim;
-    if s = '' then
-      fCommandLineParams := ''
-    else
-    begin
-      if startsStr('"', s) then
-      begin
-        i := posEx('"', s, 2);
-        if i > 0 then
-          Inc(i);
-      end
-      else
-      begin
-        i := 1;
-        lLen := Length(s);
-        while (i <= lLen) and (not CharInSet(s[i], [#9, #10, #13, ' '])) do
-          Inc(i);
-        if i > lLen then
-          i := 0;
-      end;
-
-      if i <= 0 then
-        fCommandLineParams := ''
-      else
-      begin
-        lLen := Length(s);
-        while (i <= lLen) and CharInSet(s[i], [#9, #10, #13, ' ']) do
-          Inc(i);
-        fCommandLineParams := Copy(s, i, Length(s)).Trim;
-      end;
-    end;
+    fCommandLineParams := ExtractCommandLineParams(Self.CommandLine);
   end;
 
   Result := fCommandLineParams;

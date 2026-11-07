@@ -85,6 +85,9 @@ type
   end;
 
 function SameWindowSnapshotIdentity(const aLeft, aRight: TWindowSnapshot): Boolean;
+// Reads the requested fields in our process. False when the window or its process changed meanwhile.
+function CollectWindowMetadata(const aWnd: HWND; const aExpectedPID: Cardinal; const aExpectedStartedAt: Int64;
+  const aFields: TWindowMetadataFields; var aWindow: TWindowSnapshot): Boolean;
 function RunWindowMetadataHelper: Integer;
 function RunWindowSnapshotSelfTests(const aArg: string): Integer;
 
@@ -757,9 +760,7 @@ end;
 procedure TWindowSnapshotService.Enrich;
 var
   lFields: TWindowMetadataFields;
-  lData: TJSONObject;
   lFound: Boolean;
-  lResult: TMachineOverviewProcessResult;
   lWindow: TWindowSnapshot;
   lNow: UInt64;
 begin
@@ -783,30 +784,12 @@ begin
       lNow := lWindow.MetadataAttemptedAt + 1;
     lWindow.MetadataAttemptedAt := lNow;
     try
-      lResult := RunMachineOverviewBoundedProcessCancelable(ParamStr(0),
-        Format('--window-metadata %s %d %d %d', [UIntToStr(NativeUInt(lWindow.Wnd)),
-          lWindow.PID, lWindow.ProcessStartedAt, Byte(lFields)]), 15000, 262144, fCancel.Handle);
-      if lResult.Cancelled then
-        Break;
-      if lResult.Started and (lResult.ExitCode = 0) then
+      if CollectWindowMetadata(lWindow.Wnd, lWindow.PID, lWindow.ProcessStartedAt, lFields, lWindow) then
       begin
-        lData := TJSONObject.ParseJSONValue(lResult.OutputText) as TJSONObject;
-        try
-          if not Assigned(lData) then
-            raise Exception.Create('Invalid window metadata response');
-          lWindow.CommandLine := lData.GetValue<string>('commandLine');
-          lWindow.CommandLineParams := lData.GetValue<string>('commandLineParams');
-          lWindow.AppUserModelID := lData.GetValue<string>('appUserModelId');
-          lWindow.RelaunchCommand := lData.GetValue<string>('relaunchCommand');
-          lWindow.IconBytes := TNetEncoding.Base64.DecodeStringToBytes(lData.GetValue<string>('icon'));
-          lWindow.MetadataReady := True;
-          lWindow.MetadataError := '';
-        finally
-          lData.Free;
-        end;
+        lWindow.MetadataReady := True;
+        lWindow.MetadataError := '';
       end else
-        lWindow.MetadataError := Format('Metadata exit %d: %s',
-          [lResult.ExitCode, lResult.ErrorText]);
+        lWindow.MetadataError := 'Window or process changed during metadata retrieval';
     except
       on lException: Exception do
         lWindow.MetadataError := lException.ClassName + ': ' + lException.Message;
@@ -917,108 +900,71 @@ begin
 end;
 
 function RunWindowMetadataHelper: Integer;
-var
-  lApp: TAppInfo;
-  lFields: TWindowMetadataFields;
-  lMask: Integer;
-  lMetadata: TWindowSnapshot;
-  lComResult: HRESULT;
-  lBytes: TBytes;
-  lData: TJSONObject;
-  lPID: Cardinal;
-  lExpectedPID: Cardinal;
-  lExpectedStart: Int64;
-  lStart: Int64;
-  lStream: TMemoryStream;
-  lWnd: HWND;
-  lWritten: Cardinal;
 begin
   Result := -1;
-  if SameText(ParamStr(1), '--window-metadata-test-wait') then
-  begin
-    Sleep(INFINITE);
-    Exit(0);
-  end;
   if SameText(ParamStr(1), cRestrictedFileNameFixtureArg) then
     Exit(RunFileNameFixtureWindow(ParamStr(2)));
-  if not SameText(ParamStr(1), '--window-metadata') then
+end;
+
+function SameWindowProcess(const aWnd: HWND; const aExpectedPID: Cardinal; const aExpectedStartedAt: Int64): Boolean;
+var
+  lPID: Cardinal;
+  lStart: Int64;
+begin
+  lPID := 0;
+  GetWindowThreadProcessId(aWnd, lPID);
+  lStart := 0;
+  if not TryGetProcessStartedAtUtcMilliseconds(lPID, lStart) then
+    lStart := 0;
+  Result := IsWindow(aWnd) and (lPID <> 0) and (lPID = aExpectedPID) and (lStart = aExpectedStartedAt);
+end;
+
+function CollectWindowMetadata(const aWnd: HWND; const aExpectedPID: Cardinal; const aExpectedStartedAt: Int64;
+  const aFields: TWindowMetadataFields; var aWindow: TWindowSnapshot): Boolean;
+var
+  lComResult: HRESULT;
+  lIcon: TIcon;
+  lStream: TMemoryStream;
+begin
+  // Every call here is bounded: the command line comes from the process itself, the app ID from the
+  // window's property store, and the icon request gives up on a window that does not answer. We do not
+  // read the caption: for a window of our own process that would send a message to its thread.
+  Result := False;
+  if not SameWindowProcess(aWnd, aExpectedPID, aExpectedStartedAt) then
     Exit;
-  Result := 1;
   lComResult := CoInitializeEx(nil, COINIT_APARTMENTTHREADED);
   try
-    try
-      lMask := StrToIntDef(ParamStr(5), 7);
-      if (lMask < 1) or (lMask > 7) then
-        Exit;
-      lFields := TWindowMetadataFields(Byte(lMask));
-      lMetadata := Default(TWindowSnapshot);
-      lWnd := HWND(StrToUInt64(ParamStr(2)));
-      lExpectedPID := StrToUInt(ParamStr(3));
-      lExpectedStart := StrToInt64(ParamStr(4));
-      lPID := 0;
-      GetWindowThreadProcessId(lWnd, lPID);
-      lStart := 0;
-      if not TryGetProcessStartedAtUtcMilliseconds(lPID, lStart) then
-        lStart := 0;
-      if (lPID = 0) or (lPID <> lExpectedPID) or (lStart <> lExpectedStart) then
-        Exit;
-      lApp := TAppInfo.Create(lWnd);
-      try
-        lData := TJSONObject.Create;
-        try
-          if wmIdentity in lFields then
-          begin
-            lMetadata.AppUserModelID := lApp.AppUserModelID;
-            lMetadata.RelaunchCommand := lApp.RelaunchCommand;
-          end;
-          if wmCommandLine in lFields then
-          begin
-            lMetadata.CommandLine := lApp.CommandLine;
-            lMetadata.CommandLineParams := lApp.CommandLineParams;
-          end;
-          lData.AddPair('commandLine', lMetadata.CommandLine);
-          lData.AddPair('commandLineParams', lMetadata.CommandLineParams);
-          lData.AddPair('appUserModelId', lMetadata.AppUserModelID);
-          lData.AddPair('relaunchCommand', lMetadata.RelaunchCommand);
-          lStream := TMemoryStream.Create;
-          try
-            if wmIcon in lFields then
-              if not lApp.Icon.Empty then
-                lApp.Icon.SaveToStream(lStream);
-            SetLength(lBytes, lStream.Size);
-            if Length(lBytes) > 0 then
-              Move(lStream.Memory^, lBytes[0], Length(lBytes));
-            lData.AddPair('icon', TNetEncoding.Base64.EncodeBytesToString(lBytes));
-          finally
-            lStream.Free;
-          end;
-          GetWindowThreadProcessId(lWnd, lPID);
-          lStart := 0;
-          if not TryGetProcessStartedAtUtcMilliseconds(lPID, lStart) then
-            lStart := 0;
-          if (not IsWindow(lWnd)) or (lPID <> lExpectedPID) or (lStart <> lExpectedStart) then
-            Exit;
-          lBytes := TEncoding.UTF8.GetBytes(lData.ToJSON);
-          if WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), lBytes[0], Length(lBytes), lWritten, nil) and
-            (lWritten = Cardinal(Length(lBytes))) then
-            Result := 0;
-        finally
-          lData.Free;
-        end;
-      finally
-        lApp.Free;
-      end;
-    except
-      on lException: Exception do
-      begin
-        OutputDebugString(PChar('Window metadata: ' + lException.Message));
-        Result := 1;
-      end;
+    if wmIdentity in aFields then
+    begin
+      aWindow.AppUserModelID := maxLogic.Windows.Desktop.RetrieveAppUserModelID(aWnd);
+      aWindow.RelaunchCommand := maxLogic.Windows.Desktop.RetrieveRelaunchCommand(aWnd);
     end;
   finally
     if Succeeded(lComResult) then
       CoUninitialize;
   end;
+  if wmCommandLine in aFields then
+  begin
+    aWindow.CommandLine := maxLogic.Windows.Desktop.RetrieveCommandLine(aExpectedPID);
+    aWindow.CommandLineParams := ExtractCommandLineParams(aWindow.CommandLine);
+  end;
+  if wmIcon in aFields then
+  begin
+    lIcon := TIcon.Create;
+    lStream := TMemoryStream.Create;
+    try
+      if maxLogic.Windows.Desktop.CopyIconFromWindowHandle(aWnd, lIcon) and not lIcon.Empty then
+        lIcon.SaveToStream(lStream);
+      SetLength(aWindow.IconBytes, lStream.Size);
+      if Length(aWindow.IconBytes) > 0 then
+        Move(lStream.Memory^, aWindow.IconBytes[0], Length(aWindow.IconBytes));
+    finally
+      lStream.Free;
+      lIcon.Free;
+    end;
+  end;
+  // A window handle or PID reused during the lookup must not receive the other process's data.
+  Result := SameWindowProcess(aWnd, aExpectedPID, aExpectedStartedAt);
 end;
 
 function RunMetadataPolicySelfTest: Integer;
@@ -1118,19 +1064,70 @@ begin
     Writeln('METADATA POLICY PASS selective-fields process-cache identity-isolation prefix-fallback');
 end;
 
+function RunUnresponsiveWindowMetadataSelfTest: Integer;
+var
+  lCreated: TEvent;
+  lRelease: TEvent;
+  lStartedAt: Int64;
+  lThread: TThread;
+  lWatch: TStopwatch;
+  lWindow: TWindowSnapshot;
+  lWnd: HWND;
+begin
+  Result := 1;
+  lWnd := 0;
+  lCreated := TEvent.Create(nil, True, False, '');
+  lRelease := TEvent.Create(nil, True, False, '');
+  lThread := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      lWnd := CreateWindowEx(WS_EX_TOOLWINDOW or WS_EX_NOACTIVATE, 'STATIC',
+        'ActiveAppView unresponsive metadata fixture', WS_POPUP, 0, 0, 0, 0, 0, 0, HInstance, nil);
+      lCreated.SetEvent;
+      // We never pump messages here, so the window cannot answer WM_GETICON or any other sent message.
+      lRelease.WaitFor(30000);
+      if lWnd <> 0 then
+        DestroyWindow(lWnd);
+    end);
+  lThread.FreeOnTerminate := False;
+  try
+    try
+      lThread.Start;
+      if (lCreated.WaitFor(5000) <> wrSignaled) or (lWnd = 0) then
+        raise Exception.Create('Unresponsive fixture window was not created');
+      if not TryGetProcessStartedAtUtcMilliseconds(GetCurrentProcessId, lStartedAt) then
+        raise Exception.Create('Could not obtain the fixture process start time');
+      lWindow := Default(TWindowSnapshot);
+      lWatch := TStopwatch.StartNew;
+      if not CollectWindowMetadata(lWnd, GetCurrentProcessId, lStartedAt, cAllMetadata, lWindow) then
+        raise Exception.Create('Metadata collection rejected the unresponsive fixture window');
+      if lWatch.ElapsedMilliseconds > 3000 then
+        raise Exception.Create(Format('Metadata collection waited %d ms on an unresponsive window',
+          [lWatch.ElapsedMilliseconds]));
+      if lWindow.CommandLine = '' then
+        raise Exception.Create('Metadata collection lost the command line of an unresponsive window');
+      Writeln(Format('METADATA UNRESPONSIVE PASS duration-ms=%d', [lWatch.ElapsedMilliseconds]));
+      Result := 0;
+    except
+      on lException: Exception do
+        Writeln('SELFTEST FAILED: ' + lException.Message);
+    end;
+  finally
+    lRelease.SetEvent;
+    lThread.WaitFor;
+    lThread.Free;
+    lRelease.Free;
+    lCreated.Free;
+  end;
+end;
+
 function RunWindowSnapshotSelfTests(const aArg: string): Integer;
 var
   lBatch: TWindowSnapshotBatch;
-  lCancel: TEvent;
-  lData: TJSONObject;
-  lFinished: TEvent;
   lFields: TWindowMetadataFields;
-  lArguments: string;
   lPrevious: TWindowSnapshots;
-  lProcessResult: TMachineOverviewProcessResult;
   lService: TWindowSnapshotService;
   lStartedAt: Int64;
-  lThread: TThread;
   lWatch: TStopwatch;
   lWnd: HWND;
   lWindow: TWindowSnapshot;
@@ -1147,7 +1144,7 @@ begin
     not SameText(aArg, '--self-test-window-snapshot-ownership') and
     not SameText(aArg, '--self-test-window-metadata') and
     not SameText(aArg, '--self-test-window-metadata-fields') and
-    not SameText(aArg, '--self-test-window-metadata-cancel') then
+    not SameText(aArg, '--self-test-window-metadata-unresponsive') then
     Exit;
   Result := 0;
   try
@@ -1193,80 +1190,43 @@ begin
       end;
       Exit;
     end;
+    if SameText(aArg, '--self-test-window-metadata-unresponsive') then
+    begin
+      Result := RunUnresponsiveWindowMetadataSelfTest;
+      Exit;
+    end;
     if not SameText(aArg, '--self-test-window-snapshots') then
     begin
       lWnd := CreateWindowEx(WS_EX_TOOLWINDOW or WS_EX_NOACTIVATE, 'STATIC',
         'ActiveAppView metadata fixture', WS_POPUP, 0, 0, 0, 0, 0, 0, HInstance, nil);
       if lWnd = 0 then
         RaiseLastOSError;
-      lCancel := TEvent.Create(nil, True, False, '');
-      lFinished := TEvent.Create(nil, True, False, '');
-      lThread := nil;
       try
         lStartedAt := 0;
         if not TryGetProcessStartedAtUtcMilliseconds(GetCurrentProcessId, lStartedAt) then
           raise Exception.Create('Could not obtain the fixture process start time');
-        lArguments := Format('--window-metadata %s %d %d',
-          [UIntToStr(NativeUInt(lWnd)), GetCurrentProcessId, lStartedAt]);
         if SameText(aArg, '--self-test-window-metadata-fields') then
-          lArguments := lArguments + ' 1';
-        if SameText(aArg, '--self-test-window-metadata-cancel') then
-          lArguments := '--window-metadata-test-wait';
-        lThread := TThread.CreateAnonymousThread(
-          procedure
-          begin
-            try
-              lProcessResult := RunMachineOverviewBoundedProcessCancelable(ParamStr(0),
-                lArguments, 15000, 262144, lCancel.Handle);
-            finally
-              lFinished.SetEvent;
-            end;
-          end);
-        lThread.FreeOnTerminate := False;
-        lThread.Start;
+          lFields := [wmIdentity]
+        else
+          lFields := cAllMetadata;
+        lWindow := Default(TWindowSnapshot);
         lWatch := TStopwatch.StartNew;
-        while lFinished.WaitFor(0) <> wrSignaled do
+        if not CollectWindowMetadata(lWnd, GetCurrentProcessId, lStartedAt, lFields, lWindow) then
+          raise Exception.Create('Metadata collection rejected an unchanged fixture window');
+        if SameText(aArg, '--self-test-window-metadata-fields') then
         begin
-          Application.ProcessMessages;
-          if SameText(aArg, '--self-test-window-metadata-cancel') or
-            (lWatch.ElapsedMilliseconds > 16000) then
-            lCancel.SetEvent;
-          Sleep(1);
-        end;
-        lThread.WaitFor;
-        if Assigned(lThread.FatalException) then
-          raise Exception.Create('Metadata test worker raised an exception');
-        if SameText(aArg, '--self-test-window-metadata-cancel') then
-        begin
-          if (not lProcessResult.Cancelled) or (lWatch.ElapsedMilliseconds > 2000) then
-            raise Exception.Create('Metadata cancellation did not join within two seconds');
-          Writeln(Format('METADATA CANCEL PASS join-ms=%d child-pid=%d',
-            [lWatch.ElapsedMilliseconds, lProcessResult.ProcessId]));
-        end else begin
-          if lProcessResult.ExitCode <> 0 then
-            raise Exception.Create('Metadata helper failed: ' + lProcessResult.ErrorText);
-          lData := TJSONObject.ParseJSONValue(lProcessResult.OutputText) as TJSONObject;
-          try
-            if not Assigned(lData) then
-              raise Exception.Create('Metadata helper returned invalid JSON');
-            if SameText(aArg, '--self-test-window-metadata-fields') then
-            begin
-              if (lData.GetValue<string>('commandLine') <> '') or
-                (lData.GetValue<string>('icon') <> '') then
-                raise Exception.Create('Identity-only helper retrieved command-line or icon data');
-            end else if lData.GetValue<string>('commandLine') <> string(Winapi.Windows.GetCommandLine) then
-              raise Exception.Create('Metadata helper did not return the real process command line');
-            Writeln(Format('METADATA PASS duration-ms=%d child-pid=%d',
-              [lWatch.ElapsedMilliseconds, lProcessResult.ProcessId]));
-          finally
-            lData.Free;
-          end;
-        end;
+          if (lWindow.CommandLine <> '') or (Length(lWindow.IconBytes) <> 0) then
+            raise Exception.Create('Identity-only collection retrieved command-line or icon data');
+        end else if lWindow.CommandLine <> string(Winapi.Windows.GetCommandLine) then
+          raise Exception.Create(Format('Metadata collection did not return the real process command line: "%s"',
+            [lWindow.CommandLine]));
+        if lWindow.CommandLineParams <> ExtractCommandLineParams(lWindow.CommandLine) then
+          raise Exception.Create('Metadata collection returned inconsistent command-line parameters');
+        lWindow := Default(TWindowSnapshot);
+        if CollectWindowMetadata(lWnd, GetCurrentProcessId, lStartedAt + 1, [wmIdentity], lWindow) then
+          raise Exception.Create('Metadata collection accepted a different process start time');
+        Writeln(Format('METADATA PASS duration-ms=%d in-process', [lWatch.ElapsedMilliseconds]));
       finally
-        lCancel.SetEvent;
-        lThread.Free;
-        lFinished.Free;
-        lCancel.Free;
         DestroyWindow(lWnd);
       end;
       Exit;
