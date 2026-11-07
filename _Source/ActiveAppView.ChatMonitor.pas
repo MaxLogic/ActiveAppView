@@ -49,6 +49,10 @@ type
     fUnreadMessageSoundInterval: Integer;
 
     class function AnyRuleNeedsMetadata(const aRules: TReviewRuleArray): Boolean; static;
+    class function BuildMetadataCacheKey(const aWnd: hWnd; const aPid: Cardinal;
+      const aStartedAt: Int64): string; static;
+    class function ShouldReloadIncompleteMetadata(const aComplete: Boolean;
+      const aLoadedAt, aNow: UInt64): Boolean; static;
     class function HasUnreadMessageCountInCaption(const aCaption: string): Boolean; static;
     class function IsUnreadCounterDigit(aChar: Char; out aIsNonZeroDigit: Boolean): Boolean; static;
     class function IsUnreadCounterPaddingChar(aChar: Char): Boolean; static;
@@ -95,24 +99,46 @@ uses
   ActiveAppView.MachineOverview.BoundedProcess, ActiveAppViewCore;
 
 type
-  TChatAppMetadata = class(TInterfacedObject, IChatAppMetadata)
+  // Lets the monitor retry a lookup whose helper process failed without discarding what it did learn.
+  IChatAppMetadataLoadState = interface(IInterface)
+    ['{B381BA83-2C96-4F1E-8249-99FB48692FB2}']
+    function GetComplete: Boolean;
+    function GetLoadedAt: UInt64;
+  end;
+
+  TChatAppMetadata = class(TInterfacedObject, IChatAppMetadata, IChatAppMetadataLoadState)
   private
     fAppUserModelID: string;
     fCommandLineParams: string;
+    fComplete: Boolean;
     fFileName: string;
+    fLoadedAt: UInt64;
   public
     constructor Create(
       const aFileName: string;
       const aAppUserModelID: string;
-      const aCommandLineParams: string);
+      const aCommandLineParams: string); overload;
+    constructor Create(
+      const aFileName: string;
+      const aAppUserModelID: string;
+      const aCommandLineParams: string;
+      const aComplete: Boolean); overload;
     function GetAppUserModelID: string;
     function GetCommandLineParams: string;
+    function GetComplete: Boolean;
     function GetFileName: string;
+    function GetLoadedAt: UInt64;
   end;
 
 const
   cCommandLineParamsSelfTestArg = '--self-test-chat-monitor-command-line-params';
   cMetadataCacheNamespace = 'activeappview.chat-monitor.metadata';
+  cMetadataCachePolicySelfTestArg = '--self-test-chat-monitor-metadata-cache-policy';
+  // Window metadata cannot change while the window's process lives, so entries stay until the window is
+  // gone. A window that is no longer enumerated stops touching its entry and is swept after this idle time.
+  cMetadataIdleMs = 5 * 60 * 1000;
+  cMetadataIncompleteRetryMs = 2 * 60 * 1000;
+  cMetadataSweepIntervalMs = 60 * 1000;
   cReviewRuleConjunctionSelfTestArg = '--self-test-chat-monitor-review-rule-conjunction';
   cSoundFallbackSelfTestArg = '--self-test-chat-monitor-sound-fallback';
   cSoundIntervalRespectedSelfTestArg = '--self-test-chat-monitor-sound-interval-respected';
@@ -614,6 +640,58 @@ begin
   TDirectory.Delete(lDir);
 end;
 
+function RunMetadataCachePolicySelfTest: Integer;
+var
+  lKey: string;
+  lMetadata: IChatAppMetadata;
+  lLoadState: IChatAppMetadataLoadState;
+begin
+  Result := 0;
+  lKey := TChatMonitor.BuildMetadataCacheKey(HWND($1234), 42, 1000);
+  if lKey <> TChatMonitor.BuildMetadataCacheKey(HWND($1234), 42, 1000) then
+  begin
+    Writeln('SELFTEST FAILED: metadata cache key must be stable for one window of one process instance');
+    Exit(1);
+  end;
+  if (lKey = TChatMonitor.BuildMetadataCacheKey(HWND($1234), 42, 1001))
+    or (lKey = TChatMonitor.BuildMetadataCacheKey(HWND($1234), 43, 1000))
+    or (lKey = TChatMonitor.BuildMetadataCacheKey(HWND($1235), 42, 1000)) then
+  begin
+    Writeln('SELFTEST FAILED: metadata cache key must change with window handle, PID or process start time');
+    Exit(1);
+  end;
+
+  if TChatMonitor.ShouldReloadIncompleteMetadata(True, 0, 24 * 60 * 60 * 1000) then
+  begin
+    Writeln('SELFTEST FAILED: complete metadata must not be reloaded while its window lives');
+    Exit(1);
+  end;
+  if TChatMonitor.ShouldReloadIncompleteMetadata(False, 10000, 10000 + cMetadataIncompleteRetryMs - 1) then
+  begin
+    Writeln('SELFTEST FAILED: incomplete metadata must not be reloaded before the retry delay');
+    Exit(1);
+  end;
+  if not TChatMonitor.ShouldReloadIncompleteMetadata(False, 10000, 10000 + cMetadataIncompleteRetryMs) then
+  begin
+    Writeln('SELFTEST FAILED: incomplete metadata must be reloaded after the retry delay');
+    Exit(1);
+  end;
+
+  lMetadata := TChatAppMetadata.Create('a.exe', '', '', False);
+  if (not Supports(lMetadata, IChatAppMetadataLoadState, lLoadState)) or lLoadState.GetComplete then
+  begin
+    Writeln('SELFTEST FAILED: incomplete metadata must report its load state');
+    Exit(1);
+  end;
+  lMetadata := TChatAppMetadata.Create('a.exe', '', '');
+  if (not Supports(lMetadata, IChatAppMetadataLoadState, lLoadState)) or (not lLoadState.GetComplete) then
+  begin
+    Writeln('SELFTEST FAILED: metadata created without a load state must count as complete');
+    Exit(1);
+  end;
+  Writeln('CHAT METADATA CACHE POLICY PASS');
+end;
+
 function RunChatMonitorSelfTests(const aArg: string): Integer;
 begin
   if SameText(aArg, '--self-test-chat-unread-snapshot') then
@@ -705,6 +783,17 @@ begin
     end else begin
       Result := 0;
     end;
+  end else if SameText(aArg, cMetadataCachePolicySelfTestArg) then
+  begin
+    try
+      Result := RunMetadataCachePolicySelfTest;
+    except
+      on lException: Exception do
+      begin
+        Writeln(Format('SELFTEST FAILED: %s: %s', [lException.ClassName, lException.Message]));
+        Result := 1;
+      end;
+    end;
   end;
 end;
 
@@ -715,10 +804,21 @@ constructor TChatAppMetadata.Create(
   const aAppUserModelID: string;
   const aCommandLineParams: string);
 begin
+  Create(aFileName, aAppUserModelID, aCommandLineParams, True);
+end;
+
+constructor TChatAppMetadata.Create(
+  const aFileName: string;
+  const aAppUserModelID: string;
+  const aCommandLineParams: string;
+  const aComplete: Boolean);
+begin
   inherited Create;
   fFileName := aFileName;
   fAppUserModelID := aAppUserModelID;
   fCommandLineParams := aCommandLineParams;
+  fComplete := aComplete;
+  fLoadedAt := GetTickCount64;
 end;
 
 function TChatAppMetadata.GetAppUserModelID: string;
@@ -731,9 +831,19 @@ begin
   Result := fCommandLineParams;
 end;
 
+function TChatAppMetadata.GetComplete: Boolean;
+begin
+  Result := fComplete;
+end;
+
 function TChatAppMetadata.GetFileName: string;
 begin
   Result := fFileName;
+end;
+
+function TChatAppMetadata.GetLoadedAt: UInt64;
+begin
+  Result := fLoadedAt;
 end;
 
 { TChatMonitor }
@@ -763,7 +873,8 @@ begin
 
   lCacheConfig := TMaxCacheConfig.Default;
   lCacheConfig.CaseSensitiveKeys := False;
-  lCacheConfig.SweepIntervalMs := 0;
+  // Entries live as long as their window, so idle ones (closed windows) must be swept.
+  lCacheConfig.SweepIntervalMs := cMetadataSweepIntervalMs;
   fMetadataCache := TMaxCache.New(lCacheConfig);
 
   LoadConfiguration(aSettings);
@@ -784,88 +895,131 @@ begin
   fCancel.SetEvent;
 end;
 
+class function TChatMonitor.BuildMetadataCacheKey(const aWnd: hWnd; const aPid: Cardinal;
+  const aStartedAt: Int64): string;
+begin
+  Result := Format('%s:%d:%d', [IntToHex(NativeInt(aWnd), SizeOf(NativeInt) * 2), aPid, aStartedAt]);
+end;
+
+class function TChatMonitor.ShouldReloadIncompleteMetadata(const aComplete: Boolean;
+  const aLoadedAt, aNow: UInt64): Boolean;
+begin
+  Result := (not aComplete) and (aNow >= aLoadedAt) and (aNow - aLoadedAt >= cMetadataIncompleteRetryMs);
+end;
+
 function TChatMonitor.GetMetadataCached(const aWnd: hWnd): IChatAppMetadata;
 var
+  lCacheKey: string;
   lCacheValue: IInterface;
+  lHasStartedAt: Boolean;
+  lLoader: TFunc<IInterface>;
+  lLoadState: IChatAppMetadataLoadState;
   lMetadata: IChatAppMetadata;
   lOptions: TMaxCacheOptions;
   lPid: Cardinal;
-  lWndKey: string;
+  lStartedAt: Int64;
 begin
   if fCancel.WaitFor(0) = wrSignaled then
     Exit(nil);
-  lWndKey := IntToHex(NativeInt(aWnd), SizeOf(NativeInt) * 2);
-  lOptions := TMaxCacheOptions.Create;
-  try
-    lOptions.TtlMs := 15000;
-    lOptions.ValidateIntervalMs := 2500;
-    try
-      lCacheValue := fMetadataCache.GetOrCreate(
-        cMetadataCacheNamespace,
-        lWndKey,
-        function: IInterface
-        var
-          lAppUserModelID: string;
-          lCommandLineParams: string;
-          lData: TJSONValue;
-          lFileName: string;
-          lMask: Integer;
-          lProcessResult: TMachineOverviewProcessResult;
-          lStartedAt: Int64;
+
+  // Metadata belongs to one window of one process instance and cannot change while that process lives.
+  // Keying by the process start time as well lets a reused window handle or PID load fresh data, while
+  // an unchanged window never starts the helper processes (and their WMI query) again.
+  lPid := maxLogic.Windows.Desktop.RetrievePID(aWnd);
+  lStartedAt := 0;
+  lHasStartedAt := (lPid <> 0) and TryGetProcessStartedAtUtcMilliseconds(lPid, lStartedAt);
+  if not lHasStartedAt then
+    lStartedAt := 0;
+  lCacheKey := BuildMetadataCacheKey(aWnd, lPid, lStartedAt);
+
+  lLoader :=
+    function: IInterface
+    var
+      lAppUserModelID: string;
+      lCommandLineParams: string;
+      lComplete: Boolean;
+      lData: TJSONValue;
+      lFileName: string;
+      lMask: Integer;
+      lProcessResult: TMachineOverviewProcessResult;
+    begin
+      lFileName := '';
+      lAppUserModelID := '';
+      lCommandLineParams := '';
+      // Without a process identity there is nothing more to ask; retry later in case it was transient.
+      lComplete := lHasStartedAt;
+
+      try
+        lFileName := maxLogic.Windows.Desktop.GetFileName(aWnd);
+      except
+        lFileName := '';
+      end;
+
+      if lHasStartedAt and (fCancel.WaitFor(0) <> wrSignaled) then
+      begin
+        // Keep WMI and shell COM calls outside our process so shutdown can cancel them.
+        // Identity remains usable even when the independent command-line query fails.
+        for lMask := 1 to 2 do
         begin
-          lFileName := '';
-          lAppUserModelID := '';
-          lCommandLineParams := '';
-
-          try
-            lFileName := maxLogic.Windows.Desktop.GetFileName(aWnd);
-          except
-            lFileName := '';
-          end;
-
-          lPid := maxLogic.Windows.Desktop.RetrievePID(aWnd);
-          if (lPid <> 0) and (fCancel.WaitFor(0) <> wrSignaled) and
-            TryGetProcessStartedAtUtcMilliseconds(lPid, lStartedAt) then
+          if fCancel.WaitFor(0) = wrSignaled then
           begin
-            // Keep WMI and shell COM calls outside our process so shutdown can cancel them.
-            // Identity remains usable even when the independent command-line query fails.
-            for lMask := 1 to 2 do
+            lComplete := False;
+            Break;
+          end;
+          try
+            lProcessResult := RunMachineOverviewBoundedProcessCancelable(ParamStr(0),
+              Format('--window-metadata %s %d %d %d',
+                [UIntToStr(NativeUInt(aWnd)), lPid, lStartedAt, lMask]),
+              15000, 262144, fCancel.Handle);
+            if lProcessResult.Cancelled then
             begin
-              if fCancel.WaitFor(0) = wrSignaled then
-                Break;
+              lComplete := False;
+              Break;
+            end;
+            if lProcessResult.Started and (lProcessResult.ExitCode = 0) then
+            begin
+              lData := TJSONObject.ParseJSONValue(lProcessResult.OutputText);
               try
-                lProcessResult := RunMachineOverviewBoundedProcessCancelable(ParamStr(0),
-                  Format('--window-metadata %s %d %d %d',
-                    [UIntToStr(NativeUInt(aWnd)), lPid, lStartedAt, lMask]),
-                  15000, 262144, fCancel.Handle);
-                if lProcessResult.Cancelled then
-                  Break;
-                if lProcessResult.Started and (lProcessResult.ExitCode = 0) then
+                if lData is TJSONObject then
                 begin
-                  lData := TJSONObject.ParseJSONValue(lProcessResult.OutputText);
-                  try
-                    if lData is TJSONObject then
-                    begin
-                      if lMask = 1 then
-                        lAppUserModelID := lData.GetValue<string>('appUserModelId', '')
-                      else
-                        lCommandLineParams := lData.GetValue<string>('commandLineParams', '');
-                    end;
-                  finally
-                    lData.Free;
-                  end;
+                  if lMask = 1 then
+                    lAppUserModelID := lData.GetValue<string>('appUserModelId', '')
+                  else
+                    lCommandLineParams := lData.GetValue<string>('commandLineParams', '');
                 end else
-                  OutputDebugString(PChar(Format('Chat monitor metadata: pid=%d fields=%d exit=%d %s',
-                    [lPid, lMask, lProcessResult.ExitCode, lProcessResult.ErrorText])));
-              except
-                on lException: Exception do
-                  OutputDebugString(PChar('Chat monitor metadata: ' + lException.Message));
+                  lComplete := False;
+              finally
+                lData.Free;
               end;
+            end else
+            begin
+              lComplete := False;
+              OutputDebugString(PChar(Format('Chat monitor metadata: pid=%d fields=%d exit=%d %s',
+                [lPid, lMask, lProcessResult.ExitCode, lProcessResult.ErrorText])));
+            end;
+          except
+            on lException: Exception do
+            begin
+              lComplete := False;
+              OutputDebugString(PChar('Chat monitor metadata: ' + lException.Message));
             end;
           end;
-          Result := TChatAppMetadata.Create(lFileName, lAppUserModelID, lCommandLineParams);
-        end,
-        lOptions);
+        end;
+      end;
+      Result := TChatAppMetadata.Create(lFileName, lAppUserModelID, lCommandLineParams, lComplete);
+    end;
+
+  lOptions := TMaxCacheOptions.Create;
+  try
+    lOptions.IdleMs := cMetadataIdleMs;
+    try
+      lCacheValue := fMetadataCache.GetOrCreate(cMetadataCacheNamespace, lCacheKey, lLoader, lOptions);
+      if Supports(lCacheValue, IChatAppMetadataLoadState, lLoadState) and
+        ShouldReloadIncompleteMetadata(lLoadState.GetComplete, lLoadState.GetLoadedAt, GetTickCount64) then
+      begin
+        fMetadataCache.Invalidate(cMetadataCacheNamespace, lCacheKey);
+        lCacheValue := fMetadataCache.GetOrCreate(cMetadataCacheNamespace, lCacheKey, lLoader, lOptions);
+      end;
     except
       lCacheValue := nil;
     end;
