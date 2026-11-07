@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- `Scripts\x-mouse-colors.ps1` switches the running MouseBeam axis arms between light and dark without restarting it. Requires the updated MouseBeam executable.
 - Incident history can read user-selected closed Windows performance recordings for the incident window, with per-process CPU, PID/elapsed-time identity, machine-normalized percentages, coverage and invalid-value details, and cancellable background reading. History close never waits for a recording read; reads show timed out at 120 seconds and ignore late results (ACV-072).
 - Machine Overview can keep an opt-in, administrator-only 256 MB WPR memory ring and save qualifying incidents with onset coverage and event-loss details. It waits for other WPR recordings and never requests elevation (ACV-069).
 - Memory-pressure incidents now retain private-byte RAM contributors and growth; disk-pressure incidents retain process I/O and busiest-disk measurements. User-marked incidents retain both, using the existing evidence phases and export (ACV-070).
