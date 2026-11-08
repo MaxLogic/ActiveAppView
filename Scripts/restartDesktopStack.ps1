@@ -125,6 +125,25 @@ namespace ActiveAppView {
     [ActiveAppView.NativeKeyboard]::keybd_event($leftWindowsKey, 0, $keyUp, [UIntPtr]::Zero)
 }
 
+function Invoke-LogiOptionsPlusRestart {
+    param(
+        [string]$ResolvedLogiOptionsPlusExe,
+        [bool]$WasRunning
+    )
+
+    # Options+ may be deliberately disabled; only bring it back if it was running.
+    if (-not $WasRunning) {
+        return
+    }
+
+    if (-not $ResolvedLogiOptionsPlusExe) {
+        Write-Warning 'Logi Options+ was running, but its executable could not be resolved.'
+        return
+    }
+
+    Invoke-ExecutableAndWait -FilePath $ResolvedLogiOptionsPlusExe -ProcessName 'logioptionsplus'
+}
+
 function Invoke-MagnifierRestart {
     param(
         [bool]$WasRunning
@@ -147,6 +166,8 @@ $resolvedEverythingExe = Resolve-Everything
 $resolvedLogiOptionsPlusExe = Resolve-LogiOptionsPlus
 $restartNvdaScript = Join-Path $PSScriptRoot 'restartNvda.ps1'
 $magnifierWasRunning = $null -ne (Get-Process -Name 'Magnify' -ErrorAction SilentlyContinue)
+$logiOptionsPlusWasRunning = $null -ne (Get-Process -Name 'logioptionsplus', 'logioptionsplus_agent' -ErrorAction SilentlyContinue |
+    Select-Object -First 1)
 $everythingWasRunning = $null -ne (Get-Process -Name 'Everything' -ErrorAction SilentlyContinue |
     Where-Object { [string]::Equals($_.Path, $resolvedEverythingExe, [System.StringComparison]::OrdinalIgnoreCase) } |
     Select-Object -First 1)
@@ -156,6 +177,7 @@ if ($ResolveOnly) {
         EverythingExe = $resolvedEverythingExe
         MouseBeamExe = $resolvedMouseBeamExe
         LogiOptionsPlusExe = $resolvedLogiOptionsPlusExe
+        LogiOptionsPlusWasRunning = $logiOptionsPlusWasRunning
         RestartNvdaScript = $restartNvdaScript
     }
     return
@@ -208,9 +230,7 @@ Invoke-ServiceRestartIfPresent -Name 'ArmouryCrateService'
 Invoke-ServiceRestartIfPresent -Name 'Start11'
 Invoke-ServiceRestartIfPresent -Name 'WSearch'
 
-if ($resolvedLogiOptionsPlusExe) {
-    Invoke-ExecutableAndWait -FilePath $resolvedLogiOptionsPlusExe -ProcessName 'logioptionsplus'
-}
+Invoke-LogiOptionsPlusRestart -ResolvedLogiOptionsPlusExe $resolvedLogiOptionsPlusExe -WasRunning $logiOptionsPlusWasRunning
 
 Invoke-EverythingRestart -ResolvedEverythingExe $resolvedEverythingExe -WasRunning $everythingWasRunning
 Invoke-MagnifierRestart -WasRunning $magnifierWasRunning
